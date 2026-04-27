@@ -8,3 +8,11 @@ logs/
 gateway/data/
 
 *tmp*
+
+.uv-cache/
+
+.pytest-basetemp
+
+chmod-test
+
+sandbox_temp/
