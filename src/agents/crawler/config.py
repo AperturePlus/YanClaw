@@ -13,7 +13,9 @@ class CrawlerSettings(BaseSettings):
         extra="ignore",
     )
 
-    database_url: str = "sqlite+aiosqlite:///data/yanclaw.db"
+    # database_url is reserved for skill version history (SkillManager rollback/diff).
+    # Crawled faculty/org_unit data is stored per-university under university_db_dir.
+    database_url: str = "sqlite+aiosqlite:///data/yanclaw_meta.db"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
@@ -28,3 +30,5 @@ class CrawlerSettings(BaseSettings):
     runtime_skills_dir: Path = Path("src/runtime/skills")
     crawler_skills_dir: Path = Path("src/agents/crawler/skills")
     websites_path: Path = Path("assets/websites.md")
+    university_db_dir: Path = Path("data/universities")
+    fetcher_backend: str = "httpx"  # "httpx" (default) or "playwright"

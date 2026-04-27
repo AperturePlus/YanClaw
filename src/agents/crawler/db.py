@@ -10,101 +10,168 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import (
-    College,
     CrawlLog,
     CrawlLogStatus,
     CrawlStatus,
+    OrgUnit,
+    OrgUnitStatus,
     Professor,
     ProfessorAffiliation,
-    University,
+    UniversityMeta,
 )
 
 
-async def get_or_create_university(
+async def ensure_university_meta(
     session: AsyncSession,
+    *,
     name: str,
-    url: str = "",
+    start_url: str,
     location: str = "",
-) -> University:
-    url = _clean_url(url)
+) -> UniversityMeta:
+    """Ensure the single UniversityMeta row exists in the per-university DB."""
+
+    start_url = _clean_url(start_url)
     location = _clean_text(location)
-    university = (
-        await session.execute(select(University).where(University.name == name))
-    ).scalar_one_or_none()
-    if university:
-        if url and university.url != url:
-            university.url = url
-        if location and university.location != location:
-            university.location = location
+    meta = (await session.execute(select(UniversityMeta))).scalar_one_or_none()
+    if meta:
+        if name and meta.name != name:
+            meta.name = name
+        if start_url and meta.start_url != start_url:
+            meta.start_url = start_url
+        if location and meta.location != location:
+            meta.location = location
+        meta.updated_at = _now_utc()
         await session.flush()
-        return university
+        return meta
 
-    university = University(name=name, url=url, location=location)
-    session.add(university)
+    meta = UniversityMeta(
+        name=name,
+        start_url=start_url,
+        location=location,
+        crawl_status=CrawlStatus.PENDING.value,
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    )
+    session.add(meta)
     await session.flush()
-    return university
+    return meta
 
 
-async def get_or_create_college(
+async def get_university_status(session: AsyncSession) -> CrawlStatus | None:
+    status = (await session.execute(select(UniversityMeta.crawl_status))).scalar_one_or_none()
+    return CrawlStatus(status) if status else None
+
+
+async def set_university_status(session: AsyncSession, status: str | CrawlStatus) -> UniversityMeta:
+    status_value = status.value if isinstance(status, CrawlStatus) else str(status)
+    meta = (await session.execute(select(UniversityMeta))).scalar_one_or_none()
+    if not meta:
+        meta = await ensure_university_meta(session, name="", start_url="")
+    meta.crawl_status = status_value
+    meta.updated_at = _now_utc()
+    await session.flush()
+    return meta
+
+
+async def get_or_create_org_unit(
     session: AsyncSession,
+    *,
     name: str,
-    university_id: int,
-    url: str | None = None,
-) -> College:
-    url = _clean_url(url)
-    college = (
-        await session.execute(
-            select(College).where(
-                College.name == name,
-                College.university_id == university_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if college:
-        if url and college.url != url:
-            college.url = url
-        await session.flush()
-        return college
+    url: str,
+    kind: str | None = None,
+    status: str | OrgUnitStatus | None = None,
+    discovered_from_url: str | None = None,
+) -> OrgUnit:
+    name = _clean_text(name)
+    url = _normalize_url(url)
+    if not url:
+        raise ValueError("org_unit url is required")
+    kind = _clean_text(kind) if kind else None
+    discovered_from_url = _normalize_url(discovered_from_url) if discovered_from_url else None
+    status_value = None
+    if status is not None:
+        status_value = status.value if isinstance(status, OrgUnitStatus) else str(status)
 
-    college = College(name=name, university_id=university_id, url=url)
-    session.add(college)
+    org_unit = (
+        await session.execute(select(OrgUnit).where(OrgUnit.url == url))
+    ).scalar_one_or_none()
+    if org_unit:
+        changed = False
+        if name and org_unit.name != name:
+            org_unit.name = name
+            changed = True
+        if kind and org_unit.kind != kind:
+            org_unit.kind = kind
+            changed = True
+        if status_value and org_unit.status != status_value:
+            org_unit.status = status_value
+            changed = True
+        if discovered_from_url and org_unit.discovered_from_url != discovered_from_url:
+            org_unit.discovered_from_url = discovered_from_url
+            changed = True
+        if changed:
+            org_unit.updated_at = _now_utc()
+        await session.flush()
+        return org_unit
+
+    org_unit = OrgUnit(
+        name=name or url,
+        url=url,
+        kind=kind,
+        status=status_value or OrgUnitStatus.PENDING.value,
+        discovered_from_url=discovered_from_url,
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    )
+    session.add(org_unit)
     await session.flush()
-    return college
+    return org_unit
+
+
+async def list_org_units(session: AsyncSession, *, limit: int | None = None) -> list[OrgUnit]:
+    stmt = select(OrgUnit).order_by(OrgUnit.id)
+    if limit is not None:
+        stmt = stmt.limit(int(limit))
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Professor:
-    """Insert or update a professor with conservative cross-college dedupe.
+    """Insert or update a professor with conservative cross-org_unit dedupe.
 
     Identity strategy:
-    - Always collapse exact duplicates inside the same college by name.
-    - Across colleges, merge only when email or homepage matches after normalization.
-    - Name-only matches across colleges are not merged.
-    - When a cross-college match is found, keep one Professor row and add affiliations.
+    - Always collapse exact duplicates inside the same org unit by name.
+    - Across org units, merge only when email or homepage matches after normalization.
+    - Name-only matches across org units are not merged.
+    - When a cross-org_unit match is found, keep one Professor row and add affiliations.
     """
 
     name = str(data["name"]).strip()
     if not name:
         raise ValueError("Professor name is required")
 
-    college_id = data.get("college_id")
-    if college_id is None:
-        university_name = str(data.get("university") or data.get("university_name") or "").strip()
-        college_name = str(data.get("college") or data.get("college_name") or "").strip()
-        if not university_name or not college_name:
-            raise ValueError("university and college are required when college_id is not provided")
-        university = await get_or_create_university(
+    org_unit_id = data.get("org_unit_id")
+    if org_unit_id is None:
+        org_unit_name = str(
+            data.get("org_unit")
+            or data.get("org_unit_name")
+            or data.get("college")
+            or data.get("college_name")
+            or ""
+        ).strip()
+        org_unit_url = str(data.get("org_unit_url") or data.get("college_url") or "").strip()
+        org_unit_kind = str(data.get("org_unit_kind") or "").strip() or None
+        if not org_unit_name:
+            raise ValueError("org_unit_name is required when org_unit_id is not provided")
+        if not org_unit_url:
+            # Allow missing URL when saving, but it will reduce org unit dedupe quality.
+            org_unit_url = f"about:org_unit:{org_unit_name}"
+        org_unit = await get_or_create_org_unit(
             session,
-            university_name,
-            str(data.get("university_url") or ""),
-            str(data.get("location") or ""),
+            name=org_unit_name,
+            url=org_unit_url,
+            kind=org_unit_kind,
         )
-        college = await get_or_create_college(
-            session,
-            college_name,
-            university.id,
-            data.get("college_url"),
-        )
-        college_id = college.id
+        org_unit_id = org_unit.id
 
     email = _normalize_email(data.get("email"))
     homepage = _normalize_homepage(data.get("homepage"))
@@ -118,21 +185,34 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         "bio": data.get("bio"),
         "enrollment_pref": data.get("enrollment_pref") or data.get("enrollment_preference"),
         "publications": _serialize_optional(data.get("publications")),
-        "college_id": int(college_id),
     }
 
-    professor = await _find_existing_professor(session, name, int(college_id), email, homepage)
+    professor, same_org_unit = await _find_existing_professor(
+        session,
+        name,
+        int(org_unit_id),
+        email,
+        homepage,
+    )
     if professor is None:
-        professor = Professor(**values)
+        professor = Professor(
+            **values,
+            created_at=_now_utc(),
+            updated_at=_now_utc(),
+        )
         session.add(professor)
         await session.flush()
     else:
-        same_college = professor.college_id == int(college_id)
-        _merge_professor(professor, values, overwrite=same_college)
+        _merge_professor(professor, values, overwrite=same_org_unit)
+        professor.updated_at = _now_utc()
         await session.flush()
 
-    await ensure_professor_affiliation(session, professor.id, professor.college_id)
-    await ensure_professor_affiliation(session, professor.id, int(college_id))
+    await ensure_professor_affiliation(
+        session,
+        professor_id=professor.id,
+        org_unit_id=int(org_unit_id),
+        source_url=_normalize_url(data.get("source_url")),
+    )
     await session.flush()
     return professor
 
@@ -140,26 +220,27 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
 async def ensure_professor_affiliation(
     session: AsyncSession,
     professor_id: int,
-    college_id: int,
-    source: str | None = None,
+    org_unit_id: int,
+    source_url: str | None = None,
 ) -> ProfessorAffiliation:
     existing = (
         await session.execute(
             select(ProfessorAffiliation).where(
                 ProfessorAffiliation.professor_id == professor_id,
-                ProfessorAffiliation.college_id == college_id,
+                ProfessorAffiliation.org_unit_id == org_unit_id,
             )
         )
     ).scalar_one_or_none()
     if existing:
-        if source and existing.source != source:
-            existing.source = source
+        if source_url and existing.source_url != source_url:
+            existing.source_url = source_url
         return existing
 
     affiliation = ProfessorAffiliation(
         professor_id=professor_id,
-        college_id=college_id,
-        source=source,
+        org_unit_id=org_unit_id,
+        source_url=source_url,
+        created_at=_now_utc(),
     )
     session.add(affiliation)
     await session.flush()
@@ -168,17 +249,16 @@ async def ensure_professor_affiliation(
 
 async def log_crawl(
     session: AsyncSession,
-    university_id: int,
     url: str,
     status: str | CrawlLogStatus,
     message: str | None = None,
 ) -> CrawlLog:
     status_value = status.value if isinstance(status, CrawlLogStatus) else str(status)
     crawl_log = CrawlLog(
-        university_id=university_id,
-        url=url,
+        url=_normalize_url(url),
         status=status_value,
         message=message,
+        created_at=_now_utc(),
     )
     session.add(crawl_log)
     await session.flush()
@@ -186,6 +266,7 @@ async def log_crawl(
 
 
 async def is_url_crawled(session: AsyncSession, url: str) -> bool:
+    url = _normalize_url(url)
     existing = (
         await session.execute(
             select(CrawlLog.id).where(
@@ -197,59 +278,25 @@ async def is_url_crawled(session: AsyncSession, url: str) -> bool:
     return existing is not None
 
 
-async def get_university_status(session: AsyncSession, name: str) -> CrawlStatus | None:
-    status = (
-        await session.execute(select(University.crawl_status).where(University.name == name))
-    ).scalar_one_or_none()
-    return CrawlStatus(status) if status else None
-
-
-async def set_university_status(
-    session: AsyncSession,
-    name: str,
-    status: str | CrawlStatus,
-) -> University:
-    status_value = status.value if isinstance(status, CrawlStatus) else str(status)
-    university = (
-        await session.execute(select(University).where(University.name == name))
-    ).scalar_one_or_none()
-    if not university:
-        university = University(name=name, crawl_status=status_value)
-        session.add(university)
-    else:
-        university.crawl_status = status_value
-    await session.flush()
-    return university
-
-
-async def count_professors_for_university(session: AsyncSession, university_id: int) -> int:
-    primary_ids = (
-        select(Professor.id.label("professor_id"))
-        .join(College, Professor.college_id == College.id)
-        .where(College.university_id == university_id)
-    )
-    affiliated_ids = (
-        select(ProfessorAffiliation.professor_id.label("professor_id"))
-        .join(College, ProfessorAffiliation.college_id == College.id)
-        .where(College.university_id == university_id)
-    )
-    professor_ids = primary_ids.union(affiliated_ids).subquery()
-    count = (await session.execute(select(func.count()).select_from(professor_ids))).scalar_one()
+async def count_professors(session: AsyncSession) -> int:
+    count = (await session.execute(select(func.count()).select_from(Professor))).scalar_one()
     return int(count or 0)
 
 
-async def load_universities_from_csv(session: AsyncSession, path: str | Path) -> list[University]:
-    universities: list[University] = []
+def load_university_targets_from_csv(path: str | Path) -> list[dict[str, str]]:
+    """Load university targets from a CSV-like file (assets/websites.md)."""
+
+    result: list[dict[str, str]] = []
     with Path(path).open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
         for row in reader:
             name = _row_value(row, "university", "name", fallback_index=1).strip()
             url = _clean_url(_row_value(row, "url", fallback_index=2))
             location = _clean_text(_row_value(row, "location", fallback_index=3))
-            if not name:
+            if not name or not url:
                 continue
-            universities.append(await get_or_create_university(session, name, url, location))
-    return universities
+            result.append({"name": name, "url": url, "location": location})
+    return result
 
 
 def _row_value(row: dict[str, Any], *keys: str, fallback_index: int | None = None) -> str:
@@ -300,20 +347,22 @@ def _clean_text(value: Any) -> str:
 async def _find_existing_professor(
     session: AsyncSession,
     name: str,
-    college_id: int,
+    org_unit_id: int,
     email: str | None,
     homepage: str | None,
-) -> Professor | None:
-    same_college = (
+) -> tuple[Professor | None, bool]:
+    same_org_unit = (
         await session.execute(
-            select(Professor).where(
+            select(Professor)
+            .join(ProfessorAffiliation, ProfessorAffiliation.professor_id == Professor.id)
+            .where(
                 Professor.name == name,
-                Professor.college_id == college_id,
+                ProfessorAffiliation.org_unit_id == org_unit_id,
             )
         )
     ).scalar_one_or_none()
-    if same_college:
-        return same_college
+    if same_org_unit:
+        return same_org_unit, True
 
     if email:
         by_email = (
@@ -322,21 +371,21 @@ async def _find_existing_professor(
             )
         ).scalar_one_or_none()
         if by_email:
-            return by_email
+            return by_email, False
 
     if homepage:
         by_homepage = (
             await session.execute(select(Professor).where(Professor.homepage == homepage))
         ).scalar_one_or_none()
         if by_homepage:
-            return by_homepage
+            return by_homepage, False
 
-    return None
+    return None, False
 
 
 def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite: bool) -> None:
     for key, value in values.items():
-        if key in {"name", "college_id"} or value in {None, ""}:
+        if key in {"name"} or value in {None, ""}:
             continue
         current = getattr(professor, key)
         if overwrite or current in {None, ""}:
@@ -366,3 +415,26 @@ def _normalize_homepage(value: Any) -> str | None:
         path=parsed.path.rstrip("/"),
     )
     return urlunparse(normalized)
+
+
+def _normalize_url(value: Any) -> str:
+    text = _clean_url(value)
+    if not text:
+        return ""
+    text = urldefrag(text)[0]
+    parsed = urlparse(text)
+    if not parsed.scheme or not parsed.netloc:
+        return text.rstrip("/")
+    normalized = parsed._replace(
+        scheme=parsed.scheme.lower(),
+        netloc=parsed.netloc.lower(),
+        path=parsed.path.rstrip("/"),
+    )
+    return urlunparse(normalized)
+
+
+def _now_utc() -> Any:
+    # datetime type is imported indirectly via SQLAlchemy; keep simple to avoid import cycles.
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)

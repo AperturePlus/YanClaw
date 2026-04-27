@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 
-from agents.crawler.agent import CrawlerAgent
+from sqlalchemy import select
+
 from agents.crawler import db as crawler_db
+from agents.crawler.agent import CrawlerAgent
 from agents.crawler.fetcher import FetchResult, Fetcher
-from agents.crawler.models import CrawlLogStatus, CrawlStatus
+from agents.crawler.models import CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallRecord
@@ -27,36 +29,31 @@ class FakeFetcher:
 
 
 class FakeLLM:
-    def __init__(self, empty_links=False, reflect_update=False):
+    def __init__(self, empty_links: bool = False):
         self.empty_links = empty_links
-        self.reflect_update = reflect_update
 
     async def chat(self, messages, tools=None, tool_handlers=None):
-        system = messages[0]["content"]
         user = messages[-1]["content"]
-        if "Select relevant skill names" in system:
-            return LLMResult('["extract-links", "save-professors"]')
-        if "Reflect on the crawl" in system:
-            if self.reflect_update:
-                await tool_handlers["update_skill"](
-                    name="save-professors",
-                    new_content="## Goal\nupdated\n",
-                    change_summary="reflection update",
-                )
-            return LLMResult("")
-
         payload = json.loads(user)
         state = payload["state"]
         if self.empty_links:
             return LLMResult("{}")
-        if state == "FIND_COLLEGES":
-            return LLMResult('{"links": ["https://www.example.edu.cn/cs"]}')
+
+        if state == "DISCOVER_ORG_UNIT_PAGES":
+            return LLMResult('{"links": ["https://www.example.edu.cn/orgs"]}')
+        if state == "EXTRACT_ORG_UNITS":
+            return LLMResult(
+                '{"org_units": [{"name": "CS", "url": "https://www.example.edu.cn/cs", "kind": "college"}]}'
+            )
         if state == "FIND_FACULTY_PAGES":
             return LLMResult('{"links": ["https://www.example.edu.cn/cs/faculty"]}')
         if state == "EXTRACT_PROFESSORS":
+            if "faculty" not in payload.get("page_text", ""):
+                return LLMResult("{}")
             result = await tool_handlers["save_professors"](
-                university_name="TestU",
-                college_name="CS",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
                 professors=[{"name": "Ada", "title": "Professor"}],
             )
             return LLMResult(
@@ -66,6 +63,15 @@ class FakeLLM:
         return LLMResult("{}")
 
 
+class FakeLLMHomeAsOrgList(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        user = messages[-1]["content"]
+        payload = json.loads(user)
+        if payload.get("state") == "DISCOVER_ORG_UNIT_PAGES":
+            return LLMResult('{"links": ["https://www.example.edu.cn/"]}')
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
 async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
     db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
     await db.init_db()
@@ -73,16 +79,23 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
     manager = SkillManager(skills_dir, db, "crawler")
     await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
     await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+
     pages = {
         "https://www.example.edu.cn/": FetchResult(
             "https://www.example.edu.cn/",
             "home",
-            ["https://www.example.edu.cn/cs", "https://www.example.edu.cn/cs"],
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
             200,
         ),
         "https://www.example.edu.cn/cs": FetchResult(
             "https://www.example.edu.cn/cs",
-            "college",
+            "cs",
             ["https://www.example.edu.cn/cs/faculty"],
             200,
         ),
@@ -97,6 +110,7 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
     agent = CrawlerAgent(
         university_name="TestU",
         start_url="https://www.example.edu.cn/",
+        location="TestCity",
         db=db,
         llm_client=fake_llm,
         skill_manager=manager,
@@ -105,30 +119,37 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
         max_depth=max_depth,
         max_backtracks=max_backtracks,
     )
-    return agent, fetcher, db, manager
+    return agent, fetcher, db
 
 
-async def test_agent_state_machine_dedupes_and_saves_professors(tmp_path):
-    agent, fetcher, db, _manager = await _agent(tmp_path, FakeLLM())
+async def test_agent_state_machine_discovers_org_units_and_saves_professors(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
     assert result.saved_professors == 1
     assert fetcher.calls.count("https://www.example.edu.cn/cs") == 1
+
+    async with db.session() as session:
+        meta = (await session.execute(select(UniversityMeta))).scalar_one()
+        assert meta.crawl_status == CrawlStatus.COMPLETED.value
+        units = (await session.execute(select(OrgUnit))).scalars().all()
+        assert [u.name for u in units] == ["CS"]
+
     await db.close()
 
 
 async def test_agent_respects_max_depth(tmp_path):
-    agent, fetcher, db, _manager = await _agent(tmp_path, FakeLLM(), max_depth=0)
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), max_depth=0)
     result = await agent.run()
 
     assert result.status == CrawlStatus.FAILED.value
-    assert "https://www.example.edu.cn/cs" not in fetcher.calls
+    assert "https://www.example.edu.cn/orgs" not in fetcher.calls
     await db.close()
 
 
 async def test_agent_marks_failed_when_backtrack_limit_exceeded(tmp_path):
-    agent, _fetcher, db, _manager = await _agent(
+    agent, _fetcher, db = await _agent(
         tmp_path,
         FakeLLM(empty_links=True),
         max_backtracks=0,
@@ -139,33 +160,31 @@ async def test_agent_marks_failed_when_backtrack_limit_exceeded(tmp_path):
     await db.close()
 
 
-async def test_agent_reflect_can_update_skill(tmp_path):
-    agent, _fetcher, db, manager = await _agent(tmp_path, FakeLLM(reflect_update=True))
+async def test_agent_can_reuse_homepage_when_org_unit_page_is_home(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLMHomeAsOrgList())
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
-    history = await manager.get_history("save-professors")
-    assert [item.version for item in history] == [1, 2]
-    assert "updated" in manager.load_skill("save-professors")
+    assert fetcher.calls.count("https://www.example.edu.cn/") == 1
     await db.close()
 
 
 async def test_agent_refetches_successful_urls_for_incomplete_university(tmp_path):
-    agent, fetcher, db, _manager = await _agent(tmp_path, FakeLLM())
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     async with db.session() as session:
-        university = await crawler_db.get_or_create_university(
+        await crawler_db.ensure_university_meta(
             session,
-            "TestU",
-            "https://www.example.edu.cn/",
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="TestCity",
         )
         await crawler_db.log_crawl(
             session,
-            university.id,
             "https://www.example.edu.cn/",
             CrawlLogStatus.SUCCESS,
             "previous partial run",
         )
-        await crawler_db.set_university_status(session, "TestU", CrawlStatus.FAILED)
+        await crawler_db.set_university_status(session, CrawlStatus.FAILED)
 
     result = await agent.run()
 

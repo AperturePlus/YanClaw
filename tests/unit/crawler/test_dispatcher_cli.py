@@ -8,8 +8,6 @@ from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
 from agents.crawler.models import CrawlStatus
-from runtime.database import DatabaseManager
-from tests.conftest import sqlite_url
 
 
 class FakeAgent:
@@ -44,22 +42,34 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
         encoding="utf-8",
     )
     settings = CrawlerSettings(
-        database_url=sqlite_url(tmp_path / "dispatcher.db"),
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
         max_concurrency=1,
         request_interval_seconds=0,
+        max_retries=0,
     )
-    db = DatabaseManager(settings.database_url)
     FakeAgent.active = 0
     FakeAgent.max_active = 0
 
-    dispatcher = CrawlDispatcher(settings=settings, db=db, agent_factory=FakeAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
     summary = await dispatcher.run(universities=["A", "B"])
 
     assert summary.success == 2
     assert FakeAgent.max_active == 1
-    await db.close()
+
+
+def test_university_db_path_differs_per_school(tmp_path):
+    from agents.crawler.dispatcher import _university_db_path
+
+    path_a = _university_db_path(tmp_path, "https://www.pku.edu.cn/")
+    path_b = _university_db_path(tmp_path, "https://www.tsinghua.edu.cn/")
+
+    assert path_a != path_b
+    assert path_a.parent == tmp_path
+    assert path_b.parent == tmp_path
+    assert path_a.name == "pku.edu.cn.db"
+    assert path_b.name == "tsinghua.edu.cn.db"
 
 
 def test_cli_help_outputs_commands():

@@ -1,43 +1,38 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 from sqlalchemy import select
 
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
-from agents.crawler.fetcher import Fetcher
-from agents.crawler.models import CrawlLog, Professor, University
-from runtime.database import DatabaseManager, SkillVersion
+from agents.crawler.fetcher import Fetcher, _site_root
+from agents.crawler.models import CrawlLog, OrgUnit, Professor, UniversityMeta
+from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallRecord
-from tests.conftest import sqlite_url
 
 
 class IntegrationLLM:
     async def chat(self, messages, tools=None, tool_handlers=None):
-        system = messages[0]["content"]
         user = messages[-1]["content"]
-        if "Select relevant skill names" in system:
-            return LLMResult('["extract-links", "save-professors"]')
-        if "Reflect on the crawl" in system:
-            await tool_handlers["update_skill"](
-                name="save-professors",
-                new_content="## Goal\nSave professor records with source-aware validation.\n",
-                change_summary="integration reflection",
-            )
-            return LLMResult("")
-
         payload = json.loads(user)
         state = payload["state"]
-        if state == "FIND_COLLEGES":
-            return LLMResult('{"links": ["https://www.example.edu.cn/cs"]}')
+
+        if state == "DISCOVER_ORG_UNIT_PAGES":
+            return LLMResult('{"links": ["https://www.example.edu.cn/orgs"]}')
+        if state == "EXTRACT_ORG_UNITS":
+            return LLMResult(
+                '{"org_units": [{"name": "CS", "url": "https://www.example.edu.cn/cs", "kind": "college"}]}'
+            )
         if state == "FIND_FACULTY_PAGES":
             return LLMResult('{"links": ["https://www.example.edu.cn/cs/faculty"]}')
         if state == "EXTRACT_PROFESSORS":
             result = await tool_handlers["save_professors"](
-                university_name="TestU",
-                college_name="CS",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
                 professors=[
                     {
                         "name": "Ada",
@@ -54,12 +49,17 @@ class IntegrationLLM:
         return LLMResult("{}")
 
 
+def _sqlite_url(path: Path) -> str:
+    return f"sqlite+aiosqlite:///{path.as_posix()}"
+
+
 async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
         "name,url,location\nTestU,https://www.example.edu.cn/,TestCity\n",
         encoding="utf-8",
     )
+
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir()
     (skills_dir / "extract-links.md").write_text(
@@ -72,7 +72,8 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     )
 
     pages = {
-        "https://www.example.edu.cn/": '<a href="/cs">CS</a>',
+        "https://www.example.edu.cn/": '<a href="/orgs">Orgs</a>',
+        "https://www.example.edu.cn/orgs": '<a href="/cs">CS</a>',
         "https://www.example.edu.cn/cs": '<a href="/cs/faculty">Faculty</a>',
         "https://www.example.edu.cn/cs/faculty": "<p>Ada Professor Systems ada@example.edu.cn</p>",
     }
@@ -81,17 +82,15 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         return httpx.Response(200, text=pages[str(request.url)], request=request)
 
     settings = CrawlerSettings(
-        database_url=sqlite_url(tmp_path / "integration.db"),
         websites_path=websites,
         crawler_skills_dir=skills_dir,
+        university_db_dir=tmp_path / "universities",
         request_interval_seconds=0,
         max_retries=0,
         max_concurrency=1,
     )
-    db = DatabaseManager(settings.database_url)
     dispatcher = CrawlDispatcher(
         settings=settings,
-        db=db,
         llm_client_factory=lambda: IntegrationLLM(),
         fetcher_factory=lambda: Fetcher(
             request_interval_seconds=0,
@@ -103,17 +102,23 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     summary = await dispatcher.run()
     assert summary.success == 1
 
+    root = _site_root("www.example.edu.cn")
+    db_path = (Path(settings.university_db_dir) / f"{root}.db").resolve()
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
     async with db.session() as session:
-        universities = (await session.execute(select(University))).scalars().all()
+        meta = (await session.execute(select(UniversityMeta))).scalar_one()
         professors = (await session.execute(select(Professor))).scalars().all()
+        units = (await session.execute(select(OrgUnit))).scalars().all()
         logs = (await session.execute(select(CrawlLog))).scalars().all()
-        versions = (await session.execute(select(SkillVersion))).scalars().all()
-        assert universities[0].crawl_status == "completed"
+
+        assert meta.crawl_status == "completed"
         assert professors[0].name == "Ada"
-        assert len(logs) == 3
-        assert versions[0].skill_name == "save-professors"
+        assert [u.name for u in units] == ["CS"]
+        assert len(logs) == 4
 
     second = await dispatcher.run()
     assert second.skipped == 1
 
     await db.close()
+

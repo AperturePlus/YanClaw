@@ -50,13 +50,9 @@ async def _crawl_async(
 ) -> None:
     if not skip_llm_check:
         await _check_llm(settings)
-    db = DatabaseManager(settings.database_url)
-    try:
-        dispatcher = CrawlDispatcher(settings=settings, db=db)
-        summary = await dispatcher.run(universities)
-        click.echo(f"success={summary.success} failed={summary.failed} skipped={summary.skipped}")
-    finally:
-        await db.close()
+    dispatcher = CrawlDispatcher(settings=settings)
+    summary = await dispatcher.run(universities)
+    click.echo(f"success={summary.success} failed={summary.failed} skipped={summary.skipped}")
 
 
 async def _check_llm(settings: CrawlerSettings) -> None:

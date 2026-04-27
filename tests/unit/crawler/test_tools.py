@@ -16,8 +16,9 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
     tools = get_crawler_tools(db, manager)
 
     result = await tools["save_professors"](
-        university_name="TestU",
-        college_name="CS",
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/faculty",
         professors=[{"name": "Ada", "title": "Professor"}],
     )
     assert result == {"saved": 1}
