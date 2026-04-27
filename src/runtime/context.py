@@ -31,7 +31,7 @@ class ContextManager:
     ) -> list[list[dict[str, str]]]:
         # ~4 tokens per message for role/formatting overhead, plus 2 for priming
         message_overhead = 4 * 2 + 2  # 2 messages (system + user) * 4 tokens each + 2 priming
-        tools_text = tool_defs if isinstance(tool_defs, str) else json.dumps(tool_defs, ensure_ascii=False)
+        tools_text = tool_defs if isinstance(tool_defs, str) else self._summarize_tools(tool_defs)
         fixed_parts = [
             system_prompt,
             f"Available tools:\n{tools_text}" if tools_text else "",
@@ -55,6 +55,32 @@ class ContextManager:
                 ]
             )
         return batches
+
+    def _summarize_tools(self, tool_defs: Any) -> str:
+        if not tool_defs:
+            return ""
+        if isinstance(tool_defs, str):
+            return tool_defs
+        if not isinstance(tool_defs, list):
+            return json.dumps(tool_defs, ensure_ascii=False)
+
+        lines: list[str] = []
+        for tool in tool_defs:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") != "function":
+                continue
+            function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+            name = (function.get("name") if function else tool.get("name")) or ""
+            description = (function.get("description") if function else tool.get("description")) or ""
+            if not name:
+                continue
+            line = f"- {name}: {description}".rstrip(": ").strip()
+            lines.append(line)
+
+        if lines:
+            return "\n".join(lines)
+        return json.dumps(tool_defs, ensure_ascii=False)
 
     def chunk_text(self, text: str, max_tokens: int) -> list[str]:
         if self.count_tokens(text) <= max_tokens:

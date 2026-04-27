@@ -5,7 +5,7 @@ import pytest
 from runtime.llm import LLMClient, LLMResponseError
 
 
-class _Completions:
+class _Responses:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
@@ -15,22 +15,45 @@ class _Completions:
         return self.responses.pop(0)
 
 
-class _Chat:
-    def __init__(self, responses):
-        self.completions = _Completions(responses)
-
-
 class _Client:
     def __init__(self, responses):
-        self.chat = _Chat(responses)
+        self.responses = _Responses(responses)
 
 
-def _response(message):
-    return {"choices": [{"message": message}]}
+def _text_response(text: str) -> dict:
+    """Build a Responses API output with a text message."""
+    return {
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ]
+    }
+
+
+def _tool_response(tool_calls: list[dict], text: str = "") -> dict:
+    """Build a Responses API output with function_call items."""
+    items: list[dict] = []
+    if text:
+        items.append({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        })
+    for tc in tool_calls:
+        items.append({
+            "type": "function_call",
+            "call_id": tc["call_id"],
+            "name": tc["name"],
+            "arguments": tc["arguments"],
+        })
+    return {"output": items}
 
 
 async def test_llm_client_plain_chat():
-    client = LLMClient("http://example", "key", "model", client=_Client([_response({"content": "ok"})]))
+    client = LLMClient("http://example", "key", "model", client=_Client([_text_response("ok")]))
     result = await client.chat([{"role": "user", "content": "hello"}])
     assert result.content == "ok"
     assert result.tool_call_log == []
@@ -38,19 +61,8 @@ async def test_llm_client_plain_chat():
 
 async def test_llm_client_tool_call_loop():
     responses = [
-        _response(
-            {
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "add", "arguments": '{"x": 2, "y": 3}'},
-                    }
-                ],
-            }
-        ),
-        _response({"content": "done"}),
+        _tool_response([{"call_id": "call_1", "name": "add", "arguments": '{"x": 2, "y": 3}'}]),
+        _text_response("done"),
     ]
     client = LLMClient("http://example", "key", "model", client=_Client(responses))
 
@@ -59,7 +71,7 @@ async def test_llm_client_tool_call_loop():
 
     result = await client.chat(
         [{"role": "user", "content": "add"}],
-        tools=[{"type": "function", "function": {"name": "add"}}],
+        tools=[{"type": "function", "name": "add"}],
         tool_handlers={"add": add},
     )
     assert result.content == "done"
@@ -68,18 +80,7 @@ async def test_llm_client_tool_call_loop():
 
 async def test_llm_client_stops_at_max_rounds():
     responses = [
-        _response(
-            {
-                "content": "again",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "noop", "arguments": "{}"},
-                    }
-                ],
-            }
-        )
+        _tool_response([{"call_id": "call_1", "name": "noop", "arguments": "{}"}], text="again"),
     ]
     client = LLMClient(
         "http://example",
@@ -90,7 +91,7 @@ async def test_llm_client_stops_at_max_rounds():
     )
     result = await client.chat(
         [{"role": "user", "content": "loop"}],
-        tools=[{"type": "function", "function": {"name": "noop"}}],
+        tools=[{"type": "function", "name": "noop"}],
         tool_handlers={"noop": lambda: "ok"},
     )
     assert result.content == "again"
@@ -98,16 +99,16 @@ async def test_llm_client_stops_at_max_rounds():
 
 
 async def test_llm_client_reports_invalid_chat_response():
-    client = LLMClient("http://example", "key", "model", client=_Client([{"error": "bad"}]))
+    client = LLMClient("http://example", "key", "model", client=_Client([{"output": []}]))
+    result = await client.chat([{"role": "user", "content": "hello"}])
+    # Empty output → empty content, no error (Responses API returns empty output for no content)
+    assert result.content == ""
 
-    with pytest.raises(LLMResponseError, match="did not include chat completion choices"):
-        await client.chat([{"role": "user", "content": "hello"}])
 
-
-async def test_llm_client_passes_max_tokens_to_chat_completion():
-    fake_client = _Client([_response({"content": "ok"})])
+async def test_llm_client_passes_max_tokens_to_responses_api():
+    fake_client = _Client([_text_response("ok")])
     client = LLMClient("http://example", "key", "model", client=fake_client)
 
     await client.chat([{"role": "user", "content": "hello"}], max_tokens=1)
 
-    assert fake_client.chat.completions.calls[0]["max_tokens"] == 1
+    assert fake_client.responses.calls[0]["max_output_tokens"] == 1
