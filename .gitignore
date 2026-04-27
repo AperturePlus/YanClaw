@@ -16,3 +16,7 @@ gateway/data/
 chmod-test
 
 sandbox_temp/
+
+scripts/*txt
+
+gateway/
