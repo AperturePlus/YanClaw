@@ -11,7 +11,7 @@ Identify professor records that are visible in public university pages and save 
 
 ## Tool Definition
 
-Use `save_professors` with `university_name`, `college_name`, and `professors`.
+Use `save_professors` with `org_unit_name` and `professors`.
 
 Each professor must include `name`. Optional fields include `title`, `research_areas`, `email`, `phone`, `homepage`, `bio`, `enrollment_pref`, and `publications`.
 
@@ -21,8 +21,8 @@ Each professor must include `name`. Optional fields include `title`, `research_a
 - Prefer professors discovered through the official college/school site, then its faculty/team/teacher pages.
 - Prefer the teacher's profile URL for `homepage` when available.
 - Use empty optional fields rather than inventing values.
-- Batch records from the same college in one tool call.
-- If the same teacher appears in multiple colleges, keep stable identity fields (`email` and `homepage`) unchanged so the database can merge the person and record multiple affiliations.
+- Batch records from the same org unit in one tool call.
+- If the same teacher appears in multiple org units, keep stable identity fields (`email` and `homepage`) unchanged so the database can merge the person and record multiple affiliations.
 
 ## Chinese Academic Title Handling
 
