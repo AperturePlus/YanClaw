@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 yanclaw = "agents.crawler.cli:cli"
 
+[project.optional-dependencies]
+playwright = ["playwright>=1.44.0"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.2.0",
