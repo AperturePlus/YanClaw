@@ -35,6 +35,15 @@ class _LinkParser(HTMLParser):
 class Fetcher:
     """Async HTTP fetcher with per-domain rate limiting and retries."""
 
+    _HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     def __init__(
         self,
         *,
@@ -52,6 +61,7 @@ class Fetcher:
         self._own_client = client is None
         self._timeout_seconds = timeout_seconds
         self._transport = transport
+        self._insecure_client: httpx.AsyncClient | None = None
         self._last_request_at: dict[str, float] = {}
         self._domain_locks: dict[str, asyncio.Lock] = {}
 
@@ -61,18 +71,13 @@ class Fetcher:
                 timeout=self._timeout_seconds,
                 follow_redirects=True,
                 transport=self._transport,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                },
+                headers=self._HEADERS,
             )
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if self._insecure_client is not None:
+            await self._insecure_client.aclose()
         if self._client is not None and self._own_client:
             await self._client.aclose()
 
@@ -81,11 +86,24 @@ class Fetcher:
             async with self:
                 return await self.fetch(url)
 
+        try:
+            return await self._fetch_with_client(self._client, url)
+        except RuntimeError as exc:
+            if not _is_ssl_error(exc):
+                raise
+            # SSL failures are common on Chinese university subdomains;
+            # retry without certificate verification.
+            client = await self._get_insecure_client()
+            return await self._fetch_with_client(client, url)
+
+    async def _fetch_with_client(
+        self, client: httpx.AsyncClient, url: str
+    ) -> FetchResult:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             await self._wait_for_domain(url)
             try:
-                response = await self._client.get(url)
+                response = await client.get(url)
                 if response.status_code in {429, 503} and attempt < self.max_retries:
                     await asyncio.sleep(self.retry_base_delay * (2**attempt))
                     continue
@@ -112,6 +130,16 @@ class Fetcher:
                     break
                 await asyncio.sleep(self.retry_base_delay * (2**attempt))
         raise RuntimeError(f"Failed to fetch {url}") from last_error
+
+    async def _get_insecure_client(self) -> httpx.AsyncClient:
+        if self._insecure_client is None:
+            self._insecure_client = httpx.AsyncClient(
+                timeout=self._timeout_seconds,
+                follow_redirects=True,
+                verify=False,
+                headers=self._HEADERS,
+            )
+        return self._insecure_client
 
     @staticmethod
     def filter_same_domain(links: Iterable[Any], base_url: str) -> list[str]:
@@ -207,3 +235,18 @@ def _coerce_link(value: Any) -> str | None:
 
     cleaned = value.strip()
     return cleaned or None
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    """Return True if *exc* (or its chain) originates from an SSL failure."""
+    import ssl
+
+    cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, ssl.SSLError):
+            return True
+        msg = str(cur).lower()
+        if "ssl" in msg or "certificate" in msg:
+            return True
+        cur = cur.__cause__
+    return False

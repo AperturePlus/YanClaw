@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import ssl
 import time
 
 import httpx
+import pytest
 
-from agents.crawler.fetcher import Fetcher
+from agents.crawler.fetcher import Fetcher, _is_ssl_error
 
 
 async def test_fetcher_converts_html_extracts_links_and_rate_limits():
@@ -78,3 +80,98 @@ def test_filter_same_domain_accepts_dict_links_from_llm():
         "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm",
         "https://www.buaa.edu.cn/jgsz/dzjg01.htm",
     ]
+
+
+
+# --- SSL fallback tests ---
+
+
+def _ssl_then_ok_transport() -> tuple[httpx.MockTransport, httpx.MockTransport]:
+    """Return (failing_transport, insecure_transport) for SSL fallback tests."""
+
+    def ssl_handler(request: httpx.Request) -> httpx.Response:
+        ssl_err = ssl.SSLCertVerificationError("certificate verify failed")
+        raise httpx.ConnectError(str(ssl_err)) from ssl_err
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><body><p>OK</p></body></html>",
+            request=request,
+            headers={"content-type": "text/html"},
+        )
+
+    return httpx.MockTransport(ssl_handler), httpx.MockTransport(ok_handler)
+
+
+async def test_fetcher_falls_back_to_insecure_client_on_ssl_error():
+    failing_transport, ok_transport = _ssl_then_ok_transport()
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=0,
+        retry_base_delay=0,
+        transport=failing_transport,
+    )
+    async with fetcher:
+        # Inject the insecure client backed by the ok_transport
+        fetcher._insecure_client = httpx.AsyncClient(
+            transport=ok_transport, follow_redirects=True
+        )
+        result = await fetcher.fetch("https://math.pku.edu.cn/")
+
+    assert result.status_code == 200
+    assert "OK" in result.text
+
+
+async def test_fetcher_raises_non_ssl_errors_without_fallback():
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out")
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=0,
+        retry_base_delay=0,
+        transport=httpx.MockTransport(timeout_handler),
+    )
+    async with fetcher:
+        with pytest.raises(RuntimeError, match="Failed to fetch"):
+            await fetcher.fetch("https://example.edu.cn/")
+    # Insecure client should never have been created
+    assert fetcher._insecure_client is None
+
+
+async def test_fetcher_closes_insecure_client_on_exit():
+    failing_transport, ok_transport = _ssl_then_ok_transport()
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=0,
+        retry_base_delay=0,
+        transport=failing_transport,
+    )
+    async with fetcher:
+        fetcher._insecure_client = httpx.AsyncClient(
+            transport=ok_transport, follow_redirects=True
+        )
+        await fetcher.fetch("https://math.pku.edu.cn/")
+
+    assert fetcher._insecure_client.is_closed
+
+
+# --- _is_ssl_error unit tests ---
+
+
+def test_is_ssl_error_detects_ssl_error_in_chain():
+    ssl_err = ssl.SSLCertVerificationError("certificate verify failed")
+    connect_err = httpx.ConnectError(str(ssl_err))
+    connect_err.__cause__ = ssl_err
+    runtime_err = RuntimeError("Failed to fetch")
+    runtime_err.__cause__ = connect_err
+    assert _is_ssl_error(runtime_err) is True
+
+
+def test_is_ssl_error_returns_false_for_non_ssl():
+    err = RuntimeError("Failed to fetch")
+    err.__cause__ = httpx.ReadTimeout("timed out")
+    assert _is_ssl_error(err) is False
