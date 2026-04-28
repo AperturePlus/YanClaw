@@ -41,7 +41,7 @@ def _print_use_time_stats(values: list[int]) -> None:
         return
     avg = sum(values) / max(1, len(values))
     print(
-        "use_time (seconds): "
+        "use_time (ms): "
         f"avg={avg:.2f} p50={percentile(values, 50)} "
         f"p90={percentile(values, 90)} p99={percentile(values, 99)} "
         f"min={min(values)} max={max(values)}"
@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"cost:    {ov['cost']:.6f}")
     ut = ov["use_time"]
     print(
-        "use_time (seconds): "
+        "use_time (ms): "
         f"avg={ut['avg']:.2f} p50={ut['p50']} p90={ut['p90']} p99={ut['p99']} "
         f"min={ut['min']} max={ut['max']}"
     )

@@ -8,6 +8,7 @@ logs/
 gateway/data/
 
 *tmp*
+pytest_scratch/
 
 .uv-cache/
 
@@ -20,3 +21,5 @@ sandbox_temp/
 scripts/*txt
 
 gateway/
+
+pytest_foo/
