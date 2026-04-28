@@ -100,6 +100,19 @@ class LLMClient:
             last_content = content or last_content
 
             tool_calls = message.get("tool_calls") or []
+            tool_names = [
+                str((tool_call.get("function") or {}).get("name") or "")
+                for tool_call in tool_calls
+                if isinstance(tool_call, dict)
+            ]
+            self.logger.debug(
+                "LLM response round=%s content_chars=%s tool_calls=%s",
+                round_index,
+                len(content),
+                ",".join(name for name in tool_names if name) or "none",
+            )
+            if content:
+                self.logger.debug("LLM response preview: %s", self._preview_text(content))
             if not tool_calls:
                 return LLMResult(content=last_content, tool_call_log=records)
 
@@ -125,7 +138,15 @@ class LLMClient:
                     continue
 
                 if name not in handlers:
-                    raise KeyError(f"No handler registered for tool {name!r}")
+                    self.logger.warning("Ignoring unknown tool call name=%s args=%s", name, args)
+                    working_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": '{"error": "Tool not available in this runtime"}',
+                        }
+                    )
+                    continue
 
                 self.logger.debug("Executing tool name=%s args=%s", name, args)
                 result = handlers[name](**args)
@@ -133,6 +154,7 @@ class LLMClient:
                     result = await result
 
                 records.append(ToolCallRecord(name=name, args=args, result=result))
+                self.logger.debug("Tool result name=%s summary=%s", name, self._summarize_tool_result(result))
                 working_messages.append(
                     {
                         "role": "tool",
@@ -140,6 +162,11 @@ class LLMClient:
                         "content": self._stringify_tool_result(result),
                     }
                 )
+
+            # Most crawler tools are "fire-and-forget" (persisting results). Avoid a second
+            # LLM round to reduce latency and to prevent provider-specific requirements
+            # (e.g. DeepSeek thinking mode requiring reasoning_content passback).
+            return LLMResult(content=last_content, tool_call_log=records)
 
         self.logger.warning("LLM tool loop stopped after max_rounds=%s", self.max_rounds)
         return LLMResult(content=last_content, tool_call_log=records)
@@ -220,6 +247,31 @@ class LLMClient:
         if isinstance(result, str):
             return result
         return json.dumps(result, ensure_ascii=False, default=str)
+
+    def _preview_text(self, content: str, *, limit: int = 300) -> str:
+        compact = " ".join(content.strip().split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3] + "..."
+
+    def _summarize_tool_result(self, result: Any) -> str:
+        if isinstance(result, dict):
+            links = result.get("links")
+            if isinstance(links, list):
+                sample = [str(item) for item in links[:3]]
+                return f"links={len(links)} sample={sample}"
+            saved = result.get("saved")
+            if isinstance(saved, int):
+                academicians_saved = result.get("academicians_saved")
+                if isinstance(academicians_saved, int) and academicians_saved > 0:
+                    return f"saved={saved} academicians_saved={academicians_saved}"
+                return f"saved={saved}"
+            return f"keys={sorted(result.keys())}"
+        if isinstance(result, list):
+            return f"list[{len(result)}]"
+        if isinstance(result, str):
+            return f"text[{len(result)}]"
+        return type(result).__name__
 
     def _get(self, value: Any, key: str) -> Any:
         if isinstance(value, dict):
