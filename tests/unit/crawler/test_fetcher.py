@@ -65,3 +65,16 @@ def test_filter_same_domain_allows_subdomains_and_rejects_external():
         "https://cs.pku.edu.cn/people",
         "https://www.pku.edu.cn/about",
     ]
+
+
+def test_filter_same_domain_accepts_dict_links_from_llm():
+    links = [
+        {"url": "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"},
+        {"href": "https://www.buaa.edu.cn/jgsz/dzjg01.htm"},
+        {"url": "https://www.baidu.com/"},
+        {"text": "missing-url"},
+    ]
+    assert Fetcher.filter_same_domain(links, "https://www.buaa.edu.cn/") == [
+        "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm",
+        "https://www.buaa.edu.cn/jgsz/dzjg01.htm",
+    ]

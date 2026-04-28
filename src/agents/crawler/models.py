@@ -69,6 +69,7 @@ class Professor(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    org_unit_name: Mapped[str] = mapped_column(String(255), default="Unknown", index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
@@ -84,6 +85,28 @@ class Professor(Base):
         back_populates="professor",
         cascade="all, delete-orphan",
     )
+
+
+class Academician(Base):
+    __tablename__ = "academicians"
+    __table_args__ = (UniqueConstraint("name", "org_unit_id", name="uq_academician_name_org_unit"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    homepage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bio: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enrollment_pref: Mapped[str | None] = mapped_column(Text, nullable=True)
+    publications: Mapped[str | None] = mapped_column(Text, nullable=True)
+    org_unit_id: Mapped[int] = mapped_column(ForeignKey("org_units.id"), index=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    org_unit: Mapped[OrgUnit] = relationship()
 
 
 class ProfessorAffiliation(Base):

@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import html2text
@@ -114,13 +114,16 @@ class Fetcher:
         raise RuntimeError(f"Failed to fetch {url}") from last_error
 
     @staticmethod
-    def filter_same_domain(links: Iterable[str], base_url: str) -> list[str]:
+    def filter_same_domain(links: Iterable[Any], base_url: str) -> list[str]:
         base_host = (urlparse(base_url).hostname or "").lower()
         base_root = _site_root(base_host)
         filtered: list[str] = []
         seen: set[str] = set()
 
-        for link in links:
+        for raw_link in links:
+            link = _coerce_link(raw_link)
+            if not link:
+                continue
             parsed = urlparse(link)
             host = (parsed.hostname or "").lower()
             if not host:
@@ -180,3 +183,27 @@ def _is_html_content(content_type: str) -> bool:
     """Return True if the Content-Type header indicates HTML content."""
     ct = content_type.lower().split(";")[0].strip()
     return ct in {"text/html", "application/xhtml+xml", ""}
+
+
+def _coerce_link(value: Any) -> str | None:
+    """Coerce LLM-produced link payloads into plain URL strings."""
+    if isinstance(value, dict):
+        for key in ("url", "href", "link"):
+            candidate = value.get(key)
+            if isinstance(candidate, (str, bytes)):
+                value = candidate
+                break
+        else:
+            return None
+
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+
+    if not isinstance(value, str):
+        return None
+
+    cleaned = value.strip()
+    return cleaned or None

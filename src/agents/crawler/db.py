@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urldefrag, urlparse, urlunparse
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import (
+    Academician,
     CrawlLog,
     CrawlLogStatus,
     CrawlStatus,
@@ -18,6 +19,13 @@ from agents.crawler.models import (
     Professor,
     ProfessorAffiliation,
     UniversityMeta,
+)
+from agents.crawler.sanitizer import (
+    merge_enrollment_pref,
+    normalize_multivalue,
+    normalize_optional_text,
+    normalize_org_unit_name,
+    normalize_title,
 )
 
 
@@ -150,18 +158,16 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         raise ValueError("Professor name is required")
 
     org_unit_id = data.get("org_unit_id")
+    org_unit_name = normalize_org_unit_name(
+        data.get("org_unit")
+        or data.get("org_unit_name")
+        or data.get("college")
+        or data.get("college_name"),
+        default="Unknown",
+    )
     if org_unit_id is None:
-        org_unit_name = str(
-            data.get("org_unit")
-            or data.get("org_unit_name")
-            or data.get("college")
-            or data.get("college_name")
-            or ""
-        ).strip()
         org_unit_url = str(data.get("org_unit_url") or data.get("college_url") or "").strip()
         org_unit_kind = str(data.get("org_unit_kind") or "").strip() or None
-        if not org_unit_name:
-            raise ValueError("org_unit_name is required when org_unit_id is not provided")
         if not org_unit_url:
             # Allow missing URL when saving, but it will reduce org unit dedupe quality.
             org_unit_url = f"about:org_unit:{org_unit_name}"
@@ -172,19 +178,27 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
             kind=org_unit_kind,
         )
         org_unit_id = org_unit.id
+    elif org_unit_name == "Unknown":
+        existing_org = await session.get(OrgUnit, int(org_unit_id))
+        if existing_org and existing_org.name:
+            org_unit_name = normalize_org_unit_name(existing_org.name)
 
     email = _normalize_email(data.get("email"))
     homepage = _normalize_homepage(data.get("homepage"))
     values = {
         "name": name,
-        "title": data.get("title"),
-        "research_areas": _serialize_optional(data.get("research_areas")),
+        "org_unit_name": org_unit_name,
+        "title": normalize_title(data.get("title")),
+        "research_areas": normalize_multivalue(data.get("research_areas")),
         "email": email,
-        "phone": data.get("phone"),
+        "phone": normalize_optional_text(data.get("phone")),
         "homepage": homepage,
-        "bio": data.get("bio"),
-        "enrollment_pref": data.get("enrollment_pref") or data.get("enrollment_preference"),
-        "publications": _serialize_optional(data.get("publications")),
+        "bio": normalize_optional_text(data.get("bio")),
+        "enrollment_pref": merge_enrollment_pref(
+            data.get("enrollment_pref") or data.get("enrollment_preference"),
+            None,
+        ),
+        "publications": normalize_multivalue(data.get("publications")),
     }
 
     professor, same_org_unit = await _find_existing_professor(
@@ -215,6 +229,81 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
     )
     await session.flush()
     return professor
+
+
+async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Academician:
+    name = str(data["name"]).strip()
+    if not name:
+        raise ValueError("Academician name is required")
+
+    org_unit_id = data.get("org_unit_id")
+    org_unit_name = normalize_org_unit_name(
+        data.get("org_unit")
+        or data.get("org_unit_name")
+        or data.get("college")
+        or data.get("college_name"),
+        default="Unknown",
+    )
+    if org_unit_id is None:
+        org_unit_url = str(data.get("org_unit_url") or data.get("college_url") or "").strip()
+        org_unit_kind = str(data.get("org_unit_kind") or "").strip() or None
+        if not org_unit_url:
+            org_unit_url = f"about:org_unit:{org_unit_name}"
+        org_unit = await get_or_create_org_unit(
+            session,
+            name=org_unit_name,
+            url=org_unit_url,
+            kind=org_unit_kind,
+        )
+        org_unit_id = org_unit.id
+
+    values = {
+        "name": name,
+        "title": normalize_title(data.get("title")) or "院士",
+        "research_areas": normalize_multivalue(data.get("research_areas")),
+        "email": _normalize_email(data.get("email")),
+        "phone": normalize_optional_text(data.get("phone")),
+        "homepage": _normalize_homepage(data.get("homepage")),
+        "bio": normalize_optional_text(data.get("bio")),
+        "enrollment_pref": merge_enrollment_pref(
+            data.get("enrollment_pref") or data.get("enrollment_preference"),
+            None,
+        ),
+        "publications": normalize_multivalue(data.get("publications")),
+        "source_url": _normalize_url(data.get("source_url")),
+    }
+
+    existing = (
+        await session.execute(
+            select(Academician).where(
+                Academician.name == name,
+                Academician.org_unit_id == int(org_unit_id),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        existing = Academician(
+            **values,
+            org_unit_id=int(org_unit_id),
+            created_at=_now_utc(),
+            updated_at=_now_utc(),
+        )
+        session.add(existing)
+        await session.flush()
+        return existing
+
+    changed = False
+    for key, value in values.items():
+        if value in {None, ""}:
+            continue
+        current = getattr(existing, key)
+        if current in {None, ""}:
+            setattr(existing, key, value)
+            changed = True
+    if changed:
+        existing.updated_at = _now_utc()
+    await session.flush()
+    return existing
 
 
 async def ensure_professor_affiliation(
@@ -283,6 +372,58 @@ async def count_professors(session: AsyncSession) -> int:
     return int(count or 0)
 
 
+async def count_academicians(session: AsyncSession) -> int:
+    count = (await session.execute(select(func.count()).select_from(Academician))).scalar_one()
+    return int(count or 0)
+
+
+async def ensure_runtime_schema(session: AsyncSession) -> None:
+    """Best-effort lightweight schema patching for existing SQLite university DBs."""
+    if session.bind is None or session.bind.dialect.name != "sqlite":
+        return
+
+    if not await _sqlite_has_column(session, "professors", "org_unit_name"):
+        await session.execute(
+            text("ALTER TABLE professors ADD COLUMN org_unit_name VARCHAR(255) DEFAULT 'Unknown'")
+        )
+
+    await session.execute(
+        text(
+            "UPDATE professors SET org_unit_name = 'Unknown' "
+            "WHERE org_unit_name IS NULL OR trim(org_unit_name) = ''"
+        )
+    )
+
+    await _normalize_nullish_columns(
+        session,
+        "professors",
+        [
+            "title",
+            "research_areas",
+            "email",
+            "phone",
+            "homepage",
+            "bio",
+            "enrollment_pref",
+            "publications",
+        ],
+    )
+    await _normalize_nullish_columns(
+        session,
+        "academicians",
+        [
+            "title",
+            "research_areas",
+            "email",
+            "phone",
+            "homepage",
+            "bio",
+            "enrollment_pref",
+            "publications",
+        ],
+    )
+
+
 def load_university_targets_from_csv(path: str | Path) -> list[dict[str, str]]:
     """Load university targets from a CSV-like file (assets/websites.md)."""
 
@@ -314,6 +455,33 @@ def _row_value(row: dict[str, Any], *keys: str, fallback_index: int | None = Non
 
 def _normalize_header(value: Any) -> str:
     return str(value).strip().lower().replace(" ", "_")
+
+
+async def _sqlite_has_column(session: AsyncSession, table: str, column: str) -> bool:
+    result = await session.execute(text(f"PRAGMA table_info({table})"))
+    rows = result.fetchall()
+    for row in rows:
+        # row format: cid, name, type, notnull, dflt_value, pk
+        if len(row) > 1 and str(row[1]) == column:
+            return True
+    return False
+
+
+async def _normalize_nullish_columns(
+    session: AsyncSession,
+    table: str,
+    columns: list[str],
+) -> None:
+    for column in columns:
+        await session.execute(
+            text(
+                f"UPDATE {table} SET {column} = NULL "
+                f"WHERE {column} IS NOT NULL AND ("
+                f"trim({column}) = '' OR lower(trim({column})) IN "
+                "('null', 'none', 'n/a', 'na', 'nan', '--', '-', 'unknown')"
+                ")"
+            )
+        )
 
 
 def _serialize_optional(value: Any) -> str | None:
@@ -388,6 +556,9 @@ def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite:
         if key in {"name"} or value in {None, ""}:
             continue
         current = getattr(professor, key)
+        if key == "org_unit_name":
+            setattr(professor, key, _merge_org_unit_names(current, value))
+            continue
         if overwrite or current in {None, ""}:
             setattr(professor, key, value)
 
@@ -431,6 +602,22 @@ def _normalize_url(value: Any) -> str:
         path=parsed.path.rstrip("/"),
     )
     return urlunparse(normalized)
+
+
+def _merge_org_unit_names(current: Any, incoming: Any) -> str:
+    current_text = normalize_optional_text(current)
+    incoming_text = normalize_optional_text(incoming)
+    if not current_text and not incoming_text:
+        return "Unknown"
+    if not current_text:
+        return incoming_text or "Unknown"
+    if not incoming_text:
+        return current_text
+
+    existing = [part.strip() for part in current_text.split("；") if part.strip()]
+    if incoming_text not in existing:
+        existing.append(incoming_text)
+    return "；".join(existing) if existing else "Unknown"
 
 
 def _now_utc() -> Any:

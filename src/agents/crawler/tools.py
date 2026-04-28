@@ -4,6 +4,7 @@ from typing import Any
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetcher import Fetcher
+from agents.crawler.sanitizer import sanitize_professor_payload
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
 
@@ -20,6 +21,7 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
             "source_url": {"type": "string"},
             "professors": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -58,7 +60,22 @@ EXTRACT_LINKS_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "links": {"type": "array", "items": {"type": "string"}},
+            "links": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "href": {"type": "string"},
+                                "link": {"type": "string"},
+                            },
+                        },
+                    ]
+                },
+            },
             "base_url": {"type": "string"},
             "keywords": {"type": "array", "items": {"type": "string"}},
         },
@@ -76,6 +93,34 @@ def get_crawler_tools(
     db: DatabaseManager,
     skill_manager: SkillManager,
 ) -> dict[str, Any]:
+    # Reserved for future use (tool access policy may depend on active skills).
+    _ = skill_manager
+
+    def _normalize_link_item(item: Any) -> str | None:
+        if isinstance(item, dict):
+            for key in ("url", "href", "link"):
+                value = item.get(key)
+                if isinstance(value, (str, bytes)):
+                    item = value
+                    break
+            else:
+                return None
+
+        if isinstance(item, bytes):
+            try:
+                item = item.decode("utf-8", errors="ignore")
+            except Exception:
+                return None
+
+        if not isinstance(item, str):
+            return None
+
+        normalized = item.strip().strip("`").strip("*").strip("_").strip("<").strip(">").strip('"').strip("'")
+        while normalized and normalized[-1] in {")", "]", ">", "'", '"', ",", ";", "."}:
+            normalized = normalized[:-1]
+        normalized = normalized.strip()
+        return normalized or None
+
     async def save_professors(
         org_unit_name: str,
         professors: list[dict[str, Any]],
@@ -83,37 +128,54 @@ def get_crawler_tools(
         source_url: str | None = None,
     ) -> dict[str, Any]:
         saved = 0
+        academicians_saved = 0
         errors: list[str] = []
         for professor in professors:
             try:
+                cleaned, is_academician = sanitize_professor_payload(
+                    professor,
+                    org_unit_name=org_unit_name,
+                )
                 async with db.session() as session:
                     data = {
-                        **professor,
-                        "org_unit_name": org_unit_name,
+                        **cleaned,
                         "org_unit_url": org_unit_url,
                         "source_url": source_url,
                     }
-                    await crawler_db.upsert_professor(session, data)
-                    saved += 1
+                    if is_academician:
+                        await crawler_db.upsert_academician(session, data)
+                        academicians_saved += 1
+                    else:
+                        await crawler_db.upsert_professor(session, data)
+                        saved += 1
             except Exception as exc:
                 errors.append(f"{professor.get('name', '?')}: {exc}")
         result: dict[str, Any] = {"saved": saved}
+        if academicians_saved:
+            result["academicians_saved"] = academicians_saved
         if errors:
             result["errors"] = errors
         return result
 
     async def extract_links(
-        links: list[str],
+        links: list[Any],
         base_url: str,
         keywords: list[str] | None = None,
     ) -> dict[str, Any]:
-        same_domain = Fetcher.filter_same_domain(links, base_url)
-        if keywords:
-            lowered = [keyword.lower() for keyword in keywords]
-            same_domain = [
-                link for link in same_domain if any(keyword in link.lower() for keyword in lowered)
-            ]
-        return {"links": same_domain}
+        normalized_links = [item for link in links if (item := _normalize_link_item(link))]
+        same_domain = Fetcher.filter_same_domain(normalized_links, base_url)
+        if not keywords:
+            return {"links": same_domain}
+
+        lowered = [str(keyword).strip().lower() for keyword in keywords if str(keyword).strip()]
+        if not lowered:
+            return {"links": same_domain}
+
+        filtered = [link for link in same_domain if any(keyword in link.lower() for keyword in lowered)]
+        # Many Chinese university sites use non-semantic/pinyin URL paths, while the LLM may provide
+        # human-language keywords. Avoid filtering everything out: only apply keyword filtering when
+        # it yields at least one candidate.
+        return {"links": filtered or same_domain}
 
     return {
         "save_professors": save_professors,

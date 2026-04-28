@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetcher import FetchResult, Fetcher
@@ -156,39 +156,38 @@ class CrawlerAgent:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
-
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
-        skills = await self._select_skills(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
-
-        result = await self._ask_llm(
-            CrawlerState.DISCOVER_ORG_UNIT_PAGES,
-            "Find links that lead to pages listing colleges/schools/departments/research institutes "
-            "(e.g. 院系设置, 组织机构, 学院设置, 教学单位, 科研机构). Return only links.",
-            home,
-            skills,
-        )
-        links = self._links_from_result(result.content)
+        links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
         if not links:
-            links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
+            skills = await self._select_skills(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
+            result = await self._ask_llm(
+                CrawlerState.DISCOVER_ORG_UNIT_PAGES,
+                "Find links that lead to pages listing colleges/schools/departments/research institutes "
+                "(e.g. org-structure, jgsz, yxsz, colleges, schools, departments). Return only links.",
+                home,
+                skills,
+            )
+            links = self._links_from_result(result.content)
+
         links = self.fetcher.filter_same_domain(links, self.start_url)
         links = [l for l in links if not _is_faculty_platform(l)]
+        links = _rank_org_unit_page_candidates(links, self.start_url)
 
         if not links:
             self.logger.info("No org unit pages from homepage, trying search engine fallback")
-            search_links = await self._search_engine_fallback("院系 机构设置")
+            search_links = await self._search_engine_fallback("org unit colleges schools departments jgsz yxsz")
             links = self.fetcher.filter_same_domain(search_links, self.start_url)
+            links = _rank_org_unit_page_candidates(links, self.start_url)
 
         if not links:
-            # Extremely JS-heavy homepages: use homepage itself.
             links = [home.url]
 
         return [
             _QueuedUrl(url=link, depth=1, label="org_unit_page")
-            for link in links[:10]
+            for link in links[:20]
             if self._within_depth(1)
         ]
-
     async def _extract_org_units(self, org_unit_pages: list[_QueuedUrl]) -> list[OrgUnit]:
         self._log_state(CrawlerState.EXTRACT_ORG_UNITS)
         skills = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
@@ -214,7 +213,8 @@ class CrawlerAgent:
             async with self.db.session() as session:
                 for unit in units:
                     name = str(unit.get("name") or "").strip()
-                    url = _sanitize_url(str(unit.get("url") or "").strip())
+                    raw_url = _sanitize_url(str(unit.get("url") or "").strip())
+                    url = urljoin(fetched.url, raw_url) if raw_url and not urlparse(raw_url).scheme else raw_url
                     kind = str(unit.get("kind") or "").strip() or None
                     if not name or not url:
                         continue
@@ -235,13 +235,32 @@ class CrawlerAgent:
 
         async with self.db.session() as session:
             return await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
-
     async def _find_faculty_pages(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
-        skills = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
         faculty_links: list[_QueuedUrl] = []
+        max_links_per_org_unit = 3
+        skills = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
+        llm_fallback_budget = 3
 
-        for org_unit in org_units[: self.max_org_units_per_university]:
+        preferred: list[OrgUnit] = []
+        for unit in org_units:
+            kind = (unit.kind or "").strip().lower()
+            if kind in {"division", "xuebu"}:
+                continue
+            preferred.append(unit)
+        candidates = preferred or org_units
+        max_links = min(max(40, len(candidates) * 2), 160)
+
+        start_host = (urlparse(self.start_url).hostname or "").lower()
+        candidates = sorted(
+            candidates,
+            key=lambda unit: (
+                0 if (urlparse(unit.url).hostname or "").lower() != start_host else 1,
+                unit.id,
+            ),
+        )
+
+        for org_unit in candidates[: self.max_org_units_per_university]:
             item = _QueuedUrl(
                 url=org_unit.url,
                 depth=1,
@@ -258,29 +277,50 @@ class CrawlerAgent:
             if fetched is None:
                 continue
 
-            result = await self._ask_llm(
-                CrawlerState.FIND_FACULTY_PAGES,
-                f"Current org unit: {item.label}. Find faculty list, teacher team, tutor, staff, or people pages.",
-                fetched,
-                skills,
-            )
-            links = self._links_from_result(result.content)
-            if not links:
-                links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
+            links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
             links = [
                 l
                 for l in self.fetcher.filter_same_domain(links, self.start_url)
                 if not _is_faculty_platform(l)
             ]
+            links = _rank_faculty_page_candidates(links)
+            non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
+            if non_showcase_links:
+                links = non_showcase_links
 
             if not links and _is_college_subdomain(fetched.url, self.start_url):
-                probed = await self._probe_faculty_paths(fetched.url)
-                links.extend(probed)
+                links.extend(await self._probe_faculty_paths(fetched.url))
 
             if not links and _looks_like_faculty_page(fetched.url):
                 links = [fetched.url]
 
-            for link in links:
+            if not links and llm_fallback_budget > 0:
+                llm_fallback_budget -= 1
+                result = await self._ask_llm(
+                    CrawlerState.FIND_FACULTY_PAGES,
+                    "Find links that lead to faculty list pages for this org unit (e.g. faculty, teacher, staff, people, szdw, jsdw). Return only links.",
+                    fetched,
+                    skills,
+                )
+                links = self._links_from_result(result.content)
+                if not links:
+                    for record in result.tool_call_log:
+                        if record.name != "extract_links":
+                            continue
+                        if isinstance(record.result, dict):
+                            links = list(record.result.get("links") or [])
+                            break
+                links = [
+                    l
+                    for l in self.fetcher.filter_same_domain(links, self.start_url)
+                    if not _is_faculty_platform(l)
+                ]
+                links = _rank_faculty_page_candidates(links)
+                non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
+                if non_showcase_links:
+                    links = non_showcase_links
+
+            for link in links[:max_links_per_org_unit]:
                 depth = item.depth + (0 if link == fetched.url else 1)
                 if self._within_depth(depth):
                     faculty_links.append(
@@ -294,14 +334,16 @@ class CrawlerAgent:
 
         if not faculty_links:
             self.logger.info("No faculty links from org units, trying search engine fallback")
-            search_links = await self._search_engine_fallback("师资队伍 教师名录")
+            search_links = await self._search_engine_fallback("faculty teachers professors list szdw jsdw")
             search_links = [l for l in search_links if not _is_faculty_platform(l)]
+            search_links = _rank_faculty_page_candidates(search_links)
             for link in search_links:
                 if self._within_depth(2):
                     faculty_links.append(_QueuedUrl(url=link, depth=2, label="Unknown"))
+                if len(faculty_links) >= max_links:
+                    break
 
-        return _dedupe_queue(faculty_links)
-
+        return _dedupe_queue(faculty_links)[:max_links]
     async def _probe_faculty_paths(self, org_unit_url: str) -> list[str]:
         """Try common Chinese university faculty page paths on an org unit subdomain."""
         parsed = urlparse(org_unit_url)
@@ -328,17 +370,19 @@ class CrawlerAgent:
             except Exception:
                 pass
         return found
-
     async def _extract_professors(self, faculty_links: list[_QueuedUrl]) -> None:
         self._log_state(CrawlerState.EXTRACT_PROFESSORS)
         skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
-        for item in faculty_links[:30]:
+        max_pages = min(max(40, len(faculty_links)), 120)
+        for item in faculty_links[:max_pages]:
             pages_to_process = [item]
             while pages_to_process:
                 current = pages_to_process.pop(0)
                 fetched = await self._fetch_url(current.url, current.depth)
                 if fetched is None:
                     continue
+
+                saved_before = self.saved_professors
                 result = await self._ask_llm(
                     CrawlerState.EXTRACT_PROFESSORS,
                     "Extract public professor records and call save_professors when records are found. "
@@ -347,14 +391,35 @@ class CrawlerAgent:
                     fetched,
                     skills,
                 )
+
                 tool_saved = False
                 for record in result.tool_call_log:
                     if record.name == "save_professors":
                         saved = int(record.result.get("saved", 0)) if isinstance(record.result, dict) else 0
                         self.saved_professors += saved
-                        tool_saved = True
+                        if saved > 0:
+                            tool_saved = True
+
                 if not tool_saved:
                     await self._save_professors_from_content(result.content, current.label or "Unknown")
+
+                saved_delta = self.saved_professors - saved_before
+                if saved_delta <= 0:
+                    followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
+                    for link in followups[:3]:
+                        if link in self.visited_urls:
+                            continue
+                        next_depth = current.depth + 1
+                        if not self._within_depth(next_depth):
+                            continue
+                        pages_to_process.append(
+                            _QueuedUrl(
+                                url=link,
+                                depth=next_depth,
+                                label=current.label,
+                                org_unit_id=current.org_unit_id,
+                            )
+                        )
 
                 pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
                 for plink in pagination_links:
@@ -375,6 +440,25 @@ class CrawlerAgent:
         fetched: FetchResult,
         skills_text: str,
     ) -> Any:
+        prompt_max_tokens = min(int(self.model_max_tokens), 16000)
+        raw_links = list(fetched.links or [])
+        same_domain_links = self.fetcher.filter_same_domain(raw_links, self.start_url) if raw_links else []
+        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.EXTRACT_ORG_UNITS}:
+            candidate_links = _keyword_filter(same_domain_links, ORG_UNIT_PAGE_KEYWORDS) or same_domain_links
+        elif state in {CrawlerState.FIND_FACULTY_PAGES, CrawlerState.EXTRACT_PROFESSORS}:
+            candidate_links = _keyword_filter(same_domain_links, FACULTY_KEYWORDS) or same_domain_links
+        else:
+            candidate_links = same_domain_links
+        candidate_links = candidate_links[:250]
+
+        text_limits = {
+            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 8000,
+            CrawlerState.EXTRACT_ORG_UNITS: 20000,
+            CrawlerState.FIND_FACULTY_PAGES: 12000,
+            CrawlerState.EXTRACT_PROFESSORS: 20000,
+        }
+        page_text = _truncate_middle(fetched.text or "", text_limits.get(state, 12000))
+
         user_content = json.dumps(
             {
                 "university": self.university_name,
@@ -382,9 +466,9 @@ class CrawlerAgent:
                 "state": state.value,
                 "url": fetched.url,
                 "instruction": instruction,
-                "visited_urls": sorted(self.visited_urls)[-30:],
-                "links": fetched.links,
-                "page_text": fetched.text,
+                "visited_urls": sorted(self.visited_urls)[-15:],
+                "links": candidate_links,
+                "page_text": page_text,
             },
             ensure_ascii=False,
         )
@@ -395,12 +479,13 @@ class CrawlerAgent:
         elif state is CrawlerState.EXTRACT_PROFESSORS:
             allowed_tools = {"save_professors"}
         tool_defs = [tool for tool in tool_defs if tool.get("name") in allowed_tools] if allowed_tools else []
+
         batches = self.context_manager.build_messages(
             "You are a cautious university faculty crawler. Stay on the same university domain.",
             tool_defs,
             skills_text,
             user_content,
-            self.model_max_tokens,
+            prompt_max_tokens,
         )
         handlers = get_crawler_tools(self.db, self.skill_manager)
         final_result = None
@@ -413,14 +498,23 @@ class CrawlerAgent:
         assert final_result is not None
         return final_result
 
-    async def _select_skills(self, _state: CrawlerState) -> str:
-        # No LLM-driven skill selection; load all generic skills.
+    async def _select_skills(self, state: CrawlerState) -> str:
         metas = self.skill_manager.list_skills()
         if not metas:
             return ""
-        names = [meta.name for meta in metas]
-        return "\n\n".join(self.skill_manager.load_skills(names).values())
 
+        available = {meta.name for meta in metas}
+        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.FIND_FACULTY_PAGES}:
+            desired = ["extract-links", "crawler-loop-detection"]
+        elif state is CrawlerState.EXTRACT_PROFESSORS:
+            desired = ["save-professors", "crawler-loop-detection"]
+        else:
+            desired = ["crawler-loop-detection"]
+
+        names = [name for name in desired if name in available]
+        if not names:
+            names = [meta.name for meta in metas]
+        return "\n\n".join(self.skill_manager.load_skills(names).values())
     async def _fetch_url(self, url: str, depth: int) -> FetchResult | None:
         url = _sanitize_url(url)
         if not url:
@@ -486,15 +580,14 @@ class CrawlerAgent:
         return fetched
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
+        payload = self._parse_json_from_text(content)
+        if payload is None or not isinstance(payload, dict):
             return
-        if not isinstance(payload, dict):
-            return
+
         professors = payload.get("professors")
         if not isinstance(professors, list) or not professors:
             return
+
         org_unit_name = str(
             payload.get("org_unit_name")
             or payload.get("college_name")
@@ -503,20 +596,16 @@ class CrawlerAgent:
         )
         source_url = str(payload.get("source_url") or "").strip() or None
         org_unit_url = str(payload.get("org_unit_url") or "").strip() or None
-        async with self.db.session() as session:
-            for professor in professors:
-                if not isinstance(professor, dict):
-                    continue
-                await crawler_db.upsert_professor(
-                    session,
-                    {
-                        **professor,
-                        "org_unit_name": org_unit_name,
-                        "org_unit_url": org_unit_url,
-                        "source_url": source_url,
-                    },
-                )
-                self.saved_professors += 1
+
+        tools = get_crawler_tools(self.db, self.skill_manager)
+        result = await tools["save_professors"](
+            org_unit_name=org_unit_name,
+            org_unit_url=org_unit_url,
+            source_url=source_url,
+            professors=[item for item in professors if isinstance(item, dict)],
+        )
+        if isinstance(result, dict):
+            self.saved_professors += int(result.get("saved", 0) or 0)
 
     async def _ensure_university(self) -> UniversityMeta:
         if self._university_cache is not None:
@@ -539,9 +628,8 @@ class CrawlerAgent:
             return await crawler_db.count_professors(session)
 
     def _links_from_result(self, content: str) -> list[str]:
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
+        payload = self._parse_json_from_text(content)
+        if payload is None:
             return []
         if isinstance(payload, list):
             return [_sanitize_url(str(item)) for item in payload if _sanitize_url(str(item))]
@@ -555,16 +643,51 @@ class CrawlerAgent:
         return []
 
     def _org_units_from_result(self, content: str) -> list[dict[str, Any]]:
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError:
-            return []
-        if not isinstance(payload, dict):
+        payload = self._parse_json_from_text(content)
+        if payload is None or not isinstance(payload, dict):
             return []
         units = payload.get("org_units")
         if isinstance(units, list):
             return [item for item in units if isinstance(item, dict)]
         return []
+
+    def _parse_json_from_text(self, content: str) -> Any | None:
+        if not content:
+            return None
+        text = content.strip()
+
+        def _try_load(candidate: str) -> Any | None:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                return None
+
+        loaded = _try_load(text)
+        if loaded is not None:
+            return loaded
+
+        fence = "```"
+        if fence in text:
+            start = text.find(fence)
+            end = text.find(fence, start + len(fence))
+            if start != -1 and end != -1 and end > start:
+                block = text[start + len(fence) : end]
+                if "\n" in block:
+                    block = block.split("\n", 1)[1]
+                loaded = _try_load(block.strip())
+                if loaded is not None:
+                    return loaded
+
+        for open_char, close_char in (("{", "}"), ("[", "]")):
+            start = text.find(open_char)
+            end = text.rfind(close_char)
+            if start == -1 or end == -1 or end <= start:
+                continue
+            loaded = _try_load(text[start : end + 1].strip())
+            if loaded is not None:
+                return loaded
+
+        return None
 
     def _within_depth(self, depth: int) -> bool:
         return depth <= self.max_depth
@@ -598,16 +721,28 @@ class CrawlerAgent:
                 pagination.append(link)
         return pagination
 
+    def _extract_followup_faculty_links(self, links: list[str], current_url: str) -> list[str]:
+        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
+        candidates = [link for link in same_domain if link != current_url and not _is_faculty_platform(link)]
+        candidates = _rank_faculty_page_candidates(candidates)
+        non_showcase = [link for link in candidates if not _is_academician_showcase_page(link)]
+        if non_showcase:
+            candidates = non_showcase
+        return candidates
+
     async def _search_engine_fallback(self, query_suffix: str) -> list[str]:
         """Use Bing search as fallback to find relevant pages on the university domain."""
         hostname = urlparse(self.start_url).hostname or ""
         domain = hostname.removeprefix("www.")
-        query = f"{self.university_name} {query_suffix} site:{domain}"
+        suffix = (query_suffix or "").strip()
+        if suffix and not _contains_cjk(suffix) and any(ord(ch) > 127 for ch in suffix):
+            suffix = ""
+        extra = "jgsz yxsz xysz zzjg xy yx xygk xxgk szdw jsdw faculty teacher staff people"
+        query = f"{suffix} {extra} site:{domain}".strip()
         search_url = f"https://www.bing.com/search?q={quote(query)}&count=20&setlang=en&cc=us"
         self.logger.info("Search engine fallback: %s", query)
         try:
             fetched = await self.fetcher.fetch(search_url)
-            # Use extracted <a href> links as source of truth.
             text_urls = _extract_urls_from_text(fetched.text)
             all_urls = list(dict.fromkeys(fetched.links + text_urls))
             same_domain = self.fetcher.filter_same_domain(all_urls, self.start_url)
@@ -619,16 +754,23 @@ class CrawlerAgent:
             self.logger.warning("Search engine fallback failed: %s", error)
             self.execution_log.append(f"search_fallback failed: {error}")
             return []
-
-
 ORG_UNIT_PAGE_KEYWORDS = (
     "college",
     "school",
     "department",
     "academy",
     "faculty",
+    "institute",
     "yuan",
     "xueyuan",
+    "yuanxi",
+    "/jgsz",
+    "/zzjg",
+    "/jxjg",
+    "/yxsz",
+    "/xysz",
+    "/xygk",
+    "/xxgk",
     "院",
     "系",
     "学院",
@@ -650,14 +792,26 @@ FACULTY_KEYWORDS = (
     "tutor",
     "supervisor",
     "professor",
+    "mentor",
+    "directory",
+    "list",
+    "szdw",
+    "szll",
+    "jsdw",
+    "qzjs",
+    "rcdw",
+    "jzg",
+    "faculty_list",
+    "teacher_list",
+    "facultylist",
+    "teacherlist",
+    "teaching_staff",
     "师资",
     "教师",
     "导师",
     "教工",
     "人才",
 )
-
-
 def _keyword_filter(links: list[str], keywords: tuple[str, ...]) -> list[str]:
     lowered = [(keyword, keyword.lower()) for keyword in keywords]
     return [
@@ -671,6 +825,135 @@ def _looks_like_faculty_page(url: str) -> bool:
     return bool(_keyword_filter([url], FACULTY_KEYWORDS))
 
 
+def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
+    if not links:
+        return []
+
+    strong_tokens = (
+        "teacher",
+        "faculty",
+        "staff",
+        "people",
+        "directory",
+        "list",
+        "professor",
+        "mentor",
+        "szdw",
+        "jsdw",
+        "qzjs",
+        "jzg",
+        "导师",
+        "教师",
+        "名录",
+    )
+    weak_tokens = (
+        "lyys",
+        "yuanshi",
+        "academician",
+        "jxms",
+        "mingshi",
+        "ldsr",
+        "award",
+        "honor",
+        "rongyu",
+        "yuan-shi",
+        "famous-teacher",
+    )
+
+    def _score(link: str) -> int:
+        lowered = link.lower()
+        score = 0
+        if any(token in lowered for token in strong_tokens):
+            score += 6
+        if any(token in lowered for token in weak_tokens):
+            score -= 8
+        if _is_pagination_link(link):
+            score -= 3
+        return score
+
+    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for link in ranked:
+        if link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+    return deduped
+
+
+def _is_academician_showcase_page(url: str) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in ("lyys", "yuanshi", "academician", "yuan-shi"))
+
+
+def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str]:
+    if not links:
+        return []
+
+    start_host = (urlparse(start_url).hostname or "").lower()
+    strong_tokens = (
+        "/jgsz",
+        "/yxsz",
+        "/zzjg",
+        "/jxjg",
+        "/xysz",
+        "jgsz",
+        "yxsz",
+        "zzjg",
+    )
+    medium_tokens = (
+        "college",
+        "school",
+        "department",
+        "academy",
+        "/xy/",
+        "/yx/",
+        "xueyuan",
+        "yuanxi",
+    )
+    weak_tokens = (
+        "/xygk",
+        "/xxgk",
+        "/about",
+        "/overview",
+        "/intro",
+        "/history",
+        "/leader",
+        "/news",
+        "/notice",
+    )
+
+    def _score(link: str) -> int:
+        lowered = link.lower()
+        parsed = urlparse(link)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lower()
+        score = 0
+        if host and host != start_host:
+            score += 2
+        if any(token in lowered for token in strong_tokens):
+            score += 8
+        if any(token in lowered for token in medium_tokens):
+            score += 3
+        if any(token in lowered for token in weak_tokens):
+            score -= 4
+        if _is_faculty_platform(link):
+            score -= 10
+        depth = max(0, path.count("/") - 1)
+        if depth <= 2:
+            score += 1
+        return score
+
+    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for link in ranked:
+        if link in seen:
+            continue
+        seen.add(link)
+        deduped.append(link)
+    return deduped
 def _is_faculty_platform(url: str) -> bool:
     """Return True if URL belongs to a faculty.xxx.edu.cn homepage platform (not a real faculty list)."""
     host = (urlparse(url).hostname or "").lower()
@@ -736,6 +1019,17 @@ def _sanitize_url(url: str) -> str:
     return url
 
 
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    half = max(1, max_chars // 2)
+    head = text[:half].rstrip()
+    tail = text[-half:].lstrip()
+    return head + "\n\n...[truncated]...\n\n" + tail
+
+
 _PAGINATION_RE = re.compile(
     r"[?&](page|p|pagenum|pn|start|offset)=\d+"
     r"|/list_\d+\.htm"
@@ -763,3 +1057,33 @@ def _extract_urls_from_text(text: str) -> list[str]:
             seen.add(url)
             urls.append(url)
     return urls
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

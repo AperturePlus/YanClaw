@@ -59,6 +59,48 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
     assert FakeAgent.max_active == 1
 
 
+class SlowAgent:
+    def __init__(self, **kwargs):
+        self.university_name = kwargs["university_name"]
+
+    async def run(self):
+        await asyncio.sleep(2)
+        return type(
+            "Result",
+            (),
+            {
+                "university_name": self.university_name,
+                "status": CrawlStatus.COMPLETED.value,
+                "visited_count": 1,
+                "saved_professors": 0,
+                "messages": [],
+            },
+        )()
+
+
+async def test_dispatcher_enforces_university_timeout(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        request_interval_seconds=0,
+        max_retries=0,
+        university_timeout_seconds=0.5,
+    )
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=SlowAgent)
+    summary = await dispatcher.run(universities=["A"])
+
+    assert summary.failed == 1
+    assert summary.results[0].status == CrawlStatus.FAILED.value
+    assert any("Timeout after" in message for message in summary.results[0].messages)
+
+
 def test_university_db_path_differs_per_school(tmp_path):
     from agents.crawler.dispatcher import _university_db_path
 

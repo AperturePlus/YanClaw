@@ -9,7 +9,7 @@ from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
-from runtime.logger import setup_logging
+from runtime.logger import get_logger, setup_logging
 from runtime.skills import SkillManager
 
 
@@ -22,11 +22,32 @@ def cli() -> None:
 @click.option("--universities", default="", help="Comma-separated university names to crawl.")
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency.")
 @click.option("--log-dir", default=None, type=click.Path(path_type=Path), help="Log directory.")
+@click.option(
+    "--fetcher-backend",
+    default=None,
+    type=click.Choice(["httpx", "playwright"], case_sensitive=False),
+    help="Fetcher backend: httpx (default) or playwright for JS-heavy sites.",
+)
+@click.option(
+    "--university-timeout-seconds",
+    default=None,
+    type=float,
+    help="Per-university crawl timeout (seconds).",
+)
+@click.option(
+    "--run-timeout-seconds",
+    default=None,
+    type=float,
+    help="Total crawl timeout for this CLI invocation (seconds).",
+)
 @click.option("--skip-llm-check", is_flag=True, help="Skip the startup LLM connectivity check.")
 def crawl(
     universities: str,
     concurrency: int | None,
     log_dir: Path | None,
+    fetcher_backend: str | None,
+    university_timeout_seconds: float | None,
+    run_timeout_seconds: float | None,
     skip_llm_check: bool,
 ) -> None:
     """Start crawler agents."""
@@ -36,10 +57,31 @@ def crawl(
         overrides["max_concurrency"] = concurrency
     if log_dir is not None:
         overrides["log_dir"] = log_dir
+    if fetcher_backend is not None:
+        overrides["fetcher_backend"] = fetcher_backend
+    if university_timeout_seconds is not None:
+        overrides["university_timeout_seconds"] = university_timeout_seconds
     settings = CrawlerSettings().model_copy(update=overrides) if overrides else CrawlerSettings()
     setup_logging(settings.log_dir)
+    logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
-    asyncio.run(_crawl_async(settings, selected, skip_llm_check=skip_llm_check))
+    logger.info(
+        "Crawler config concurrency=%s fetcher_backend=%s university_timeout_seconds=%s request_timeout_seconds=%s llm_timeout_seconds=%s selected=%s",
+        settings.max_concurrency,
+        settings.fetcher_backend,
+        settings.university_timeout_seconds,
+        settings.request_timeout_seconds,
+        settings.llm_timeout_seconds,
+        ",".join(selected) if selected else "*",
+    )
+    asyncio.run(
+        _crawl_async(
+            settings,
+            selected,
+            skip_llm_check=skip_llm_check,
+            run_timeout_seconds=run_timeout_seconds,
+        )
+    )
 
 
 async def _crawl_async(
@@ -47,11 +89,18 @@ async def _crawl_async(
     universities: list[str] | None,
     *,
     skip_llm_check: bool = False,
+    run_timeout_seconds: float | None = None,
 ) -> None:
     if not skip_llm_check:
         await _check_llm(settings)
     dispatcher = CrawlDispatcher(settings=settings)
-    summary = await dispatcher.run(universities)
+    try:
+        if run_timeout_seconds is None:
+            summary = await dispatcher.run(universities)
+        else:
+            summary = await asyncio.wait_for(dispatcher.run(universities), timeout=float(run_timeout_seconds))
+    except asyncio.TimeoutError:
+        raise click.ClickException(f"Total run timeout after {run_timeout_seconds}s")
     click.echo(f"success={summary.success} failed={summary.failed} skipped={summary.skipped}")
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
@@ -61,7 +63,8 @@ async def test_crawler_db_upsert_dedupe_status_and_targets(tmp_path):
     async with db.session() as session:
         professors = (await session.execute(select(Professor))).scalars().all()
         assert len(professors) == 1
-        assert professors[0].title == "Chair Professor"
+        assert professors[0].title == "教授"
+        assert professors[0].org_unit_name == "CS"
 
     await db.close()
 
@@ -103,7 +106,9 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
         assert len(affiliations) == 2
         assert professors[0].email == "ada@testu.edu.cn"
         # Cross-org-unit merge should be conservative (do not overwrite existing title).
-        assert professors[0].title == "Professor"
+        assert professors[0].title == "教授"
+        assert "Computer Science" in professors[0].org_unit_name
+        assert "Software" in professors[0].org_unit_name
 
     await db.close()
 
@@ -118,3 +123,59 @@ async def test_load_university_targets_accepts_markdown_autolink_urls(tmp_path):
     assert targets[0]["url"] == "https://www.example.edu.cn/"
     assert targets[0]["location"] == "City"
 
+
+async def test_upsert_academician_professors(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "cleanup.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_academician(
+            session,
+            {
+                "name": "A",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.example.edu.cn/",
+                "title": "Academician",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "B",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.example.edu.cn/",
+                "title": "Professor",
+            },
+        )
+        assert await crawler_db.count_academicians(session) == 1
+        assert await crawler_db.count_professors(session) == 1
+
+    await db.close()
+
+
+async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "schema.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        session.add(
+            Professor(
+                name="A",
+                org_unit_name="",
+                title="",
+                email="",
+                phone="",
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        professor = (await session.execute(select(Professor))).scalar_one()
+        assert professor.org_unit_name == "Unknown"
+        assert professor.title is None
+        assert professor.email is None
+        assert professor.phone is None
+
+    await db.close()

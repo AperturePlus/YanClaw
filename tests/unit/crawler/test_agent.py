@@ -5,7 +5,12 @@ import json
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
-from agents.crawler.agent import CrawlerAgent
+from agents.crawler.agent import (
+    CrawlerAgent,
+    _is_academician_showcase_page,
+    _rank_faculty_page_candidates,
+    _rank_org_unit_page_candidates,
+)
 from agents.crawler.fetcher import FetchResult, Fetcher
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
 from runtime.context import ContextManager
@@ -72,7 +77,17 @@ class FakeLLMHomeAsOrgList(FakeLLM):
         return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
 
 
-async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
+class FakeLLMWithFacultyFollowup(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        user = messages[-1]["content"]
+        payload = json.loads(user)
+        state = payload["state"]
+        if state == "FIND_FACULTY_PAGES":
+            return LLMResult('{"links": ["https://www.example.edu.cn/cs/landing"]}')
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3, pages=None):
     db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
     await db.init_db()
     skills_dir = tmp_path / "skills"
@@ -80,32 +95,33 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3):
     await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
     await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
 
-    pages = {
-        "https://www.example.edu.cn/": FetchResult(
-            "https://www.example.edu.cn/",
-            "home",
-            ["https://www.example.edu.cn/orgs"],
-            200,
-        ),
-        "https://www.example.edu.cn/orgs": FetchResult(
-            "https://www.example.edu.cn/orgs",
-            "org list",
-            ["https://www.example.edu.cn/cs"],
-            200,
-        ),
-        "https://www.example.edu.cn/cs": FetchResult(
-            "https://www.example.edu.cn/cs",
-            "cs",
-            ["https://www.example.edu.cn/cs/faculty"],
-            200,
-        ),
-        "https://www.example.edu.cn/cs/faculty": FetchResult(
-            "https://www.example.edu.cn/cs/faculty",
-            "faculty",
-            [],
-            200,
-        ),
-    }
+    if pages is None:
+        pages = {
+            "https://www.example.edu.cn/": FetchResult(
+                "https://www.example.edu.cn/",
+                "home",
+                ["https://www.example.edu.cn/orgs"],
+                200,
+            ),
+            "https://www.example.edu.cn/orgs": FetchResult(
+                "https://www.example.edu.cn/orgs",
+                "org list",
+                ["https://www.example.edu.cn/cs"],
+                200,
+            ),
+            "https://www.example.edu.cn/cs": FetchResult(
+                "https://www.example.edu.cn/cs",
+                "cs",
+                ["https://www.example.edu.cn/cs/faculty"],
+                200,
+            ),
+            "https://www.example.edu.cn/cs/faculty": FetchResult(
+                "https://www.example.edu.cn/cs/faculty",
+                "faculty",
+                [],
+                200,
+            ),
+        }
     fetcher = FakeFetcher(pages)
     agent = CrawlerAgent(
         university_name="TestU",
@@ -169,6 +185,53 @@ async def test_agent_can_reuse_homepage_when_org_unit_page_is_home(tmp_path):
     await db.close()
 
 
+async def test_agent_extracts_from_followup_faculty_pages_when_landing_page_has_no_records(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/landing"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/landing": FetchResult(
+            "https://www.example.edu.cn/cs/landing",
+            "landing",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMWithFacultyFollowup(),
+        pages=pages,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert "https://www.example.edu.cn/cs/faculty" in fetcher.calls
+    await db.close()
+
+
 async def test_agent_refetches_successful_urls_for_incomplete_university(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     async with db.session() as session:
@@ -191,3 +254,31 @@ async def test_agent_refetches_successful_urls_for_incomplete_university(tmp_pat
     assert result.status == CrawlStatus.COMPLETED.value
     assert "https://www.example.edu.cn/" in fetcher.calls
     await db.close()
+
+
+def test_rank_org_unit_page_candidates_prefers_jgsz_over_xygk():
+    ranked = _rank_org_unit_page_candidates(
+        [
+            "https://www.buaa.edu.cn/xygk/jrbh.htm",
+            "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm",
+        ],
+        "https://www.buaa.edu.cn/",
+    )
+    assert ranked[0] == "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"
+
+
+def test_rank_faculty_page_candidates_demotes_lyys():
+    ranked = _rank_faculty_page_candidates(
+        [
+            "https://www.mse.buaa.edu.cn/xygk/szll.htm",
+            "https://www.mse.buaa.edu.cn/teachers/list.htm",
+            "https://www.mse.buaa.edu.cn/szdw/lyys1.htm",
+        ]
+    )
+    assert ranked[0] == "https://www.mse.buaa.edu.cn/teachers/list.htm"
+    assert ranked[-1] == "https://www.mse.buaa.edu.cn/szdw/lyys1.htm"
+
+
+def test_is_academician_showcase_page():
+    assert _is_academician_showcase_page("https://www.mse.buaa.edu.cn/szdw/lyys1.htm")
+    assert not _is_academician_showcase_page("https://www.mse.buaa.edu.cn/teachers/list.htm")

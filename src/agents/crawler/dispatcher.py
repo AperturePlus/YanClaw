@@ -10,7 +10,7 @@ from agents.crawler import db as crawler_db
 from agents.crawler.agent import AgentResult, CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.fetcher import Fetcher, _site_root
-from agents.crawler.models import CrawlStatus
+from agents.crawler.models import CrawlLogStatus, CrawlStatus
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
@@ -138,6 +138,7 @@ class CrawlDispatcher:
         try:
             await db.init_db()
             async with db.session() as session:
+                await crawler_db.ensure_runtime_schema(session)
                 await crawler_db.ensure_university_meta(
                     session,
                     name=university.name,
@@ -170,35 +171,71 @@ class CrawlDispatcher:
         semaphore: asyncio.Semaphore,
     ) -> AgentResult:
         async with semaphore:
-            self.logger.info("Dispatching %s", university.name)
+            timeout_seconds = float(self.settings.university_timeout_seconds)
+            self.logger.info(
+                "Dispatching %s (timeout=%ss request_timeout=%ss llm_timeout=%ss)",
+                university.name,
+                timeout_seconds,
+                self.settings.request_timeout_seconds,
+                self.settings.llm_timeout_seconds,
+            )
             db = DatabaseManager(_sqlite_url(university.db_path))
             try:
-                await db.init_db()
-                async with db.session() as session:
-                    await crawler_db.ensure_university_meta(
-                        session,
-                        name=university.name,
+                async def _crawl_one() -> AgentResult:
+                    await db.init_db()
+                    async with db.session() as session:
+                        await crawler_db.ensure_runtime_schema(session)
+                        await crawler_db.ensure_university_meta(
+                            session,
+                            name=university.name,
+                            start_url=university.url,
+                            location=university.location,
+                        )
+
+                    skill_manager = SkillManager(
+                        Path(self.settings.crawler_skills_dir),
+                        db,
+                        "crawler",
+                    )
+                    agent = self.agent_factory(
+                        university_name=university.name,
                         start_url=university.url,
                         location=university.location,
+                        db=db,
+                        llm_client=self.llm_client_factory(),
+                        skill_manager=skill_manager,
+                        context_manager=ContextManager(self.settings.openai_model),
+                        fetcher=fetcher,
+                        model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
                     )
+                    return await agent.run()
 
-                skill_manager = SkillManager(
-                    Path(self.settings.crawler_skills_dir),
-                    db,
-                    "crawler",
-                )
-                agent = self.agent_factory(
-                    university_name=university.name,
-                    start_url=university.url,
-                    location=university.location,
-                    db=db,
-                    llm_client=self.llm_client_factory(),
-                    skill_manager=skill_manager,
-                    context_manager=ContextManager(self.settings.openai_model),
-                    fetcher=fetcher,
-                    model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
-                )
-                return await agent.run()
+                try:
+                    return await asyncio.wait_for(_crawl_one(), timeout=timeout_seconds)
+                except asyncio.TimeoutError:
+                    self.logger.warning(
+                        "Timeout crawling %s after %ss",
+                        university.name,
+                        timeout_seconds,
+                    )
+                    try:
+                        async with db.session() as session:
+                            await crawler_db.set_university_status(session, CrawlStatus.FAILED)
+                            await crawler_db.log_crawl(
+                                session,
+                                university.url,
+                                CrawlLogStatus.FAILED,
+                                f"Timeout after {timeout_seconds}s",
+                            )
+                    except Exception:
+                        # If the DB init was part of the timed-out work, we may not be able to persist logs.
+                        self.logger.exception("Failed to persist timeout status for %s", university.name)
+                    return AgentResult(
+                        university_name=university.name,
+                        status=CrawlStatus.FAILED.value,
+                        visited_count=0,
+                        saved_professors=0,
+                        messages=[f"Timeout after {timeout_seconds}s"],
+                    )
             finally:
                 await db.close()
-
