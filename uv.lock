@@ -905,16 +905,12 @@ dependencies = [
     { name = "html2text" },
     { name = "httpx" },
     { name = "openai" },
+    { name = "playwright" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "sqlalchemy" },
     { name = "tiktoken" },
-]
-
-[package.optional-dependencies]
-playwright = [
-    { name = "playwright" },
 ]
 
 [package.dev-dependencies]
@@ -930,14 +926,13 @@ requires-dist = [
     { name = "html2text", specifier = ">=2024.2.26" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "openai", specifier = ">=1.40.0" },
-    { name = "playwright", marker = "extra == 'playwright'", specifier = ">=1.44.0" },
+    { name = "playwright", specifier = ">=1.44.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pydantic-settings", specifier = ">=2.2.1" },
     { name = "python-dotenv", specifier = ">=1.0.1" },
     { name = "sqlalchemy", specifier = ">=2.0.30" },
     { name = "tiktoken", specifier = ">=0.7.0" },
 ]
-provides-extras = ["playwright"]
 
 [package.metadata.requires-dev]
 dev = [

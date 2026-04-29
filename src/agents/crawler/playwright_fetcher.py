@@ -15,10 +15,16 @@ import asyncio
 import time
 from typing import Iterable
 
-from agents.crawler.fetcher import FetchResult, Fetcher, _is_html_content, _site_root
+from agents.crawler.fetcher import (
+    FetchResult,
+    Fetcher,
+    _detect_block_reason,
+    _is_html_content,
+    _site_root,
+)
 
 try:
-    from playwright.async_api import async_playwright, Browser, BrowserContext
+    from playwright.async_api import Browser, BrowserContext, async_playwright
 except ImportError:  # pragma: no cover
     async_playwright = None  # type: ignore[assignment,misc]
 
@@ -42,7 +48,7 @@ class PlaywrightFetcher:
         if async_playwright is None:
             raise ImportError(
                 "playwright is required for PlaywrightFetcher. "
-                "Install it with: pip install playwright && playwright install chromium"
+                "Install dependencies, then run: uv run yanclaw-install-chromium"
             )
         self.request_interval_seconds = request_interval_seconds
         self.max_retries = max_retries
@@ -91,7 +97,7 @@ class PlaywrightFetcher:
                     status = resp.status if resp else 0
 
                     if status in {429, 503} and attempt < self.max_retries:
-                        await asyncio.sleep(self.retry_base_delay * (2 ** attempt))
+                        await asyncio.sleep(self.retry_base_delay * (2**attempt))
                         continue
 
                     content_type = (resp.headers.get("content-type", "") if resp else "")
@@ -101,18 +107,29 @@ class PlaywrightFetcher:
                         return FetchResult(url=final_url, text="", links=[], status_code=status)
 
                     html = await page.content()
-                    # Reuse Fetcher's HTML→text and link extraction logic
+                    block_reason = _detect_block_reason(
+                        status_code=status,
+                        body_text=html,
+                        headers=resp.headers if resp else None,
+                    )
+                    # Reuse Fetcher's HTML->text and link extraction logic.
                     fetcher_helper = Fetcher.__new__(Fetcher)
                     text = fetcher_helper._html_to_text(html)
                     links = fetcher_helper._extract_links(html, final_url)
-                    return FetchResult(url=final_url, text=text, links=links, status_code=status)
+                    return FetchResult(
+                        url=final_url,
+                        text=text,
+                        links=links,
+                        status_code=status,
+                        block_reason=block_reason,
+                    )
                 finally:
                     await page.close()
             except Exception as error:
                 last_error = error
                 if attempt >= self.max_retries:
                     break
-                await asyncio.sleep(self.retry_base_delay * (2 ** attempt))
+                await asyncio.sleep(self.retry_base_delay * (2**attempt))
 
         raise RuntimeError(f"Failed to fetch {url}") from last_error
 

@@ -57,6 +57,58 @@ async def test_fetcher_retries_429_then_succeeds():
     assert calls == 2
 
 
+async def test_fetcher_marks_202_waf_challenge_pages():
+    async def handler(request):
+        html = """
+        <html><body><script>
+        var $_ts={};
+        document.cookie='__jsl_clearance=abc';
+        setTimeout(function(){},1000);
+        </script></body></html>
+        """
+        return httpx.Response(
+            202,
+            text=html,
+            request=request,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+    )
+    async with fetcher:
+        result = await fetcher.fetch("https://www.example.edu.cn/")
+
+    assert result.status_code == 202
+    assert result.block_reason is not None
+    assert "waf_challenge" in result.block_reason
+
+
+async def test_fetcher_marks_200_waf_like_html_pages():
+    async def handler(request):
+        html = "<html><body>" + ("challenge " * 1000) + "document.cookie setTimeout(" + "</body></html>"
+        return httpx.Response(
+            200,
+            text=html,
+            request=request,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=0,
+        transport=httpx.MockTransport(handler),
+    )
+    async with fetcher:
+        result = await fetcher.fetch("https://www.example.edu.cn/")
+
+    assert result.status_code == 200
+    assert result.block_reason is not None
+    assert "waf_like_html" in result.block_reason
+
+
 def test_filter_same_domain_allows_subdomains_and_rejects_external():
     links = [
         "https://cs.pku.edu.cn/people",

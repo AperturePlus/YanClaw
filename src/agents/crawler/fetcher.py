@@ -4,7 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from urllib.parse import urldefrag, urljoin, urlparse
 
 import html2text
@@ -17,6 +17,7 @@ class FetchResult:
     text: str
     links: list[str]
     status_code: int
+    block_reason: str | None = None
 
 
 class _LinkParser(HTMLParser):
@@ -109,12 +110,18 @@ class Fetcher:
                     continue
                 response.raise_for_status()
                 content_type = response.headers.get("content-type", "")
+                block_reason = _detect_block_reason(
+                    status_code=response.status_code,
+                    body_text=response.text,
+                    headers=response.headers,
+                )
                 if not _is_html_content(content_type):
                     return FetchResult(
                         url=str(response.url),
                         text="",
                         links=[],
                         status_code=response.status_code,
+                        block_reason=block_reason,
                     )
                 text = self._html_to_text(response.text)
                 links = self._extract_links(response.text, str(response.url))
@@ -123,6 +130,7 @@ class Fetcher:
                     text=text,
                     links=links,
                     status_code=response.status_code,
+                    block_reason=block_reason,
                 )
             except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.TransportError) as error:
                 last_error = error
@@ -258,3 +266,51 @@ def _is_ssl_error(exc: BaseException) -> bool:
             return True
         cur = cur.__cause__
     return False
+
+
+_WAF_BODY_MARKERS = (
+    "x-amzn-waf-action",
+    "challenge",
+    "captcha",
+    "security check",
+    "web application firewall",
+    "waf",
+    "bot detection",
+    "document.cookie",
+    "$_ts",
+    "__jsl_clearance",
+    "acw_sc__v2",
+    "settimeout(",
+    "正在验证",
+    "安全验证",
+    "人机验证",
+)
+
+_WAF_STATUS_CODES = {202, 403, 405, 412, 429, 503}
+
+
+def _detect_block_reason(
+    *, status_code: int, body_text: str, headers: Mapping[str, Any] | None = None
+) -> str | None:
+    """Best-effort WAF/challenge page detection for observability and fallback logic."""
+
+    header_action = ""
+    if headers is not None:
+        raw = headers.get("x-amzn-waf-action")
+        if raw is not None:
+            header_action = str(raw).strip().lower()
+
+    lowered = body_text.lower()
+    marker_hits = [marker for marker in _WAF_BODY_MARKERS if marker in lowered]
+
+    if header_action in {"challenge", "captcha"}:
+        return f"waf_header:{header_action}"
+
+    if status_code in _WAF_STATUS_CODES and marker_hits:
+        return f"waf_challenge status={status_code} markers={','.join(marker_hits[:3])}"
+
+    # Some WAFs return 2xx + JS challenge (common on Chinese university portals).
+    if status_code == 200 and len(marker_hits) >= 3 and len(body_text) > 2000:
+        return f"waf_like_html status=200 markers={','.join(marker_hits[:3])}"
+
+    return None

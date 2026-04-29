@@ -7,6 +7,7 @@ import click
 
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
+from agents.crawler.playwright_setup import ensure_chromium_installed
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
 from runtime.logger import get_logger, setup_logging
@@ -74,6 +75,13 @@ def crawl(
         settings.llm_timeout_seconds,
         ",".join(selected) if selected else "*",
     )
+    if str(settings.fetcher_backend).strip().lower() == "playwright":
+        try:
+            installed_now = ensure_chromium_installed()
+        except Exception as error:
+            raise click.ClickException(f"Failed to prepare Playwright Chromium: {error}") from error
+        if installed_now:
+            logger.info("Installed Playwright Chromium runtime")
     asyncio.run(
         _crawl_async(
             settings,
@@ -93,6 +101,7 @@ async def _crawl_async(
 ) -> None:
     if not skip_llm_check:
         await _check_llm(settings)
+
     dispatcher = CrawlDispatcher(settings=settings)
     try:
         if run_timeout_seconds is None:
@@ -101,6 +110,8 @@ async def _crawl_async(
             summary = await asyncio.wait_for(dispatcher.run(universities), timeout=float(run_timeout_seconds))
     except asyncio.TimeoutError:
         raise click.ClickException(f"Total run timeout after {run_timeout_seconds}s")
+    except ImportError as error:
+        raise click.ClickException(str(error)) from error
     click.echo(f"success={summary.success} failed={summary.failed} skipped={summary.skipped}")
 
 

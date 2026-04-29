@@ -159,6 +159,12 @@ class CrawlerAgent:
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
         links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
+        self.logger.debug(
+            "Org-page discovery homepage_links=%s keyword_hits=%s block_reason=%s",
+            len(home.links),
+            len(links),
+            home.block_reason or "-",
+        )
         if not links:
             skills = await self._select_skills(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
             result = await self._ask_llm(
@@ -169,10 +175,20 @@ class CrawlerAgent:
                 skills,
             )
             links = self._links_from_result(result.content)
+            if not links:
+                links = self._links_from_tool_call_log(result, tool_name="extract_links")
+                if links:
+                    self.logger.debug("Org-page discovery consumed extract_links tool output: %s", links[:5])
 
         links = self.fetcher.filter_same_domain(links, self.start_url)
         links = [l for l in links if not _is_faculty_platform(l)]
         links = _rank_org_unit_page_candidates(links, self.start_url)
+        if links:
+            self.logger.debug(
+                "Org-page discovery same_domain_ranked=%s sample=%s",
+                len(links),
+                links[:5],
+            )
 
         if not links:
             self.logger.info("No org unit pages from keywords/LLM, probing intermediate paths")
@@ -185,6 +201,11 @@ class CrawlerAgent:
             links = _rank_org_unit_page_candidates(links, self.start_url)
 
         if not links:
+            if home.block_reason:
+                self.logger.warning(
+                    "Org-page discovery exhausted fallbacks while homepage looked blocked: %s",
+                    home.block_reason,
+                )
             links = [home.url]
 
         return [
@@ -308,12 +329,13 @@ class CrawlerAgent:
                 )
                 links = self._links_from_result(result.content)
                 if not links:
-                    for record in result.tool_call_log:
-                        if record.name != "extract_links":
-                            continue
-                        if isinstance(record.result, dict):
-                            links = list(record.result.get("links") or [])
-                            break
+                    links = self._links_from_tool_call_log(result, tool_name="extract_links")
+                    if links:
+                        self.logger.debug(
+                            "Faculty discovery consumed extract_links tool output org_unit=%s sample=%s",
+                            item.label,
+                            links[:5],
+                        )
                 links = [
                     l
                     for l in self.fetcher.filter_same_domain(links, self.start_url)
@@ -359,6 +381,17 @@ class CrawlerAgent:
                 continue
             try:
                 result = await self.fetcher.fetch(probe_url)
+                if result.block_reason:
+                    self.logger.info(
+                        "Faculty probe blocked url=%s status=%s reason=%s",
+                        probe_url,
+                        result.status_code,
+                        result.block_reason,
+                    )
+                    self.execution_log.append(
+                        f"probe_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
+                    )
+                    continue
                 if result.status_code == 200 and len(result.text) > 200:
                     found.append(probe_url)
                     self.logger.info("Probed faculty path found: %s", probe_url)
@@ -371,6 +404,13 @@ class CrawlerAgent:
                             "probed",
                         )
                     break
+                self.logger.debug(
+                    "Faculty probe miss url=%s status=%s text_chars=%s links=%s",
+                    probe_url,
+                    result.status_code,
+                    len(result.text),
+                    len(result.links),
+                )
             except Exception:
                 pass
         return found
@@ -386,11 +426,29 @@ class CrawlerAgent:
                 continue
             try:
                 result = await self.fetcher.fetch(probe_url)
+                if result.block_reason:
+                    self.logger.info(
+                        "Org-page probe blocked url=%s status=%s reason=%s",
+                        probe_url,
+                        result.status_code,
+                        result.block_reason,
+                    )
+                    self.execution_log.append(
+                        f"probe_org_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
+                    )
+                    continue
                 if result.status_code == 200 and len(result.text) > 200:
                     found.append(probe_url)
                     self.logger.info("Probed org page found: %s", probe_url)
                     self.execution_log.append(f"probe_org_found url={probe_url}")
                     break
+                self.logger.debug(
+                    "Org-page probe miss url=%s status=%s text_chars=%s links=%s",
+                    probe_url,
+                    result.status_code,
+                    len(result.text),
+                    len(result.links),
+                )
             except Exception:
                 pass
         return found
@@ -483,6 +541,12 @@ class CrawlerAgent:
         }
         page_text = _truncate_middle(fetched.text or "", text_limits.get(state, 12000))
 
+        allowed_tools: set[str] = set()
+        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.FIND_FACULTY_PAGES}:
+            allowed_tools = {"extract_links"}
+        elif state is CrawlerState.EXTRACT_PROFESSORS:
+            allowed_tools = {"save_professors"}
+
         user_content = json.dumps(
             {
                 "university": self.university_name,
@@ -493,15 +557,12 @@ class CrawlerAgent:
                 "visited_urls": sorted(self.visited_urls)[-15:],
                 "links": candidate_links,
                 "page_text": page_text,
+                "allowed_tools": sorted(allowed_tools),
+                "tool_call_policy": "Only call tools listed in allowed_tools. Do not invent tool names.",
             },
             ensure_ascii=False,
         )
         tool_defs = get_crawler_tool_definitions()
-        allowed_tools: set[str] = set()
-        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.FIND_FACULTY_PAGES}:
-            allowed_tools = {"extract_links"}
-        elif state is CrawlerState.EXTRACT_PROFESSORS:
-            allowed_tools = {"save_professors"}
         tool_defs = [tool for tool in tool_defs if tool.get("name") in allowed_tools] if allowed_tools else []
 
         batches = self.context_manager.build_messages(
@@ -513,6 +574,14 @@ class CrawlerAgent:
         )
         handlers = get_crawler_tools(self.db, self.skill_manager)
         final_result = None
+        self.logger.debug(
+            "LLM request state=%s url=%s candidate_links=%s page_text_chars=%s tools=%s",
+            state.value,
+            fetched.url,
+            len(candidate_links),
+            len(page_text),
+            [tool.get("name") for tool in tool_defs],
+        )
         for batch in batches:
             final_result = await self.llm_client.chat(
                 batch,
@@ -520,6 +589,12 @@ class CrawlerAgent:
                 tool_handlers=handlers,
             )
         assert final_result is not None
+        self.logger.debug(
+            "LLM response state=%s content_chars=%s tool_calls=%s",
+            state.value,
+            len(final_result.content or ""),
+            len(getattr(final_result, "tool_call_log", []) or []),
+        )
         return final_result
 
     async def _select_skills(self, state: CrawlerState) -> str:
@@ -593,14 +668,39 @@ class CrawlerAgent:
         self._fetch_cache.setdefault(url, fetched)
 
         async with self.db.session() as session:
+            crawl_status = CrawlLogStatus.SUCCESS
+            crawl_message = f"depth={depth} status_code={fetched.status_code}"
+            if fetched.block_reason:
+                crawl_status = CrawlLogStatus.FAILED
+                crawl_message = (
+                    f"{crawl_message} blocked={fetched.block_reason} links={len(fetched.links)}"
+                )
             await crawler_db.log_crawl(
                 session,
                 fetched.url,
-                CrawlLogStatus.SUCCESS,
-                f"depth={depth} status_code={fetched.status_code}",
+                crawl_status,
+                crawl_message,
             )
 
-        self.execution_log.append(f"fetch ok url={fetched.url} depth={depth} links={len(fetched.links)}")
+        if fetched.block_reason:
+            self.logger.warning(
+                "WAF/challenge page detected url=%s status=%s reason=%s links=%s",
+                fetched.url,
+                fetched.status_code,
+                fetched.block_reason,
+                len(fetched.links),
+            )
+            if type(self.fetcher).__name__ == "Fetcher":
+                self.logger.warning(
+                    "Detected anti-bot blocking on httpx backend; consider rerun with --fetcher-backend playwright"
+                )
+            self.execution_log.append(
+                f"fetch blocked url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
+            )
+        else:
+            self.execution_log.append(
+                f"fetch ok url={fetched.url} depth={depth} status={fetched.status_code} links={len(fetched.links)}"
+            )
         return fetched
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
@@ -664,6 +764,22 @@ class CrawlerAgent:
             if isinstance(value, list):
                 raw = [str(item.get("url") if isinstance(item, dict) else item) for item in value]
                 return [_sanitize_url(u) for u in raw if _sanitize_url(u)]
+        return []
+
+    def _links_from_tool_call_log(self, result: Any, *, tool_name: str = "extract_links") -> list[str]:
+        records = getattr(result, "tool_call_log", None)
+        if not isinstance(records, list):
+            return []
+        for record in records:
+            if getattr(record, "name", "") != tool_name:
+                continue
+            payload = getattr(record, "result", None)
+            if isinstance(payload, dict):
+                links = payload.get("links")
+                if isinstance(links, list):
+                    return [_sanitize_url(str(link)) for link in links if _sanitize_url(str(link))]
+            if isinstance(payload, list):
+                return [_sanitize_url(str(link)) for link in payload if _sanitize_url(str(link))]
         return []
 
     def _org_units_from_result(self, content: str) -> list[dict[str, Any]]:
@@ -762,11 +878,17 @@ class CrawlerAgent:
         if suffix and not _contains_cjk(suffix) and any(ord(ch) > 127 for ch in suffix):
             suffix = ""
         extra = "jgsz yxsz xysz zzjg xy yx xygk xxgk szdw jsdw faculty teacher staff people"
-        query = f"{suffix} {extra} site:{domain}".strip()
+        query = _dedupe_query_terms(f"{suffix} {extra} site:{domain}".strip())
         search_url = f"https://www.bing.com/search?q={quote(query)}&count=20&setlang=en&cc=us"
         self.logger.info("Search engine fallback: %s", query)
         try:
             fetched = await self.fetcher.fetch(search_url)
+            self.logger.info(
+                "Search fallback response status=%s final_url=%s block_reason=%s",
+                fetched.status_code,
+                fetched.url,
+                fetched.block_reason or "-",
+            )
             text_urls = _extract_urls_from_text(fetched.text)
             all_urls = list(dict.fromkeys(fetched.links + text_urls))
             same_domain = self.fetcher.filter_same_domain(all_urls, self.start_url)
@@ -1105,6 +1227,21 @@ def _extract_urls_from_text(text: str) -> list[str]:
 
 def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _dedupe_query_terms(query: str) -> str:
+    terms = [term for term in query.split() if term]
+    if not terms:
+        return ""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(term)
+    return " ".join(deduped)
 
 
 

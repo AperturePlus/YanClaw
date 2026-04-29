@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
+import click
+import pytest
 from click.testing import CliRunner
 
+from agents.crawler import cli as crawler_cli
 from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
@@ -127,3 +130,90 @@ def test_cli_help_outputs_commands():
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "llm-check" in result.output
+
+
+async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+    )
+
+    async def _raise_import_error(self, universities):
+        raise ImportError("playwright is required for PlaywrightFetcher")
+
+    monkeypatch.setattr(CrawlDispatcher, "run", _raise_import_error)
+
+    with pytest.raises(click.ClickException, match="playwright is required for PlaywrightFetcher"):
+        await crawler_cli._crawl_async(
+            settings,
+            universities=["A"],
+            skip_llm_check=True,
+        )
+
+
+def test_crawl_cli_auto_installs_chromium_for_playwright_backend(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("YANCLAW_WEBSITES_PATH", str(websites))
+    monkeypatch.setenv("YANCLAW_CRAWLER_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("YANCLAW_UNIVERSITY_DB_DIR", str(tmp_path / "universities"))
+
+    called = {"install": 0, "crawl_async": 0}
+
+    def _install():
+        called["install"] += 1
+        return True
+
+    async def _noop_crawl_async(settings, universities, *, skip_llm_check=False, run_timeout_seconds=None):
+        called["crawl_async"] += 1
+
+    monkeypatch.setattr(crawler_cli, "ensure_chromium_installed", _install)
+    monkeypatch.setattr(crawler_cli, "_crawl_async", _noop_crawl_async)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "crawl",
+        "--fetcher-backend", "playwright",
+        "--universities", "A",
+        "--skip-llm-check",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert called["install"] == 1
+    assert called["crawl_async"] == 1
+
+
+def test_crawl_cli_wraps_chromium_prepare_error(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("YANCLAW_WEBSITES_PATH", str(websites))
+    monkeypatch.setenv("YANCLAW_CRAWLER_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setenv("YANCLAW_UNIVERSITY_DB_DIR", str(tmp_path / "universities"))
+
+    def _raise_prepare_error():
+        raise RuntimeError("network blocked")
+
+    monkeypatch.setattr(crawler_cli, "ensure_chromium_installed", _raise_prepare_error)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, [
+        "crawl",
+        "--fetcher-backend", "playwright",
+        "--universities", "A",
+        "--skip-llm-check",
+    ])
+
+    assert result.exit_code != 0
+    assert "Failed to prepare Playwright Chromium" in result.output
