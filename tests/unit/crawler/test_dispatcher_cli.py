@@ -217,3 +217,20 @@ def test_crawl_cli_wraps_chromium_prepare_error(tmp_path, monkeypatch):
 
     assert result.exit_code != 0
     assert "Failed to prepare Playwright Chromium" in result.output
+
+
+def test_dispatcher_factory_supports_hybrid_backend(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        fetcher_backend="hybrid",
+    )
+    factory = CrawlDispatcher._default_fetcher_factory(settings)
+    fetcher = factory()
+    assert type(fetcher).__name__ == "HybridFetcher"

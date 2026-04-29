@@ -32,4 +32,7 @@ class CrawlerSettings(BaseSettings):
     crawler_skills_dir: Path = Path("src/agents/crawler/skills")
     websites_path: Path = Path("assets/websites.md")
     university_db_dir: Path = Path("data/universities")
-    fetcher_backend: str = "httpx"  # "httpx" (default), "playwright", or "curl_cffi"
+    fetcher_backend: str = "hybrid"  # "hybrid" (default), "httpx", "playwright", "curl_cffi", or "crawl4ai"
+    crawl4ai_base_url: str = "http://localhost:10086"
+    crawl4ai_api_token: str = ""
+    crawl4ai_timeout_seconds: float = Field(default=120.0, gt=0)

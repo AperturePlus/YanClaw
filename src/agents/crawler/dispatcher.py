@@ -94,6 +94,27 @@ class CrawlDispatcher:
                 max_retries=settings.max_retries,
                 timeout_seconds=settings.request_timeout_seconds,
             )
+        if settings.fetcher_backend == "crawl4ai":
+            from agents.crawler.crawl4ai_fetcher import Crawl4aiFetcher
+
+            return lambda: Crawl4aiFetcher(
+                base_url=settings.crawl4ai_base_url,
+                api_token=settings.crawl4ai_api_token,
+                request_interval_seconds=settings.request_interval_seconds,
+                max_retries=settings.max_retries,
+                timeout_seconds=settings.crawl4ai_timeout_seconds,
+            )
+        if settings.fetcher_backend == "hybrid":
+            from agents.crawler.hybrid_fetcher import HybridFetcher
+
+            return lambda: HybridFetcher(
+                request_interval_seconds=settings.request_interval_seconds,
+                max_retries=settings.max_retries,
+                timeout_seconds=settings.request_timeout_seconds,
+                crawl4ai_base_url=settings.crawl4ai_base_url,
+                crawl4ai_api_token=settings.crawl4ai_api_token,
+                crawl4ai_timeout_seconds=settings.crawl4ai_timeout_seconds,
+            )
         return lambda: Fetcher(
             request_interval_seconds=settings.request_interval_seconds,
             max_retries=settings.max_retries,
