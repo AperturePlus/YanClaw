@@ -175,3 +175,41 @@ def test_is_ssl_error_returns_false_for_non_ssl():
     err = RuntimeError("Failed to fetch")
     err.__cause__ = httpx.ReadTimeout("timed out")
     assert _is_ssl_error(err) is False
+
+
+async def test_fetcher_ssl_handshake_failure_skips_retries_and_falls_back():
+    """SSL handshake failures (SECLEVEL mismatch) should not waste retries
+    and should fall back to the insecure client with relaxed ciphers."""
+    primary_calls = 0
+
+    def ssl_handshake_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal primary_calls
+        primary_calls += 1
+        raise httpx.ConnectError(
+            "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] ssl/tls alert handshake failure"
+        )
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text="<html><body><p>OK</p></body></html>",
+            request=request,
+            headers={"content-type": "text/html"},
+        )
+
+    fetcher = Fetcher(
+        request_interval_seconds=0,
+        max_retries=3,
+        retry_base_delay=0,
+        transport=httpx.MockTransport(ssl_handshake_handler),
+    )
+    async with fetcher:
+        fetcher._insecure_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(ok_handler), follow_redirects=True
+        )
+        result = await fetcher.fetch("https://www.gsm.pku.edu.cn/")
+
+    assert result.status_code == 200
+    assert "OK" in result.text
+    # SSL error is deterministic — should break after 1 attempt, not 4
+    assert primary_calls == 1

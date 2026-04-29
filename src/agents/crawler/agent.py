@@ -175,6 +175,10 @@ class CrawlerAgent:
         links = _rank_org_unit_page_candidates(links, self.start_url)
 
         if not links:
+            self.logger.info("No org unit pages from keywords/LLM, probing intermediate paths")
+            links = await self._probe_intermediate_org_pages()
+
+        if not links:
             self.logger.info("No org unit pages from homepage, trying search engine fallback")
             search_links = await self._search_engine_fallback("org unit colleges schools departments jgsz yxsz")
             links = self.fetcher.filter_same_domain(search_links, self.start_url)
@@ -366,6 +370,26 @@ class CrawlerAgent:
                             CrawlLogStatus.SUCCESS,
                             "probed",
                         )
+                    break
+            except Exception:
+                pass
+        return found
+
+    async def _probe_intermediate_org_pages(self) -> list[str]:
+        """Try common org-unit listing paths on the university main domain."""
+        parsed = urlparse(self.start_url)
+        base = f"{parsed.scheme}://{parsed.hostname}"
+        found: list[str] = []
+        for suffix in _INTERMEDIATE_ORG_PATHS:
+            probe_url = base + suffix
+            if probe_url in self.visited_urls:
+                continue
+            try:
+                result = await self.fetcher.fetch(probe_url)
+                if result.status_code == 200 and len(result.text) > 200:
+                    found.append(probe_url)
+                    self.logger.info("Probed org page found: %s", probe_url)
+                    self.execution_log.append(f"probe_org_found url={probe_url}")
                     break
             except Exception:
                 pass
@@ -771,8 +795,13 @@ ORG_UNIT_PAGE_KEYWORDS = (
     "/xysz",
     "/xygk",
     "/xxgk",
-    "院",
-    "系",
+    # Full pinyin forms used by some universities (e.g. RUC zuzhijigou.html)
+    "zuzhijigou",
+    "jiaoxuejigou",
+    "jiaoxuedanwei",
+    "yuanxishezhi",
+    "xueyuanshezhi",
+    # Chinese keywords (multi-char only to avoid false positives)
     "学院",
     "院系",
     "组织机构",
@@ -993,6 +1022,21 @@ _COMMON_FACULTY_PATHS = (
     "/yjdw/szdw.htm",
     "/jszy/",
     "/rydw/",
+)
+
+_INTERMEDIATE_ORG_PATHS = (
+    "/zuzhijigou.html",
+    "/jgsz.htm",
+    "/jgsz/",
+    "/jgsz/jxkyjg.htm",
+    "/yxsz.htm",
+    "/yxsz/",
+    "/zzjg.htm",
+    "/zzjg/",
+    "/jxjg.htm",
+    "/jxjg/",
+    "/xysz.htm",
+    "/xysz/",
 )
 
 

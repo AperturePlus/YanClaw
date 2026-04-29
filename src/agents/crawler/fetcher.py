@@ -88,11 +88,11 @@ class Fetcher:
 
         try:
             return await self._fetch_with_client(self._client, url)
-        except RuntimeError as exc:
+        except (RuntimeError, httpx.ConnectError) as exc:
             if not _is_ssl_error(exc):
                 raise
             # SSL failures are common on Chinese university subdomains;
-            # retry without certificate verification.
+            # retry with relaxed cipher suites and no certificate verification.
             client = await self._get_insecure_client()
             return await self._fetch_with_client(client, url)
 
@@ -126,6 +126,8 @@ class Fetcher:
                 )
             except (httpx.TimeoutException, httpx.HTTPStatusError, httpx.TransportError) as error:
                 last_error = error
+                if _is_ssl_error(error):
+                    break  # SSL errors are deterministic; let fetch() fallback
                 if attempt >= self.max_retries:
                     break
                 await asyncio.sleep(self.retry_base_delay * (2**attempt))
@@ -133,10 +135,16 @@ class Fetcher:
 
     async def _get_insecure_client(self) -> httpx.AsyncClient:
         if self._insecure_client is None:
+            import ssl as _ssl
+
+            ctx = _ssl.create_default_context()
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+            ctx.check_hostname = False
+            ctx.verify_mode = _ssl.CERT_NONE
             self._insecure_client = httpx.AsyncClient(
                 timeout=self._timeout_seconds,
                 follow_redirects=True,
-                verify=False,
+                verify=ctx,
                 headers=self._HEADERS,
             )
         return self._insecure_client
