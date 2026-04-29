@@ -24,9 +24,10 @@ from agents.crawler.fetcher import (
 )
 
 try:
-    from playwright.async_api import Browser, BrowserContext, async_playwright
+    from playwright.async_api import Browser, BrowserContext, Error as PlaywrightError, async_playwright
 except ImportError:  # pragma: no cover
     async_playwright = None  # type: ignore[assignment,misc]
+    PlaywrightError = Exception  # type: ignore[assignment,misc]
 
 
 class PlaywrightFetcher:
@@ -76,11 +77,22 @@ class PlaywrightFetcher:
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception as error:
+                if not self._is_already_closed_error(error):
+                    raise
         if self._browser:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception as error:
+                if not self._is_already_closed_error(error):
+                    raise
         if self._pw and hasattr(self._pw, "stop"):
             await self._pw.stop()
+        self._context = None
+        self._browser = None
+        self._pw = None
 
     async def fetch(self, url: str) -> FetchResult:
         if self._context is None:
@@ -134,6 +146,13 @@ class PlaywrightFetcher:
         raise RuntimeError(f"Failed to fetch {url}") from last_error
 
     filter_same_domain = staticmethod(Fetcher.filter_same_domain)
+
+    @staticmethod
+    def _is_already_closed_error(error: Exception) -> bool:
+        if isinstance(error, PlaywrightError):
+            text = str(error).lower()
+            return "target page, context or browser has been closed" in text
+        return False
 
     async def _wait_for_domain(self, url: str) -> None:
         from urllib.parse import urlparse
