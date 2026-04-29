@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler.agent import (
     CrawlerAgent,
+    _QueuedUrl,
     _dedupe_query_terms,
+    _is_core_academic_kind,
     _is_academician_showcase_page,
     _keyword_filter,
+    _org_unit_faculty_priority,
     _rank_faculty_page_candidates,
     _rank_org_unit_page_candidates,
     ORG_UNIT_PAGE_KEYWORDS,
@@ -155,6 +159,7 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3, pages=None):
         fetcher=fetcher,
         max_depth=max_depth,
         max_backtracks=max_backtracks,
+        min_org_units=1,
     )
     return agent, fetcher, db
 
@@ -173,6 +178,25 @@ async def test_agent_state_machine_discovers_org_units_and_saves_professors(tmp_
         units = (await session.execute(select(OrgUnit))).scalars().all()
         assert [u.name for u in units] == ["CS"]
 
+    await db.close()
+
+
+async def test_agent_bypasses_cross_run_dedup_when_all_org_pages_are_history(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM())
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/orgs",
+            CrawlLogStatus.SUCCESS,
+            "seeded-history",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert agent.backtrack_count == 0
+    assert fetcher.calls.count("https://www.example.edu.cn/orgs") == 1
     await db.close()
 
 
@@ -353,7 +377,7 @@ async def test_agent_discovers_org_units_via_intermediate_probe(tmp_path):
         ),
         "https://www.example.edu.cn/jgsz.htm": FetchResult(
             "https://www.example.edu.cn/jgsz.htm",
-            "org unit listing page with colleges",
+            "org unit listing page with colleges " + "x" * 200,
             ["https://www.example.edu.cn/cs"],
             200,
         ),
@@ -405,6 +429,7 @@ async def test_agent_discovers_org_units_via_intermediate_probe(tmp_path):
         context_manager=ContextManager(),
         fetcher=fetcher,
         max_depth=4,
+        min_org_units=1,
     )
     result = await agent.run()
 
@@ -466,6 +491,7 @@ async def test_agent_discovers_org_units_from_extract_links_tool_log(tmp_path):
         context_manager=ContextManager(),
         fetcher=fetcher,
         max_depth=4,
+        min_org_units=1,
     )
     result = await agent.run()
 
@@ -477,3 +503,204 @@ async def test_agent_discovers_org_units_from_extract_links_tool_log(tmp_path):
 def test_dedupe_query_terms_removes_case_insensitive_duplicates():
     query = "org unit jgsz yxsz jgsz YXSZ faculty site:scu.edu.cn"
     assert _dedupe_query_terms(query) == "org unit jgsz yxsz faculty site:scu.edu.cn"
+
+
+def test_keyword_filter_matches_uestc_xybm_jxkydw():
+    links = [
+        "https://www.uestc.edu.cn/xybm/jxkydw_yjjg.htm",
+        "https://www.uestc.edu.cn/xxgk/xxjj.htm",
+    ]
+    matched = _keyword_filter(links, ORG_UNIT_PAGE_KEYWORDS)
+    assert "https://www.uestc.edu.cn/xybm/jxkydw_yjjg.htm" in matched
+
+
+def test_rank_org_unit_page_candidates_prefers_jxkydw_over_xxgk():
+    ranked = _rank_org_unit_page_candidates(
+        [
+            "https://www.uestc.edu.cn/xxgk/xxjj.htm",
+            "https://www.uestc.edu.cn/xybm/jxkydw_yjjg.htm",
+            "https://xxgkw.uestc.edu.cn/",
+        ],
+        "https://www.uestc.edu.cn/",
+    )
+    assert ranked[0] == "https://www.uestc.edu.cn/xybm/jxkydw_yjjg.htm"
+
+
+async def test_agent_extract_org_units_follows_llm_next_url_hint(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/xxgk/xxjj.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/xxgk/xxjj.htm": FetchResult(
+            "https://www.example.edu.cn/xxgk/xxjj.htm",
+            "overview",
+            ["https://www.example.edu.cn/xybm/jxkydw_yjjg.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm": FetchResult(
+            "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+
+    class FollowupLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload.get("state")
+            url = payload.get("url", "")
+            if state == "EXTRACT_ORG_UNITS" and url.endswith("/xxgk/xxjj.htm"):
+                return LLMResult(
+                    '{"org_units": [], "next_url": "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm"}'
+                )
+            if state == "EXTRACT_ORG_UNITS" and url.endswith("/xybm/jxkydw_yjjg.htm"):
+                return LLMResult(
+                    '{"org_units": [{"name": "CS", "url": "https://www.example.edu.cn/cs", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    class FollowupFetcher(FakeFetcher):
+        async def fetch(self, url):
+            self.calls.append(url)
+            if url in self.pages:
+                return self.pages[url]
+            raise RuntimeError(f"Failed to fetch {url}")
+
+    fetcher = FollowupFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "followup.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+
+    agent = CrawlerAgent(
+        university_name="FollowupU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=FollowupLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        max_depth=4,
+        min_org_units=1,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm" in fetcher.calls
+    await db.close()
+
+
+def test_is_core_academic_kind_and_priority():
+    assert _is_core_academic_kind("college")
+    assert not _is_core_academic_kind("research_institute")
+
+    start_host = "www.uestc.edu.cn"
+    college = SimpleNamespace(kind="college", url="https://www.ese.uestc.edu.cn/", id=1)
+    research_detail = SimpleNamespace(
+        kind="research_institute",
+        url="https://www.rd.uestc.edu.cn/info/1009/1030.htm",
+        id=2,
+    )
+    assert _org_unit_faculty_priority(college, start_host) < _org_unit_faculty_priority(
+        research_detail, start_host
+    )
+
+
+async def test_extract_org_units_stops_early_after_enough_core_units(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/xybm/bm.htm": FetchResult(
+            "https://www.example.edu.cn/xybm/bm.htm",
+            "bm",
+            ["https://www.example.edu.cn/xybm/jxkydw_yjjg.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm": FetchResult(
+            "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm",
+            "core list",
+            [
+                "https://www.example.edu.cn/cs",
+                "https://www.example.edu.cn/ee",
+                "https://www.example.edu.cn/math",
+            ],
+            200,
+        ),
+        "https://www.example.edu.cn/xxgk/xxjj.htm": FetchResult(
+            "https://www.example.edu.cn/xxgk/xxjj.htm",
+            "overview",
+            [],
+            200,
+        ),
+    }
+
+    class EarlyStopLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload.get("state")
+            url = payload.get("url", "")
+            if state == "EXTRACT_ORG_UNITS" and url.endswith("/xybm/bm.htm"):
+                return LLMResult(
+                    '{"org_units": [{"name": "教学科研单位、研究机构", "url": "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm", "kind": "category"}]}'
+                )
+            if state == "EXTRACT_ORG_UNITS" and url.endswith("/xybm/jxkydw_yjjg.htm"):
+                return LLMResult(
+                    '{"org_units": ['
+                    '{"name": "CS", "url": "https://www.example.edu.cn/cs", "kind": "college"},'
+                    '{"name": "EE", "url": "https://www.example.edu.cn/ee", "kind": "college"},'
+                    '{"name": "Math", "url": "https://www.example.edu.cn/math", "kind": "school"}'
+                    ']}'
+                )
+            return LLMResult('{"org_units": []}')
+
+    fetcher = FakeFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "early_stop.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+
+    agent = CrawlerAgent(
+        university_name="EarlyStopU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=EarlyStopLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        max_depth=4,
+        min_org_units=2,
+    )
+
+    units = await agent._extract_org_units(
+        [
+            _QueuedUrl(url="https://www.example.edu.cn/xybm/bm.htm", depth=1),
+            _QueuedUrl(url="https://www.example.edu.cn/xybm/jxkydw_yjjg.htm", depth=1),
+            _QueuedUrl(url="https://www.example.edu.cn/xxgk/xxjj.htm", depth=1),
+        ]
+    )
+
+    names = {u.name for u in units}
+    assert {"CS", "EE", "Math"} <= names
+    # Once core units are enough, extractor should stop before spending time on xxgk page.
+    assert "https://www.example.edu.cn/xxgk/xxjj.htm" not in fetcher.calls
+    await db.close()

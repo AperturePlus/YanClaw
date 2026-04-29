@@ -32,4 +32,4 @@ class CrawlerSettings(BaseSettings):
     crawler_skills_dir: Path = Path("src/agents/crawler/skills")
     websites_path: Path = Path("assets/websites.md")
     university_db_dir: Path = Path("data/universities")
-    fetcher_backend: str = "httpx"  # "httpx" (default) or "playwright"
+    fetcher_backend: str = "httpx"  # "httpx" (default), "playwright", or "curl_cffi"

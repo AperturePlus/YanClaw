@@ -6,6 +6,9 @@ from pathlib import Path
 import httpx
 from sqlalchemy import select
 
+from functools import partial
+
+from agents.crawler.agent import CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
 from agents.crawler.fetcher import Fetcher, _site_root
@@ -72,14 +75,19 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     )
 
     pages = {
-        "https://www.example.edu.cn/": '<a href="/orgs">Orgs</a>',
-        "https://www.example.edu.cn/orgs": '<a href="/cs">CS</a>',
-        "https://www.example.edu.cn/cs": '<a href="/cs/faculty">Faculty</a>',
-        "https://www.example.edu.cn/cs/faculty": "<p>Ada Professor Systems ada@example.edu.cn</p>",
+        "https://www.example.edu.cn/": '<html><body><h1>Example University</h1><a href="/orgs">Org Units</a><p>Welcome to Example University homepage with enough content to pass validation checks.</p></body></html>',
+        "https://www.example.edu.cn/orgs": '<html><body><h1>Academic Units</h1><a href="/cs">Computer Science</a><p>List of all academic departments and colleges at Example University with sufficient page content.</p></body></html>',
+        "https://www.example.edu.cn/cs": '<html><body><h1>CS Department</h1><a href="/cs/faculty">Faculty List</a><p>Computer Science department page with information about programs and research areas.</p></body></html>',
+        "https://www.example.edu.cn/cs/faculty": "<html><body><h1>Faculty</h1><p>Ada Professor Systems ada@example.edu.cn. Our faculty members are leaders in their fields.</p></body></html>",
     }
 
     async def handler(request):
-        return httpx.Response(200, text=pages[str(request.url)], request=request)
+        return httpx.Response(
+            200,
+            text=pages[str(request.url)],
+            request=request,
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
 
     settings = CrawlerSettings(
         websites_path=websites,
@@ -91,6 +99,7 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     )
     dispatcher = CrawlDispatcher(
         settings=settings,
+        agent_factory=partial(CrawlerAgent, min_org_units=1),
         llm_client_factory=lambda: IntegrationLLM(),
         fetcher_factory=lambda: Fetcher(
             request_interval_seconds=0,

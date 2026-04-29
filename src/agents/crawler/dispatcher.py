@@ -86,6 +86,14 @@ class CrawlDispatcher:
                 max_retries=settings.max_retries,
                 timeout_seconds=settings.request_timeout_seconds,
             )
+        if settings.fetcher_backend == "curl_cffi":
+            from agents.crawler.curl_cffi_fetcher import CurlCffiFetcher
+
+            return lambda: CurlCffiFetcher(
+                request_interval_seconds=settings.request_interval_seconds,
+                max_retries=settings.max_retries,
+                timeout_seconds=settings.request_timeout_seconds,
+            )
         return lambda: Fetcher(
             request_interval_seconds=settings.request_interval_seconds,
             max_retries=settings.max_retries,

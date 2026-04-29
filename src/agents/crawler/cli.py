@@ -26,8 +26,8 @@ def cli() -> None:
 @click.option(
     "--fetcher-backend",
     default=None,
-    type=click.Choice(["httpx", "playwright"], case_sensitive=False),
-    help="Fetcher backend: httpx (default) or playwright for JS-heavy sites.",
+    type=click.Choice(["httpx", "playwright", "curl_cffi"], case_sensitive=False),
+    help="Fetcher backend: httpx (default), playwright for JS-heavy sites, or curl_cffi for TLS fingerprint bypass.",
 )
 @click.option(
     "--university-timeout-seconds",

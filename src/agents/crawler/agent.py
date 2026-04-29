@@ -61,6 +61,7 @@ class CrawlerAgent:
         max_depth: int = 4,
         max_backtracks: int = 3,
         max_org_units_per_university: int = 50,
+        min_org_units: int = 5,
         model_max_tokens: int = 16000,
     ) -> None:
         self.university_name = university_name
@@ -75,6 +76,7 @@ class CrawlerAgent:
         self.max_depth = max_depth
         self.max_backtracks = max_backtracks
         self.max_org_units_per_university = max_org_units_per_university
+        self.min_org_units = min_org_units
         self.model_max_tokens = model_max_tokens
         self.visited_urls: set[str] = set()
         self._fetch_cache: dict[str, FetchResult] = {}
@@ -83,6 +85,7 @@ class CrawlerAgent:
         self.saved_professors = 0
         self._university_cache: UniversityMeta | None = None
         self._skip_cross_run_dedup = False
+        self._blocked_hosts: set[str] = set()
 
     async def run(self) -> AgentResult:
         await self._ensure_university()
@@ -112,10 +115,34 @@ class CrawlerAgent:
 
                 if not org_units:
                     org_units = await self._extract_org_units(org_unit_pages)
+                if not org_units and not self._skip_cross_run_dedup:
+                    all_previously_crawled = await self._all_urls_previously_crawled(
+                        [item.url for item in org_unit_pages]
+                    )
+                    if all_previously_crawled:
+                        self.logger.info(
+                            "All org-unit pages were already crawled in previous runs; bypassing cross-run dedup for this retry"
+                        )
+                        self._skip_cross_run_dedup = True
+                        org_units = await self._extract_org_units(org_unit_pages)
                 if not org_units:
                     if self._too_many_backtracks("no org units extracted"):
                         break
                     org_unit_pages = []
+                    self._skip_cross_run_dedup = True
+                    continue
+                if len(org_units) < self.min_org_units:
+                    self.logger.info(
+                        "Only %s org units found (min=%s), likely category pages; retrying",
+                        len(org_units),
+                        self.min_org_units,
+                    )
+                    if self._too_many_backtracks(
+                        f"too few org units ({len(org_units)} < {self.min_org_units})"
+                    ):
+                        break
+                    org_unit_pages = []
+                    org_units = []
                     self._skip_cross_run_dedup = True
                     continue
 
@@ -217,10 +244,28 @@ class CrawlerAgent:
         self._log_state(CrawlerState.EXTRACT_ORG_UNITS)
         skills = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
 
+        max_pages = min(max(8, len(org_unit_pages)), 20)
+        pending = list(org_unit_pages[:max_pages])
+        seen_pages = {item.url for item in pending}
         extracted_any = False
-        for page in org_unit_pages[:5]:
+        core_validated_total = 0
+        processed = 0
+        while pending and processed < max_pages:
+            page = pending.pop(0)
+            processed += 1
             fetched = await self._fetch_url(page.url, page.depth)
             if fetched is None:
+                continue
+
+            # Skip LLM extraction when the page is clearly blocked/empty -
+            # the LLM would hallucinate URLs from training data.
+            if fetched.block_reason or (not fetched.links and len(fetched.text) < 200):
+                self.logger.debug(
+                    "Skipping org-unit extraction for blocked/empty page url=%s block_reason=%s text_len=%s",
+                    fetched.url,
+                    fetched.block_reason or "-",
+                    len(fetched.text),
+                )
                 continue
 
             result = await self._ask_llm(
@@ -232,9 +277,35 @@ class CrawlerAgent:
             )
             units = self._org_units_from_result(result.content)
             if not units:
+                followups = self._org_unit_followup_links_from_result(result.content, fetched.url)
+                added_followups: list[str] = []
+                for link in followups:
+                    if link in seen_pages:
+                        continue
+                    if not _same_site(link, self.start_url) or _is_faculty_platform(link):
+                        continue
+                    next_depth = page.depth + (0 if link == fetched.url else 1)
+                    if not self._within_depth(next_depth):
+                        continue
+                    seen_pages.add(link)
+                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    added_followups.append(link)
+                if added_followups:
+                    self.logger.debug(
+                        "Org-unit extraction followups from LLM hint page=%s added=%s sample=%s",
+                        fetched.url,
+                        len(added_followups),
+                        added_followups[:3],
+                    )
                 continue
 
+            # Build a set of URLs actually present on the page for validation.
+            page_urls = set(fetched.links)
+            page_text_lower = fetched.text.lower()
+
             extracted_any = True
+            validated = 0
+            hallucinated = 0
             async with self.db.session() as session:
                 for unit in units:
                     name = str(unit.get("name") or "").strip()
@@ -243,10 +314,19 @@ class CrawlerAgent:
                     kind = str(unit.get("kind") or "").strip() or None
                     if not name or not url:
                         continue
+                    if _is_category_name(name):
+                        continue
                     if not _same_site(url, self.start_url):
                         continue
                     if _is_faculty_platform(url):
                         continue
+                    # Validate: URL must appear in page links or page text.
+                    if not _url_found_on_page(url, page_urls, page_text_lower):
+                        hallucinated += 1
+                        continue
+                    validated += 1
+                    if _is_core_academic_kind(kind):
+                        core_validated_total += 1
                     await crawler_db.get_or_create_org_unit(
                         session,
                         name=name,
@@ -254,6 +334,20 @@ class CrawlerAgent:
                         kind=kind,
                         discovered_from_url=fetched.url,
                     )
+
+            if hallucinated:
+                self.logger.info(
+                    "Org-unit URL validation: %s accepted, %s rejected (not found on page)",
+                    validated,
+                    hallucinated,
+                )
+            if core_validated_total >= self.min_org_units:
+                self.logger.info(
+                    "Collected %s core org units (min=%s); stop org-unit extraction early",
+                    core_validated_total,
+                    self.min_org_units,
+                )
+                break
 
         if not extracted_any:
             return []
@@ -268,22 +362,20 @@ class CrawlerAgent:
         llm_fallback_budget = 3
 
         preferred: list[OrgUnit] = []
+        fallback: list[OrgUnit] = []
         for unit in org_units:
             kind = (unit.kind or "").strip().lower()
             if kind in {"division", "xuebu"}:
                 continue
-            preferred.append(unit)
-        candidates = preferred or org_units
+            if _is_core_academic_kind(kind):
+                preferred.append(unit)
+            else:
+                fallback.append(unit)
+        candidates = preferred or fallback or org_units
         max_links = min(max(40, len(candidates) * 2), 160)
 
         start_host = (urlparse(self.start_url).hostname or "").lower()
-        candidates = sorted(
-            candidates,
-            key=lambda unit: (
-                0 if (urlparse(unit.url).hostname or "").lower() != start_host else 1,
-                unit.id,
-            ),
-        )
+        candidates = sorted(candidates, key=lambda unit: _org_unit_faculty_priority(unit, start_host))
 
         for org_unit in candidates[: self.max_org_units_per_university]:
             item = _QueuedUrl(
@@ -296,6 +388,11 @@ class CrawlerAgent:
             if _is_faculty_platform(item.url):
                 self.logger.info("Skipping faculty platform URL: %s", item.url)
                 self.execution_log.append(f"skip faculty_platform url={item.url}")
+                continue
+
+            item_host = (urlparse(item.url).hostname or "").lower()
+            if item_host in self._blocked_hosts:
+                self.logger.debug("Skipping %s: host already marked blocked", item.url)
                 continue
 
             fetched = await self._fetch_url(item.url, item.depth)
@@ -373,6 +470,10 @@ class CrawlerAgent:
     async def _probe_faculty_paths(self, org_unit_url: str) -> list[str]:
         """Try common Chinese university faculty page paths on an org unit subdomain."""
         parsed = urlparse(org_unit_url)
+        host = (parsed.hostname or "").lower()
+        if host in self._blocked_hosts:
+            self.logger.debug("Skip faculty path probing for blocked host: %s", host)
+            return []
         base = f"{parsed.scheme}://{parsed.hostname}"
         found: list[str] = []
         for suffix in _COMMON_FACULTY_PATHS:
@@ -683,6 +784,9 @@ class CrawlerAgent:
             )
 
         if fetched.block_reason:
+            blocked_host = (urlparse(fetched.url).hostname or "").lower()
+            if blocked_host:
+                self._blocked_hosts.add(blocked_host)
             self.logger.warning(
                 "WAF/challenge page detected url=%s status=%s reason=%s links=%s",
                 fetched.url,
@@ -751,6 +855,14 @@ class CrawlerAgent:
         async with self.db.session() as session:
             return await crawler_db.count_professors(session)
 
+    async def _all_urls_previously_crawled(self, urls: list[str]) -> bool:
+        candidates = [_sanitize_url(url) for url in urls if _sanitize_url(url)]
+        if not candidates:
+            return False
+        async with self.db.session() as session:
+            checks = [await crawler_db.is_url_crawled(session, url) for url in candidates]
+        return all(checks)
+
     def _links_from_result(self, content: str) -> list[str]:
         payload = self._parse_json_from_text(content)
         if payload is None:
@@ -765,6 +877,29 @@ class CrawlerAgent:
                 raw = [str(item.get("url") if isinstance(item, dict) else item) for item in value]
                 return [_sanitize_url(u) for u in raw if _sanitize_url(u)]
         return []
+
+    def _org_unit_followup_links_from_result(self, content: str, current_url: str) -> list[str]:
+        payload = self._parse_json_from_text(content)
+        links: list[str] = []
+        if isinstance(payload, dict):
+            for key in ("next_url", "url", "next_page", "target_url", "org_unit_page"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    link = _sanitize_url(value)
+                    if link:
+                        links.append(urljoin(current_url, link))
+
+        links.extend(self._links_from_result(content))
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for link in links:
+            clean = _sanitize_url(link)
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            deduped.append(clean)
+        return deduped
 
     def _links_from_tool_call_log(self, result: Any, *, tool_name: str = "extract_links") -> list[str]:
         records = getattr(result, "tool_call_log", None)
@@ -915,6 +1050,10 @@ ORG_UNIT_PAGE_KEYWORDS = (
     "/jxjg",
     "/yxsz",
     "/xysz",
+    "/xybm",
+    "/jxkydw",
+    "jxkydw",
+    "yjjg",
     "/xygk",
     "/xxgk",
     # Full pinyin forms used by some universities (e.g. RUC zuzhijigou.html)
@@ -1049,9 +1188,15 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
         "/zzjg",
         "/jxjg",
         "/xysz",
+        "/xybm",
+        "/jxkydw",
+        "_yjjg",
         "jgsz",
         "yxsz",
         "zzjg",
+        "xybm",
+        "jxkydw",
+        "yjjg",
     )
     medium_tokens = (
         "college",
@@ -1066,6 +1211,10 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
     weak_tokens = (
         "/xygk",
         "/xxgk",
+        "/xxgk/xxjj",
+        "/xxgk/xxls",
+        "/xxgk/lrld",
+        "/xxgk/xrld",
         "/about",
         "/overview",
         "/intro",
@@ -1083,6 +1232,8 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
         score = 0
         if host and host != start_host:
             score += 2
+        if host.startswith("xxgk") or host.startswith("news") or host.startswith("www2"):
+            score -= 3
         if any(token in lowered for token in strong_tokens):
             score += 8
         if any(token in lowered for token in medium_tokens):
@@ -1105,6 +1256,32 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
         seen.add(link)
         deduped.append(link)
     return deduped
+
+
+def _is_core_academic_kind(kind: str | None) -> bool:
+    value = (kind or "").strip().lower()
+    if not value:
+        return False
+    core_tokens = ("college", "school", "department", "academy", "faculty", "xueyuan", "yuanxi")
+    research_tokens = ("research", "institute", "lab", "center", "platform")
+    if any(token in value for token in research_tokens):
+        return False
+    return any(token in value for token in core_tokens)
+
+
+def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int]:
+    kind = (unit.kind or "").strip().lower()
+    parsed = urlparse(unit.url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+
+    core_rank = 0 if _is_core_academic_kind(kind) else 1
+    host_rank = 0 if host != start_host else 1
+    detail_rank = 1 if ("/info/" in path or "/news/" in path or "/notice/" in path) else 0
+    path_depth = max(0, path.count("/") - 1)
+    return (core_rank, detail_rank, host_rank, path_depth)
+
+
 def _is_faculty_platform(url: str) -> bool:
     """Return True if URL belongs to a faculty.xxx.edu.cn homepage platform (not a real faculty list)."""
     host = (urlparse(url).hostname or "").lower()
@@ -1175,6 +1352,46 @@ def _dedupe_queue(items: list[_QueuedUrl]) -> list[_QueuedUrl]:
 
 def _same_site(url: str, base_url: str) -> bool:
     return bool(Fetcher.filter_same_domain([url], base_url))
+
+
+def _url_found_on_page(url: str, page_links: set[str], page_text_lower: str) -> bool:
+    """Return True if *url* (or its key components) appears in the page links or text."""
+    if url in page_links:
+        return True
+    # Check if any page link shares the same hostname+path.
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/").lower()
+    for link in page_links:
+        lp = urlparse(link)
+        if (lp.hostname or "").lower() == host and lp.path.rstrip("/").lower() == path:
+            return True
+    # Fallback: check if the hostname appears in the page text (covers cases
+    # where the URL is rendered as text but not as an <a> tag).
+    if host and host in page_text_lower:
+        return True
+    return False
+
+
+_CATEGORY_PATTERNS = (
+    "教学科研",
+    "科研机构",
+    "研究机构",
+    "教学单位",
+    "直属单位",
+    "附属单位",
+    "独立学院",
+    "党群部门",
+    "行政部门",
+    "管理机构",
+    "教辅机构",
+    "群团组织",
+)
+
+
+def _is_category_name(name: str) -> bool:
+    """Return True if *name* looks like a section heading rather than a specific org unit."""
+    return any(pattern in name for pattern in _CATEGORY_PATTERNS)
 
 
 def _sanitize_url(url: str) -> str:
