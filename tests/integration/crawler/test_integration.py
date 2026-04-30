@@ -11,7 +11,7 @@ from functools import partial
 from agents.crawler.agent import CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
-from agents.crawler.fetcher import Fetcher, _site_root
+from agents.crawler.fetchers import Fetcher, _site_root
 from agents.crawler.models import CrawlLog, OrgUnit, Professor, UniversityMeta
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallRecord

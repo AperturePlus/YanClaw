@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
-from agents.crawler.fetcher import FetchResult, Fetcher
+from agents.crawler.fetchers.httpx_fetcher import FetchResult, Fetcher
 from runtime.logger import get_logger
 
 
@@ -30,6 +30,7 @@ class HybridFetcher:
         crawl4ai_timeout_seconds: float = 120.0,
         backend_order: tuple[str, ...] = ("httpx", "curl_cffi", "playwright", "crawl4ai"),
         backend_factories: dict[str, Callable[[], Any]] | None = None,
+        cookies: list[dict] | None = None,
     ) -> None:
         self.request_interval_seconds = request_interval_seconds
         self.max_retries = max_retries
@@ -40,6 +41,7 @@ class HybridFetcher:
         self.crawl4ai_timeout_seconds = crawl4ai_timeout_seconds
         self.backend_order = tuple(dict.fromkeys(backend_order))
         self._custom_backend_factories = backend_factories or {}
+        self._cookies = cookies or []
 
         self._active_backends: dict[str, Any] = {}
         self._entered_order: list[str] = []
@@ -186,36 +188,42 @@ class HybridFetcher:
         if self._custom_backend_factories:
             return self._custom_backend_factories
 
+        httpx_cookies = {c["name"]: c["value"] for c in self._cookies if "name" in c and "value" in c} if self._cookies else {}
+        pw_cookies = self._cookies
+
         def _httpx_factory() -> Any:
             return Fetcher(
                 request_interval_seconds=self.request_interval_seconds,
                 max_retries=self.max_retries,
                 timeout_seconds=self.timeout_seconds,
                 retry_base_delay=self.retry_base_delay,
+                cookies=httpx_cookies or None,
             )
 
         def _curl_factory() -> Any:
-            from agents.crawler.curl_cffi_fetcher import CurlCffiFetcher
+            from agents.crawler.fetchers.curl_cffi_fetcher import CurlCffiFetcher
 
             return CurlCffiFetcher(
                 request_interval_seconds=self.request_interval_seconds,
                 max_retries=self.max_retries,
                 timeout_seconds=self.timeout_seconds,
                 retry_base_delay=self.retry_base_delay,
+                cookies=httpx_cookies or None,
             )
 
         def _playwright_factory() -> Any:
-            from agents.crawler.playwright_fetcher import PlaywrightFetcher
+            from agents.crawler.fetchers.playwright_fetcher import PlaywrightFetcher
 
             return PlaywrightFetcher(
                 request_interval_seconds=self.request_interval_seconds,
                 max_retries=self.max_retries,
                 timeout_seconds=self.timeout_seconds,
                 retry_base_delay=self.retry_base_delay,
+                cookies=pw_cookies or None,
             )
 
         def _crawl4ai_factory() -> Any:
-            from agents.crawler.crawl4ai_fetcher import Crawl4aiFetcher
+            from agents.crawler.fetchers.crawl4ai_fetcher import Crawl4aiFetcher
 
             return Crawl4aiFetcher(
                 base_url=self.crawl4ai_base_url,
@@ -224,6 +232,7 @@ class HybridFetcher:
                 max_retries=self.max_retries,
                 timeout_seconds=self.crawl4ai_timeout_seconds,
                 retry_base_delay=self.retry_base_delay,
+                cookies=pw_cookies or None,
             )
 
         return {

@@ -15,7 +15,7 @@ import asyncio
 import time
 from typing import Iterable
 
-from agents.crawler.fetcher import (
+from agents.crawler.fetchers.httpx_fetcher import (
     FetchResult,
     Fetcher,
     _detect_block_reason,
@@ -45,6 +45,7 @@ class PlaywrightFetcher:
         max_retries: int = 3,
         timeout_seconds: float = 30.0,
         retry_base_delay: float = 1.0,
+        cookies: list[dict] | None = None,
     ) -> None:
         if async_playwright is None:
             raise ImportError(
@@ -55,6 +56,7 @@ class PlaywrightFetcher:
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self._timeout_ms = int(timeout_seconds * 1000)
+        self._cookies = cookies or []
         self._pw: object | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -73,6 +75,8 @@ class PlaywrightFetcher:
             ),
             locale="zh-CN",
         )
+        if self._cookies:
+            await self._context.add_cookies(self._cookies)
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:

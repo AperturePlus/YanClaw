@@ -54,6 +54,7 @@ class Fetcher:
         retry_base_delay: float = 1.0,
         client: httpx.AsyncClient | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        cookies: dict[str, str] | None = None,
     ) -> None:
         self.request_interval_seconds = request_interval_seconds
         self.max_retries = max_retries
@@ -62,6 +63,7 @@ class Fetcher:
         self._own_client = client is None
         self._timeout_seconds = timeout_seconds
         self._transport = transport
+        self._cookies = cookies or {}
         self._insecure_client: httpx.AsyncClient | None = None
         self._last_request_at: dict[str, float] = {}
         self._domain_locks: dict[str, asyncio.Lock] = {}
@@ -73,6 +75,7 @@ class Fetcher:
                 follow_redirects=True,
                 transport=self._transport,
                 headers=self._HEADERS,
+                cookies=self._cookies or None,
             )
         return self
 
@@ -154,6 +157,7 @@ class Fetcher:
                 follow_redirects=True,
                 verify=ctx,
                 headers=self._HEADERS,
+                cookies=self._cookies or None,
             )
         return self._insecure_client
 

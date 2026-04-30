@@ -15,7 +15,7 @@ import time
 from typing import Iterable
 from urllib.parse import urlparse
 
-from agents.crawler.fetcher import (
+from agents.crawler.fetchers.httpx_fetcher import (
     FetchResult,
     Fetcher,
     _detect_block_reason,
@@ -43,6 +43,7 @@ class CurlCffiFetcher:
         timeout_seconds: float = 30.0,
         retry_base_delay: float = 1.0,
         impersonate: str = "chrome131",
+        cookies: dict[str, str] | None = None,
     ) -> None:
         if AsyncSession is None:
             raise ImportError(
@@ -54,6 +55,7 @@ class CurlCffiFetcher:
         self.retry_base_delay = retry_base_delay
         self._timeout_seconds = timeout_seconds
         self._impersonate = impersonate
+        self._cookies = cookies or {}
         self._session: AsyncSession | None = None
         self._last_request_at: dict[str, float] = {}
         self._domain_locks: dict[str, asyncio.Lock] = {}
@@ -63,6 +65,7 @@ class CurlCffiFetcher:
             impersonate=self._impersonate,
             timeout=self._timeout_seconds,
             allow_redirects=True,
+            cookies=self._cookies or None,
         )
         return self
 

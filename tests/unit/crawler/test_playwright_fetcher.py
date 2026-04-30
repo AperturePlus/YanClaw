@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from agents.crawler.fetcher import FetchResult
+from agents.crawler.fetchers import FetchResult
 
 playwright = pytest.importorskip("playwright", reason="playwright not installed")
 
 
-from agents.crawler.playwright_fetcher import PlaywrightFetcher
+from agents.crawler.fetchers.playwright_fetcher import PlaywrightFetcher
 
 
 def test_playwright_fetcher_has_same_interface_as_fetcher():

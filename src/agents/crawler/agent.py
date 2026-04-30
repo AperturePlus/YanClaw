@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
-from agents.crawler.fetcher import FetchResult, Fetcher
+from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (

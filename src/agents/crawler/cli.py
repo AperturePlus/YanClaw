@@ -26,8 +26,8 @@ def cli() -> None:
 @click.option(
     "--fetcher-backend",
     default=None,
-    type=click.Choice(["hybrid", "httpx", "playwright", "curl_cffi", "crawl4ai"], case_sensitive=False),
-    help="Fetcher backend: hybrid (default, auto fallback), httpx, playwright, curl_cffi, or crawl4ai.",
+    type=click.Choice(["hybrid", "httpx", "playwright", "curl_cffi", "crawl4ai", "human"], case_sensitive=False),
+    help="Fetcher backend: hybrid (default), httpx, playwright, curl_cffi, crawl4ai, or human (browser-assisted).",
 )
 @click.option(
     "--university-timeout-seconds",
@@ -158,6 +158,56 @@ def llm_check() -> None:
     click.echo(f"timeout_seconds={settings.llm_timeout_seconds}")
     asyncio.run(_check_llm(settings))
     click.echo("ok")
+
+
+@cli.group()
+def cookie() -> None:
+    """Manage per-university cookies for WAF bypass."""
+
+
+@cookie.command("import")
+@click.argument("url", type=str)
+@click.argument("file", type=click.Path(exists=True, path_type=Path))
+def cookie_import(url: str, file: Path) -> None:
+    """Import cookies from a JSON file for a university URL.
+
+    URL is the university start URL (e.g. https://www.scu.edu.cn/).
+    FILE is a JSON file containing a list of cookie dicts.
+    """
+    import json as _json
+
+    from agents.crawler.cookies import save_cookies
+
+    data = _json.loads(file.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise click.ClickException("Cookie file must contain a JSON array of cookie objects")
+    path = save_cookies(url, data)
+    click.echo(f"Saved {len(data)} cookies to {path}")
+
+
+@cookie.command("list")
+def cookie_list() -> None:
+    """List all stored cookie files."""
+    from agents.crawler.cookies import list_cookie_files
+
+    entries = list_cookie_files()
+    if not entries:
+        click.echo("No cookies stored.")
+        return
+    for domain, count in entries:
+        click.echo(f"{domain}\t{count} cookies")
+
+
+@cookie.command("clear")
+@click.argument("url", type=str)
+def cookie_clear(url: str) -> None:
+    """Remove stored cookies for a university URL."""
+    from agents.crawler.cookies import clear_cookies
+
+    if clear_cookies(url):
+        click.echo("Cookies removed.")
+    else:
+        click.echo("No cookies found for this URL.")
 
 
 @cli.group()

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from agents.crawler.fetcher import FetchResult
-from agents.crawler.hybrid_fetcher import HybridFetcher
+from agents.crawler.fetchers import FetchResult
+from agents.crawler.fetchers.hybrid_fetcher import HybridFetcher
 
 
 class _FakeBackend:

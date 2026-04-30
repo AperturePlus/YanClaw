@@ -4,7 +4,7 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from agents.crawler.fetcher import Fetcher
+from agents.crawler.fetchers import Fetcher
 from agents.crawler.models import OrgUnit
 ORG_UNIT_PAGE_KEYWORDS = (
     "college",
@@ -268,7 +268,7 @@ def _is_college_subdomain(url: str, start_url: str) -> bool:
         return False
     if _is_faculty_platform(url):
         return False
-    from agents.crawler.fetcher import _site_root
+    from agents.crawler.fetchers import _site_root
 
     return _site_root(host) == _site_root(base_host)
 

@@ -6,7 +6,7 @@ import time
 import httpx
 import pytest
 
-from agents.crawler.fetcher import Fetcher, _is_ssl_error
+from agents.crawler.fetchers.httpx_fetcher import Fetcher, _is_ssl_error
 
 
 async def test_fetcher_converts_html_extracts_links_and_rate_limits():

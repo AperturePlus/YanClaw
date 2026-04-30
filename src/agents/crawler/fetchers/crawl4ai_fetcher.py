@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from agents.crawler.fetcher import (
+from agents.crawler.fetchers.httpx_fetcher import (
     FetchResult,
     Fetcher,
     _detect_block_reason,
@@ -43,6 +43,7 @@ class Crawl4aiFetcher:
         max_retries: int = 3,
         timeout_seconds: float = 60.0,
         retry_base_delay: float = 1.0,
+        cookies: list[dict] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_token = api_token
@@ -50,6 +51,7 @@ class Crawl4aiFetcher:
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self._timeout_seconds = timeout_seconds
+        self._cookies = cookies or []
         self._client: httpx.AsyncClient | None = None
         self._last_request_at: dict[str, float] = {}
         self._domain_locks: dict[str, asyncio.Lock] = {}
@@ -108,6 +110,21 @@ class Crawl4aiFetcher:
                 },
             },
         }
+        if self._cookies:
+            import json as _json
+
+            cookies_json = _json.dumps(self._cookies)
+            payload["hooks"] = {
+                "code": {
+                    "on_page_context_created": (
+                        "async def hook(page, context, **kwargs):\n"
+                        "    import json\n"
+                        f"    await context.add_cookies(json.loads('{cookies_json}'))\n"
+                        "    return page"
+                    ),
+                },
+                "timeout": 15,
+            }
         response = await self._client.post(
             f"{self.base_url}/crawl",
             json=payload,

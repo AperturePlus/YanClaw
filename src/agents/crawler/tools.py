@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from agents.crawler import db as crawler_db
-from agents.crawler.fetcher import Fetcher
+from agents.crawler.fetchers import Fetcher
 from agents.crawler.sanitizer import sanitize_professor_payload
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager

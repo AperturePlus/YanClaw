@@ -5,8 +5,8 @@ import json
 import httpx
 import pytest
 
-from agents.crawler.crawl4ai_fetcher import Crawl4aiFetcher
-from agents.crawler.fetcher import FetchResult
+from agents.crawler.fetchers.crawl4ai_fetcher import Crawl4aiFetcher
+from agents.crawler.fetchers import FetchResult
 
 
 # ---------------------------------------------------------------------------

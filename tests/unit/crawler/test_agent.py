@@ -18,7 +18,7 @@ from agents.crawler.agent import (
     _rank_org_unit_page_candidates,
     ORG_UNIT_PAGE_KEYWORDS,
 )
-from agents.crawler.fetcher import FetchResult, Fetcher
+from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from agents.crawler.fetcher import FetchResult
+from agents.crawler.fetchers import FetchResult
 
 curl_cffi = pytest.importorskip("curl_cffi", reason="curl_cffi not installed")
 
-from agents.crawler.curl_cffi_fetcher import CurlCffiFetcher
+from agents.crawler.fetchers.curl_cffi_fetcher import CurlCffiFetcher
 
 
 def test_curl_cffi_fetcher_has_same_interface_as_fetcher():
