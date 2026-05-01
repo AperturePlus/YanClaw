@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -124,9 +125,8 @@ class LLMClient:
                 function = tool_call.get("function") or {}
                 name = function.get("name") or ""
                 raw_args = function.get("arguments") or "{}"
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-                except json.JSONDecodeError:
+                args = self._parse_tool_arguments(raw_args)
+                if args is None:
                     self.logger.warning("Invalid JSON in tool arguments for %s: %s", name, str(raw_args)[:200])
                     working_messages.append(
                         {
@@ -277,3 +277,99 @@ class LLMClient:
         if isinstance(value, dict):
             return value.get(key)
         return getattr(value, key, None)
+
+    def _parse_tool_arguments(self, raw_args: Any) -> dict[str, Any] | None:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if raw_args is None:
+            return {}
+        if not isinstance(raw_args, str):
+            try:
+                return dict(raw_args)
+            except Exception:
+                return None
+
+        text = raw_args.strip()
+        if not text:
+            return {}
+
+        # Some providers wrap JSON in markdown fences.
+        if text.startswith("```"):
+            fenced = self._strip_json_fence(text)
+            if fenced:
+                text = fenced
+
+        candidates = [text]
+
+        escaped = self._escape_unescaped_string_controls(text)
+        if escaped != text:
+            candidates.append(escaped)
+
+        for candidate in list(candidates):
+            stripped_commas = re.sub(r",(\s*[}\]])", r"\1", candidate)
+            if stripped_commas != candidate:
+                candidates.append(stripped_commas)
+
+            sliced = self._slice_to_json_object(candidate)
+            if sliced and sliced != candidate:
+                candidates.append(sliced)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        return None
+
+    def _strip_json_fence(self, text: str) -> str:
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return text
+        if not lines[0].lstrip().startswith("```"):
+            return text
+        if not lines[-1].strip().startswith("```"):
+            return text
+        return "\n".join(lines[1:-1]).strip()
+
+    def _slice_to_json_object(self, text: str) -> str:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return text
+        return text[start : end + 1]
+
+    def _escape_unescaped_string_controls(self, text: str) -> str:
+        out: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = not in_string
+                continue
+            if in_string and ch in {"\n", "\r", "\t"}:
+                if ch == "\n":
+                    out.append("\\n")
+                elif ch == "\r":
+                    out.append("\\r")
+                else:
+                    out.append("\\t")
+                continue
+            out.append(ch)
+        return "".join(out)
