@@ -61,3 +61,43 @@ async def test_llm_client_ignores_unknown_tool_calls():
 
     assert result.content == "need tool"
     assert result.tool_call_log == []
+
+
+async def test_llm_client_repairs_unescaped_newline_in_tool_arguments():
+    raw_args = (
+        '{"org_unit_name":"School of Economics","org_unit_url":"https://sesu.scu.edu.cn/",'
+        '"source_url":"https://sesu.scu.edu.cn/info/1128/9772.htm",'
+        '"professors":[{"name":"Zeng Zhongdong","title":"Professor","research_areas":"Risk Management\nMacro Economics"}]}'
+    )
+    responses = [
+        _chat_response(
+            content="need tool",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "save_professors",
+                        "arguments": raw_args,
+                    },
+                }
+            ],
+        )
+    ]
+    client = LLMClient("http://example", "key", "model", client=_Client(responses))
+    seen: dict = {}
+
+    async def save_professors(**kwargs):
+        seen.update(kwargs)
+        return {"saved": 1}
+
+    result = await client.chat(
+        [{"role": "user", "content": "test"}],
+        tools=[{"type": "function", "name": "save_professors"}],
+        tool_handlers={"save_professors": save_professors},
+    )
+
+    assert result.tool_call_log
+    assert seen["org_unit_name"] == "School of Economics"
+    assert seen["professors"][0]["name"] == "Zeng Zhongdong"
+    assert "Risk Management" in seen["professors"][0]["research_areas"]
