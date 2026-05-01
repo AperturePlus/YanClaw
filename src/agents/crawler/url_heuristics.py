@@ -373,17 +373,63 @@ def _is_core_academic_kind(kind: str | None) -> bool:
     return any(token in value for token in core_tokens)
 
 
-def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int]:
-    kind = (unit.kind or "").strip().lower()
-    parsed = urlparse(unit.url)
+_FOCUS_DISCIPLINE_HIGH_HINTS = (
+    "computer",
+    "cs",
+    "software",
+    "se",
+    "electronics",
+    "electronic",
+    "ee",
+    "eie",
+    "\u8ba1\u7b97\u673a",  # 计算机
+    "\u8f6f\u4ef6",  # 软件
+    "\u7535\u5b50\u4fe1\u606f",  # 电子信息
+    "\u7535\u5b50",  # 电子
+)
+
+_FOCUS_DISCIPLINE_MEDIUM_HINTS = (
+    "ai",
+    "artificial intelligence",
+    "intelligence",
+    "cyber",
+    "security",
+    "network",
+    "communication",
+    "information",
+    "automation",
+    "robot",
+    "\u4eba\u5de5\u667a\u80fd",  # 人工智能
+    "\u7f51\u7edc\u5b89\u5168",  # 网络安全
+    "\u4fe1\u606f\u5de5\u7a0b",  # 信息工程
+    "\u901a\u4fe1",  # 通信
+)
+
+
+def _org_unit_focus_rank(unit: OrgUnit) -> int:
+    name = (getattr(unit, "name", "") or "").strip().lower()
+    kind = (getattr(unit, "kind", "") or "").strip().lower()
+    url = (getattr(unit, "url", "") or "").strip().lower()
+    text = f"{name} {kind} {url}"
+    if any(token in text for token in _FOCUS_DISCIPLINE_HIGH_HINTS):
+        return 0
+    if any(token in text for token in _FOCUS_DISCIPLINE_MEDIUM_HINTS):
+        return 1
+    return 2
+
+
+def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int, int]:
+    kind = (getattr(unit, "kind", "") or "").strip().lower()
+    parsed = urlparse(getattr(unit, "url", "") or "")
     host = (parsed.hostname or "").lower()
     path = parsed.path.lower()
 
+    focus_rank = _org_unit_focus_rank(unit)
     core_rank = 0 if _is_core_academic_kind(kind) else 1
     host_rank = 0 if host != start_host else 1
     detail_rank = 1 if ("/info/" in path or "/news/" in path or "/notice/" in path) else 0
     path_depth = max(0, path.count("/") - 1)
-    return (core_rank, detail_rank, host_rank, path_depth)
+    return (focus_rank, core_rank, detail_rank, host_rank, path_depth)
 
 
 def _is_faculty_platform(url: str) -> bool:
