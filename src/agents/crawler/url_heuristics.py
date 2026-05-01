@@ -375,45 +375,74 @@ def _is_core_academic_kind(kind: str | None) -> bool:
 
 _FOCUS_DISCIPLINE_HIGH_HINTS = (
     "computer",
-    "cs",
+    "computing",
     "software",
-    "se",
     "electronics",
     "electronic",
-    "ee",
-    "eie",
+    "electrical",
+    "microelectronics",
+    "information engineering",
+    "information science",
     "\u8ba1\u7b97\u673a",  # 计算机
     "\u8f6f\u4ef6",  # 软件
     "\u7535\u5b50\u4fe1\u606f",  # 电子信息
-    "\u7535\u5b50",  # 电子
+    "\u7535\u6c14\u5de5\u7a0b",  # 电气工程
+    "\u5fae\u7535\u5b50",  # 微电子
 )
 
+_FOCUS_DISCIPLINE_HIGH_HOST_LABELS = {
+    "cs",
+    "cse",
+    "software",
+    "se",
+    "ee",
+    "ece",
+    "eie",
+    "electronic",
+    "electronics",
+    "microelectronics",
+}
+
 _FOCUS_DISCIPLINE_MEDIUM_HINTS = (
-    "ai",
     "artificial intelligence",
     "intelligence",
-    "cyber",
+    "cybersecurity",
+    "cyber security",
     "security",
     "network",
     "communication",
-    "information",
     "automation",
     "robot",
     "\u4eba\u5de5\u667a\u80fd",  # 人工智能
     "\u7f51\u7edc\u5b89\u5168",  # 网络安全
     "\u4fe1\u606f\u5de5\u7a0b",  # 信息工程
     "\u901a\u4fe1",  # 通信
+    "\u81ea\u52a8\u5316",  # 自动化
 )
+
+
+def _ascii_terms(value: str) -> set[str]:
+    return {term for term in re.split(r"[^a-z0-9]+", value.lower()) if term}
 
 
 def _org_unit_focus_rank(unit: OrgUnit) -> int:
     name = (getattr(unit, "name", "") or "").strip().lower()
     kind = (getattr(unit, "kind", "") or "").strip().lower()
-    url = (getattr(unit, "url", "") or "").strip().lower()
-    text = f"{name} {kind} {url}"
+    parsed = urlparse((getattr(unit, "url", "") or "").strip().lower())
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    text = f"{name} {kind} {host} {path}"
+
+    host_labels = {label for label in re.split(r"[.\-]+", host) if label}
+    ascii_terms = _ascii_terms(f"{name} {kind} {path}")
+
+    if host_labels & _FOCUS_DISCIPLINE_HIGH_HOST_LABELS:
+        return 0
     if any(token in text for token in _FOCUS_DISCIPLINE_HIGH_HINTS):
         return 0
     if any(token in text for token in _FOCUS_DISCIPLINE_MEDIUM_HINTS):
+        return 1
+    if {"ai", "robotics"} & ascii_terms:
         return 1
     return 2
 

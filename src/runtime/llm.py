@@ -314,6 +314,10 @@ class LLMClient:
             if sliced and sliced != candidate:
                 candidates.append(sliced)
 
+            repaired = self._repair_truncated_json_object(candidate)
+            if repaired and repaired != candidate:
+                candidates.append(repaired)
+
         seen: set[str] = set()
         for candidate in candidates:
             normalized = candidate.strip()
@@ -373,3 +377,70 @@ class LLMClient:
                 continue
             out.append(ch)
         return "".join(out)
+
+    def _repair_truncated_json_object(self, text: str) -> str | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+        candidate = text[start:].strip()
+        if not candidate:
+            return None
+
+        out: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        closer_map = {"{": "}", "[": "]"}
+        opener_for = {"}": "{", "]": "["}
+
+        for ch in candidate:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+
+            if ch == '"':
+                out.append(ch)
+                in_string = not in_string
+                continue
+
+            if in_string:
+                if ch in {"\n", "\r", "\t"}:
+                    if ch == "\n":
+                        out.append("\\n")
+                    elif ch == "\r":
+                        out.append("\\r")
+                    else:
+                        out.append("\\t")
+                else:
+                    out.append(ch)
+                continue
+
+            if ch in closer_map:
+                stack.append(ch)
+                out.append(ch)
+                continue
+            if ch in opener_for:
+                if stack and stack[-1] == opener_for[ch]:
+                    stack.pop()
+                    out.append(ch)
+                # Drop unmatched closers in malformed outputs.
+                continue
+
+            out.append(ch)
+
+        if escaped:
+            out.append("\\")
+        if in_string:
+            out.append('"')
+
+        while stack:
+            opener = stack.pop()
+            out.append(closer_map[opener])
+
+        return "".join(out).strip()

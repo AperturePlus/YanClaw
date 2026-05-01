@@ -499,6 +499,7 @@ class CrawlerAgent:
 
         start_host = (urlparse(self.start_url).hostname or "").lower()
         candidates = sorted(candidates, key=lambda unit: _org_unit_faculty_priority(unit, start_host))
+        self._log_org_unit_queue_preview(candidates, start_host, stage="streaming")
 
         for org_unit in candidates[: self.max_org_units_per_university]:
             item = _QueuedUrl(url=org_unit.url, depth=1, label=org_unit.name, org_unit_id=org_unit.id)
@@ -578,6 +579,7 @@ class CrawlerAgent:
 
         start_host = (urlparse(self.start_url).hostname or "").lower()
         candidates = sorted(candidates, key=lambda unit: _org_unit_faculty_priority(unit, start_host))
+        self._log_org_unit_queue_preview(candidates, start_host, stage="batch")
 
         for org_unit in candidates[: self.max_org_units_per_university]:
             item = _QueuedUrl(
@@ -1157,6 +1159,20 @@ class CrawlerAgent:
         if parent:
             return parent
         return normalized
+
+    def _log_org_unit_queue_preview(self, candidates: list[OrgUnit], start_host: str, *, stage: str) -> None:
+        if not candidates:
+            return
+        preview = []
+        for unit in candidates[:8]:
+            priority = _org_unit_faculty_priority(unit, start_host)
+            preview.append(f"{unit.name}:{priority}")
+        self.logger.info(
+            "Org-unit queue ordered stage=%s total=%s preview=%s",
+            stage,
+            len(candidates),
+            " | ".join(preview),
+        )
 
     def _is_failed_detail_fetch(self, fetched: FetchResult) -> bool:
         if fetched.block_reason:
