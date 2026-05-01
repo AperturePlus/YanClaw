@@ -672,6 +672,35 @@ def test_is_core_academic_kind_and_priority():
     )
 
 
+def test_org_unit_priority_prefers_computing_and_electronics():
+    start_host = "www.scu.edu.cn"
+    generic_college = SimpleNamespace(
+        name="History College",
+        kind="college",
+        url="https://history.scu.edu.cn/",
+        id=1,
+    )
+    software_college = SimpleNamespace(
+        name="School of Software",
+        kind="college",
+        url="https://software.scu.edu.cn/",
+        id=2,
+    )
+    ece_college = SimpleNamespace(
+        name="School of Electronic Information",
+        kind="college",
+        url="https://eie.scu.edu.cn/",
+        id=3,
+    )
+
+    assert _org_unit_faculty_priority(software_college, start_host) < _org_unit_faculty_priority(
+        generic_college, start_host
+    )
+    assert _org_unit_faculty_priority(ece_college, start_host) < _org_unit_faculty_priority(
+        generic_college, start_host
+    )
+
+
 async def test_extract_org_units_keeps_processing_candidates_after_minimum_core_units(tmp_path):
     pages = {
         "https://www.example.edu.cn/xybm/bm.htm": FetchResult(
