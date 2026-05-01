@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -35,6 +37,13 @@ class _UniversityTarget:
     db_path: Path
 
 
+@dataclass(frozen=True)
+class _UniversityProgress:
+    has_db: bool
+    status: CrawlStatus | None
+    professor_count: int
+
+
 AgentFactory = Callable[..., CrawlerAgent]
 LLMClientFactory = Callable[[], LLMClient]
 FetcherFactory = Callable[[], Fetcher]
@@ -51,6 +60,10 @@ def _university_db_path(university_db_dir: Path, start_url: str) -> Path:
         root = "unknown"
     filename = root.replace(":", "_") + ".db"
     return university_db_dir / filename
+
+
+class FreshRunPreparationError(RuntimeError):
+    """Raised when preparing fresh-run backups fails."""
 
 
 class CrawlDispatcher:
@@ -130,7 +143,7 @@ class CrawlDispatcher:
             timeout_seconds=settings.request_timeout_seconds,
         )
 
-    async def run(self, universities: list[str] | None = None) -> DispatcherSummary:
+    async def run(self, universities: list[str] | None = None, *, resume: bool = False) -> DispatcherSummary:
         university_db_dir = Path(self.settings.university_db_dir)
         university_db_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,6 +163,13 @@ class CrawlDispatcher:
                 )
             )
 
+        if resume:
+            self.logger.info("Run mode=resume; preserving existing per-university databases")
+            await self._inspect_progress(targets)
+        else:
+            self.logger.info("Run mode=fresh; backing up and rebuilding selected per-university databases")
+            self._prepare_fresh_run(targets)
+
         semaphore = asyncio.Semaphore(self.settings.max_concurrency)
         results: list[AgentResult] = []
         skipped = 0
@@ -157,7 +177,7 @@ class CrawlDispatcher:
         async with self.fetcher_factory() as fetcher:
             tasks = []
             for university in targets:
-                if await self._should_skip(university):
+                if resume and await self._should_skip(university):
                     skipped += 1
                     continue
                 tasks.append(self._run_one(university, fetcher, semaphore))
@@ -168,6 +188,69 @@ class CrawlDispatcher:
         failed = sum(1 for result in results if result.status == CrawlStatus.FAILED.value)
         self.logger.info("Summary success=%s failed=%s skipped=%s", success, failed, skipped)
         return DispatcherSummary(success=success, failed=failed, skipped=skipped, results=results)
+
+    def _prepare_fresh_run(self, targets: list[_UniversityTarget]) -> None:
+        existing_paths = sorted({target.db_path for target in targets if target.db_path.exists()})
+        if not existing_paths:
+            self.logger.info("Fresh run: no existing university DB files found for selected targets")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_root = self._next_backup_dir(Path(self.settings.university_db_dir) / "backup" / timestamp)
+        backup_root.mkdir(parents=True, exist_ok=False)
+
+        copied: list[tuple[Path, Path]] = []
+        try:
+            for db_path in existing_paths:
+                backup_path = backup_root / db_path.name
+                shutil.copy2(db_path, backup_path)
+                copied.append((db_path, backup_path))
+        except Exception as error:
+            raise FreshRunPreparationError(
+                f"Failed to back up selected university DB files into {backup_root}: {error}"
+            ) from error
+
+        for db_path, _ in copied:
+            try:
+                db_path.unlink()
+            except Exception as error:
+                raise FreshRunPreparationError(
+                    f"Backups were created at {backup_root}, but failed to remove original DB {db_path}: {error}"
+                ) from error
+
+        self.logger.info(
+            "Fresh run prepared: backed up %s DB files into %s and removed originals",
+            len(copied),
+            backup_root,
+        )
+
+    def _next_backup_dir(self, preferred: Path) -> Path:
+        candidate = preferred
+        index = 1
+        while candidate.exists():
+            candidate = preferred.with_name(f"{preferred.name}-{index:02d}")
+            index += 1
+        return candidate
+
+    async def _inspect_progress(self, targets: list[_UniversityTarget]) -> None:
+        for university in targets:
+            progress = await self._get_university_progress(university)
+            if not progress.has_db:
+                self.logger.info(
+                    "Resume progress university=%s status=missing_db professors=0 action=crawl",
+                    university.name,
+                )
+                continue
+            action = "skip" if progress.status == CrawlStatus.COMPLETED and progress.professor_count > 0 else "crawl"
+            status_text = progress.status.value if progress.status else "unknown"
+            self.logger.info(
+                "Resume progress university=%s status=%s professors=%s action=%s db=%s",
+                university.name,
+                status_text,
+                progress.professor_count,
+                action,
+                university.db_path,
+            )
 
     def _make_cookie_fetcher(self, raw_cookies: list[dict]) -> Fetcher:
         """Create a fetcher of the configured backend type with cookies injected."""
@@ -224,9 +307,27 @@ class CrawlDispatcher:
         )
 
     async def _should_skip(self, university: _UniversityTarget) -> bool:
-
-        if not university.db_path.exists():
+        progress = await self._get_university_progress(university)
+        if not progress.has_db:
             return False
+        if progress.status != CrawlStatus.COMPLETED:
+            return False
+        if progress.professor_count <= 0:
+            self.logger.info(
+                "Re-crawling %s because it is marked completed but has no professors",
+                university.name,
+            )
+            return False
+        self.logger.info(
+            "Skipping completed university %s (%s professors)",
+            university.name,
+            progress.professor_count,
+        )
+        return True
+
+    async def _get_university_progress(self, university: _UniversityTarget) -> _UniversityProgress:
+        if not university.db_path.exists():
+            return _UniversityProgress(has_db=False, status=None, professor_count=0)
         db = DatabaseManager(_sqlite_url(university.db_path))
         try:
             await db.init_db()
@@ -239,21 +340,12 @@ class CrawlDispatcher:
                     location=university.location,
                 )
                 status = await crawler_db.get_university_status(session)
-                if status != CrawlStatus.COMPLETED:
-                    return False
                 professor_count = await crawler_db.count_professors(session)
-                if professor_count <= 0:
-                    self.logger.info(
-                        "Re-crawling %s because it is marked completed but has no professors",
-                        university.name,
-                    )
-                    return False
-                self.logger.info(
-                    "Skipping completed university %s (%s professors)",
-                    university.name,
-                    professor_count,
+                return _UniversityProgress(
+                    has_db=True,
+                    status=status,
+                    professor_count=int(professor_count),
                 )
-                return True
         finally:
             await db.close()
 
@@ -316,6 +408,13 @@ class CrawlDispatcher:
                         detail_fetch_backend=self.settings.detail_fetch_backend,
                         detail_profile_hard_cap_per_org_unit=self.settings.detail_profile_hard_cap_per_org_unit,
                         detail_failure_threshold=self.settings.detail_failure_threshold,
+                        pipeline_enabled=self.settings.pipeline_enabled,
+                        pipeline_fetch_workers=self.settings.pipeline_fetch_workers,
+                        pipeline_llm_workers=self.settings.pipeline_llm_workers,
+                        pipeline_db_workers=self.settings.pipeline_db_workers,
+                        pipeline_queue_cap=self.settings.pipeline_queue_cap,
+                        invalid_json_max_retry=self.settings.invalid_json_max_retry,
+                        task_recovery_enabled=self.settings.task_recovery_enabled,
                     )
                     return await agent.run()
 

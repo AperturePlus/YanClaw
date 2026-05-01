@@ -6,7 +6,7 @@ from pathlib import Path
 import click
 
 from agents.crawler.config import CrawlerSettings
-from agents.crawler.dispatcher import CrawlDispatcher
+from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError
 from agents.crawler.playwright_setup import ensure_chromium_installed
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
@@ -41,6 +41,11 @@ def cli() -> None:
     type=float,
     help="Total crawl timeout for this CLI invocation (seconds).",
 )
+@click.option(
+    "--resume",
+    is_flag=True,
+    help="Resume from existing per-university DB files instead of backing up and rebuilding them.",
+)
 @click.option("--skip-llm-check", is_flag=True, help="Skip the startup LLM connectivity check.")
 def crawl(
     universities: str,
@@ -49,6 +54,7 @@ def crawl(
     fetcher_backend: str | None,
     university_timeout_seconds: float | None,
     run_timeout_seconds: float | None,
+    resume: bool,
     skip_llm_check: bool,
 ) -> None:
     """Start crawler agents."""
@@ -67,12 +73,13 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s fetcher_backend=%s university_timeout_seconds=%s request_timeout_seconds=%s llm_timeout_seconds=%s selected=%s",
+        "Crawler config concurrency=%s fetcher_backend=%s university_timeout_seconds=%s request_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s",
         settings.max_concurrency,
         settings.fetcher_backend,
         settings.university_timeout_seconds,
         settings.request_timeout_seconds,
         settings.llm_timeout_seconds,
+        resume,
         ",".join(selected) if selected else "*",
     )
     if str(settings.fetcher_backend).strip().lower() == "playwright":
@@ -88,6 +95,7 @@ def crawl(
             selected,
             skip_llm_check=skip_llm_check,
             run_timeout_seconds=run_timeout_seconds,
+            resume=resume,
         )
     )
 
@@ -98,6 +106,7 @@ async def _crawl_async(
     *,
     skip_llm_check: bool = False,
     run_timeout_seconds: float | None = None,
+    resume: bool = False,
 ) -> None:
     if not skip_llm_check:
         await _check_llm(settings)
@@ -105,12 +114,17 @@ async def _crawl_async(
     dispatcher = CrawlDispatcher(settings=settings)
     try:
         if run_timeout_seconds is None:
-            summary = await dispatcher.run(universities)
+            summary = await dispatcher.run(universities, resume=resume)
         else:
-            summary = await asyncio.wait_for(dispatcher.run(universities), timeout=float(run_timeout_seconds))
+            summary = await asyncio.wait_for(
+                dispatcher.run(universities, resume=resume),
+                timeout=float(run_timeout_seconds),
+            )
     except asyncio.TimeoutError:
         raise click.ClickException(f"Total run timeout after {run_timeout_seconds}s")
     except ImportError as error:
+        raise click.ClickException(str(error)) from error
+    except FreshRunPreparationError as error:
         raise click.ClickException(str(error)) from error
     click.echo(f"success={summary.success} failed={summary.failed} skipped={summary.skipped}")
 

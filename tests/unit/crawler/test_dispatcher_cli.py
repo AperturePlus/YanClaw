@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import click
 import pytest
 from click.testing import CliRunner
 
+from agents.crawler import db as crawler_db
 from agents.crawler import cli as crawler_cli
+from agents.crawler import dispatcher as dispatcher_module
 from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
-from agents.crawler.dispatcher import CrawlDispatcher
+from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError, _university_db_path
 from agents.crawler.models import CrawlStatus
+from runtime.database import DatabaseManager
+
+
+def _sqlite_url(path: Path) -> str:
+    return f"sqlite+aiosqlite:///{path.as_posix()}"
 
 
 class FakeAgent:
@@ -124,6 +132,7 @@ def test_cli_help_outputs_commands():
     result = runner.invoke(cli, ["crawl", "--help"])
     assert result.exit_code == 0
     assert "--universities" in result.output
+    assert "--resume" in result.output
 
     result = runner.invoke(cli, ["skills", "--help"])
     assert result.exit_code == 0
@@ -147,12 +156,38 @@ async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monke
         fetcher_backend="httpx",
     )
 
-    async def _raise_import_error(self, universities):
+    async def _raise_import_error(self, universities, *, resume=False):
         raise ImportError("playwright is required for PlaywrightFetcher")
 
     monkeypatch.setattr(CrawlDispatcher, "run", _raise_import_error)
 
     with pytest.raises(click.ClickException, match="playwright is required for PlaywrightFetcher"):
+        await crawler_cli._crawl_async(
+            settings,
+            universities=["A"],
+            skip_llm_check=True,
+        )
+
+
+async def test_crawl_async_wraps_fresh_prepare_error_as_click_exception(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        fetcher_backend="httpx",
+    )
+
+    async def _raise_prepare_error(self, universities, *, resume=False):
+        raise FreshRunPreparationError("backup failed")
+
+    monkeypatch.setattr(CrawlDispatcher, "run", _raise_prepare_error)
+
+    with pytest.raises(click.ClickException, match="backup failed"):
         await crawler_cli._crawl_async(
             settings,
             universities=["A"],
@@ -176,7 +211,14 @@ def test_crawl_cli_auto_installs_chromium_for_playwright_backend(tmp_path, monke
         called["install"] += 1
         return True
 
-    async def _noop_crawl_async(settings, universities, *, skip_llm_check=False, run_timeout_seconds=None):
+    async def _noop_crawl_async(
+        settings,
+        universities,
+        *,
+        skip_llm_check=False,
+        run_timeout_seconds=None,
+        resume=False,
+    ):
         called["crawl_async"] += 1
 
     monkeypatch.setattr(crawler_cli, "ensure_chromium_installed", _install)
@@ -237,3 +279,155 @@ def test_dispatcher_factory_supports_hybrid_backend(tmp_path):
     factory = CrawlDispatcher._default_fetcher_factory(settings)
     fetcher = factory()
     assert type(fetcher).__name__ == "HybridFetcher"
+
+
+async def test_crawl_async_passes_resume_to_dispatcher(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        fetcher_backend="httpx",
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeDispatcher:
+        def __init__(self, *, settings):
+            self.settings = settings
+
+        async def run(self, universities, *, resume=False):
+            captured["universities"] = universities
+            captured["resume"] = resume
+            return type("Summary", (), {"success": 1, "failed": 0, "skipped": 0, "results": []})()
+
+    monkeypatch.setattr(crawler_cli, "CrawlDispatcher", _FakeDispatcher)
+    await crawler_cli._crawl_async(
+        settings,
+        universities=["A"],
+        skip_llm_check=True,
+        resume=True,
+    )
+    assert captured["universities"] == ["A"]
+    assert captured["resume"] is True
+
+
+async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\nB,https://b.sample.edu.cn/,Y\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        request_interval_seconds=0,
+        max_retries=0,
+        fetcher_backend="httpx",
+    )
+    db_path_a = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db_path_b = _university_db_path(Path(settings.university_db_dir), "https://b.sample.edu.cn/")
+    db_path_a.parent.mkdir(parents=True, exist_ok=True)
+    db_path_a.write_bytes(b"old-a")
+    db_path_b.write_bytes(b"old-b")
+
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    summary = await dispatcher.run(universities=["A"])
+
+    assert summary.success == 1
+    assert summary.skipped == 0
+    assert db_path_a.exists()
+    assert db_path_a.read_bytes() != b"old-a"
+    assert db_path_b.read_bytes() == b"old-b"
+
+    backup_root = Path(settings.university_db_dir) / "backup"
+    backup_dirs = list(backup_root.iterdir())
+    assert len(backup_dirs) == 1
+    backed_up_files = {p.name for p in backup_dirs[0].iterdir()}
+    assert db_path_a.name in backed_up_files
+    assert db_path_b.name not in backed_up_files
+    assert (backup_dirs[0] / db_path_a.name).read_bytes() == b"old-a"
+
+
+async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        request_interval_seconds=0,
+        max_retries=0,
+        fetcher_backend="httpx",
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+    await db.close()
+
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    summary = await dispatcher.run(universities=["A"], resume=True)
+
+    assert summary.success == 0
+    assert summary.failed == 0
+    assert summary.skipped == 1
+    assert not (Path(settings.university_db_dir) / "backup").exists()
+
+
+async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        request_interval_seconds=0,
+        max_retries=0,
+        fetcher_backend="httpx",
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"old-a")
+
+    def _raise_copy(*args, **kwargs):
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(dispatcher_module.shutil, "copy2", _raise_copy)
+
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    with pytest.raises(RuntimeError, match="Failed to back up selected university DB files"):
+        await dispatcher.run(universities=["A"])
+    assert db_path.exists()
+    assert db_path.read_bytes() == b"old-a"

@@ -126,7 +126,7 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         assert [u.name for u in units] == ["CS"]
         assert len(logs) == 4
 
-    second = await dispatcher.run()
+    second = await dispatcher.run(resume=True)
     assert second.skipped == 1
 
     await db.close()
