@@ -90,23 +90,30 @@ async def get_or_create_org_unit(
     status: str | OrgUnitStatus | None = None,
     discovered_from_url: str | None = None,
 ) -> OrgUnit:
-    name = _clean_text(name)
+    name = normalize_org_unit_name(name, default="")
     url = _normalize_url(url)
+    if not name and not url:
+        raise ValueError("org_unit name or url is required")
     if not url:
-        raise ValueError("org_unit url is required")
+        url = f"about:org_unit:{name or 'Unknown'}"
+    if not name:
+        name = url
     kind = _clean_text(kind) if kind else None
     discovered_from_url = _normalize_url(discovered_from_url) if discovered_from_url else None
     status_value = None
     if status is not None:
         status_value = status.value if isinstance(status, OrgUnitStatus) else str(status)
 
-    org_unit = (
-        await session.execute(select(OrgUnit).where(OrgUnit.url == url))
-    ).scalar_one_or_none()
+    org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.url == url))).scalar_one_or_none()
+    if org_unit is None and name:
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == name))).scalar_one_or_none()
     if org_unit:
         changed = False
         if name and org_unit.name != name:
             org_unit.name = name
+            changed = True
+        if url and org_unit.url != url and _should_replace_org_unit_url(org_unit.url, url):
+            org_unit.url = url
             changed = True
         if kind and org_unit.kind != kind:
             org_unit.kind = kind
@@ -148,7 +155,7 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
 
     Identity strategy:
     - Always collapse exact duplicates inside the same org unit by name.
-    - Across org units, merge only when email or homepage matches after normalization.
+    - Across org units, merge only when email or external_link matches after normalization.
     - Name-only matches across org units are not merged.
     - When a cross-org_unit match is found, keep one Professor row and add affiliations.
     """
@@ -183,8 +190,10 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         if existing_org and existing_org.name:
             org_unit_name = normalize_org_unit_name(existing_org.name)
 
+    source_url = _normalize_url(data.get("source_url"))
     email = _normalize_email(data.get("email"))
-    homepage = _normalize_homepage(data.get("homepage"))
+    external_link = _normalize_homepage(data.get("external_link") or data.get("homepage"))
+    source_url = _normalize_url(data.get("source_url"))
     values = {
         "name": name,
         "org_unit_name": org_unit_name,
@@ -192,7 +201,8 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         "research_areas": normalize_multivalue(data.get("research_areas")),
         "email": email,
         "phone": normalize_optional_text(data.get("phone")),
-        "homepage": homepage,
+        "homepage": source_url or None,
+        "external_link": external_link,
         "bio": normalize_optional_text(data.get("bio")),
         "enrollment_pref": merge_enrollment_pref(
             data.get("enrollment_pref") or data.get("enrollment_preference"),
@@ -206,7 +216,7 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         name,
         int(org_unit_id),
         email,
-        homepage,
+        external_link,
     )
     if professor is None:
         professor = Professor(
@@ -225,7 +235,7 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         session,
         professor_id=professor.id,
         org_unit_id=int(org_unit_id),
-        source_url=_normalize_url(data.get("source_url")),
+        source_url=source_url,
     )
     await session.flush()
     return professor
@@ -257,20 +267,22 @@ async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Aca
         )
         org_unit_id = org_unit.id
 
+    source_url = _normalize_url(data.get("source_url"))
     values = {
         "name": name,
         "title": normalize_title(data.get("title")) or "院士",
         "research_areas": normalize_multivalue(data.get("research_areas")),
         "email": _normalize_email(data.get("email")),
         "phone": normalize_optional_text(data.get("phone")),
-        "homepage": _normalize_homepage(data.get("homepage")),
+        "homepage": source_url or None,
+        "external_link": _normalize_homepage(data.get("external_link") or data.get("homepage")),
         "bio": normalize_optional_text(data.get("bio")),
         "enrollment_pref": merge_enrollment_pref(
             data.get("enrollment_pref") or data.get("enrollment_preference"),
             None,
         ),
         "publications": normalize_multivalue(data.get("publications")),
-        "source_url": _normalize_url(data.get("source_url")),
+        "source_url": source_url,
     }
 
     existing = (
@@ -386,11 +398,67 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
         await session.execute(
             text("ALTER TABLE professors ADD COLUMN org_unit_name VARCHAR(255) DEFAULT 'Unknown'")
         )
+    if not await _sqlite_has_column(session, "professors", "external_link"):
+        await session.execute(text("ALTER TABLE professors ADD COLUMN external_link TEXT"))
+    if not await _sqlite_has_column(session, "academicians", "external_link"):
+        await session.execute(text("ALTER TABLE academicians ADD COLUMN external_link TEXT"))
 
     await session.execute(
         text(
             "UPDATE professors SET org_unit_name = 'Unknown' "
             "WHERE org_unit_name IS NULL OR trim(org_unit_name) = ''"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE org_units SET name = trim(name) "
+            "WHERE name IS NOT NULL"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE org_units SET name = 'Unknown' "
+            "WHERE name IS NULL OR trim(name) = ''"
+        )
+    )
+    await _dedupe_org_units_by_name(session)
+    await session.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_org_units_name ON org_units(name)"))
+
+    # Preserve previously stored personal homepage into external_link before homepage is repurposed.
+    await session.execute(
+        text(
+            "UPDATE professors SET external_link = homepage "
+            "WHERE (external_link IS NULL OR trim(external_link) = '') "
+            "AND homepage IS NOT NULL AND trim(homepage) <> ''"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE academicians SET external_link = homepage "
+            "WHERE (external_link IS NULL OR trim(external_link) = '') "
+            "AND homepage IS NOT NULL AND trim(homepage) <> ''"
+        )
+    )
+    # Homepage now tracks the internal page where the info was captured.
+    await session.execute(
+        text(
+            "UPDATE professors SET homepage = ("
+            "  SELECT pa.source_url FROM professor_affiliations pa "
+            "  WHERE pa.professor_id = professors.id "
+            "    AND pa.source_url IS NOT NULL AND trim(pa.source_url) <> '' "
+            "  ORDER BY pa.id DESC LIMIT 1"
+            ") "
+            "WHERE EXISTS ("
+            "  SELECT 1 FROM professor_affiliations pa2 "
+            "  WHERE pa2.professor_id = professors.id "
+            "    AND pa2.source_url IS NOT NULL AND trim(pa2.source_url) <> ''"
+            ")"
+        )
+    )
+    await session.execute(
+        text(
+            "UPDATE academicians SET homepage = source_url "
+            "WHERE source_url IS NOT NULL AND trim(source_url) <> ''"
         )
     )
 
@@ -403,6 +471,7 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
             "email",
             "phone",
             "homepage",
+            "external_link",
             "bio",
             "enrollment_pref",
             "publications",
@@ -417,6 +486,7 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
             "email",
             "phone",
             "homepage",
+            "external_link",
             "bio",
             "enrollment_pref",
             "publications",
@@ -517,7 +587,7 @@ async def _find_existing_professor(
     name: str,
     org_unit_id: int,
     email: str | None,
-    homepage: str | None,
+    external_link: str | None,
 ) -> tuple[Professor | None, bool]:
     same_org_unit = (
         await session.execute(
@@ -541,12 +611,12 @@ async def _find_existing_professor(
         if by_email:
             return by_email, False
 
-    if homepage:
-        by_homepage = (
-            await session.execute(select(Professor).where(Professor.homepage == homepage))
+    if external_link:
+        by_external_link = (
+            await session.execute(select(Professor).where(Professor.external_link == external_link))
         ).scalar_one_or_none()
-        if by_homepage:
-            return by_homepage, False
+        if by_external_link:
+            return by_external_link, False
 
     return None, False
 
@@ -602,6 +672,79 @@ def _normalize_url(value: Any) -> str:
         path=parsed.path.rstrip("/"),
     )
     return urlunparse(normalized)
+
+
+async def _dedupe_org_units_by_name(session: AsyncSession) -> None:
+    rows = (await session.execute(select(OrgUnit).order_by(OrgUnit.id.asc()))).scalars().all()
+    keep_by_name: dict[str, OrgUnit] = {}
+    for row in rows:
+        canonical_name = normalize_org_unit_name(row.name, default="Unknown")
+        if row.name != canonical_name:
+            row.name = canonical_name
+        keeper = keep_by_name.get(canonical_name)
+        if keeper is None:
+            keep_by_name[canonical_name] = row
+            continue
+
+        if _should_replace_org_unit_url(keeper.url, row.url):
+            keeper.url = row.url
+        if (not keeper.kind) and row.kind:
+            keeper.kind = row.kind
+        if (not keeper.discovered_from_url) and row.discovered_from_url:
+            keeper.discovered_from_url = row.discovered_from_url
+        keeper.updated_at = _now_utc()
+
+        await session.execute(
+            text(
+                "DELETE FROM professor_affiliations "
+                "WHERE org_unit_id = :dup_id "
+                "AND professor_id IN ("
+                "  SELECT professor_id FROM professor_affiliations WHERE org_unit_id = :keep_id"
+                ")"
+            ),
+            {"dup_id": row.id, "keep_id": keeper.id},
+        )
+        await session.execute(
+            text(
+                "UPDATE professor_affiliations "
+                "SET org_unit_id = :keep_id "
+                "WHERE org_unit_id = :dup_id"
+            ),
+            {"dup_id": row.id, "keep_id": keeper.id},
+        )
+        await session.execute(
+            text(
+                "DELETE FROM academicians "
+                "WHERE org_unit_id = :dup_id "
+                "AND name IN (SELECT name FROM academicians WHERE org_unit_id = :keep_id)"
+            ),
+            {"dup_id": row.id, "keep_id": keeper.id},
+        )
+        await session.execute(
+            text(
+                "UPDATE academicians "
+                "SET org_unit_id = :keep_id "
+                "WHERE org_unit_id = :dup_id"
+            ),
+            {"dup_id": row.id, "keep_id": keeper.id},
+        )
+        await session.execute(text("DELETE FROM org_units WHERE id = :dup_id"), {"dup_id": row.id})
+
+    await session.flush()
+
+
+def _should_replace_org_unit_url(current: str, candidate: str) -> bool:
+    current_clean = _normalize_url(current)
+    candidate_clean = _normalize_url(candidate)
+    if not candidate_clean:
+        return False
+    if not current_clean:
+        return True
+    if current_clean == candidate_clean:
+        return False
+    if current_clean.startswith("about:org_unit:") and not candidate_clean.startswith("about:org_unit:"):
+        return True
+    return False
 
 
 def _merge_org_unit_names(current: Any, incoming: Any) -> str:

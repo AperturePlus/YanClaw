@@ -47,7 +47,10 @@ class OrgUnit(Base):
     """Academic org units under a university: colleges/schools/departments/institutes."""
 
     __tablename__ = "org_units"
-    __table_args__ = (UniqueConstraint("url", name="uq_org_unit_url"),)
+    __table_args__ = (
+        UniqueConstraint("url", name="uq_org_unit_url"),
+        UniqueConstraint("name", name="uq_org_unit_name"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
@@ -74,7 +77,10 @@ class Professor(Base):
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Internal profile page where the crawler got this professor info.
     homepage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional external/personal homepage mentioned inside the profile content.
+    external_link: Mapped[str | None] = mapped_column(Text, nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     enrollment_pref: Mapped[str | None] = mapped_column(Text, nullable=True)
     publications: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -97,7 +103,10 @@ class Academician(Base):
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     phone: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Internal profile page where the crawler got this academician info.
     homepage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional external/personal homepage mentioned inside the profile content.
+    external_link: Mapped[str | None] = mapped_column(Text, nullable=True)
     bio: Mapped[str | None] = mapped_column(Text, nullable=True)
     enrollment_pref: Mapped[str | None] = mapped_column(Text, nullable=True)
     publications: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -80,6 +80,7 @@ def sanitize_professor_payload(
         "email": normalize_optional_text(record.get("email")),
         "phone": normalize_optional_text(record.get("phone")),
         "homepage": normalize_optional_text(record.get("homepage")),
+        "external_link": normalize_optional_text(record.get("external_link") or record.get("homepage")),
         "bio": bio,
         "enrollment_pref": enrollment_pref,
         "publications": normalize_multivalue(record.get("publications")),
