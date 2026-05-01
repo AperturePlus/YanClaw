@@ -1,11 +1,13 @@
 import * as api from './api';
 import { addHistory, clearJob, notify, setJob, state } from './state';
 import { showToast } from './ui/toast';
-import { urlMatches } from './utils';
+import { isErrorPage, sameHost, urlMatches } from './utils';
 
 const POLL_INTERVAL = 2000;
 const AUTO_CHECK_INTERVAL = 1000;
 const AUTO_SUBMIT_DELAY = 2000;
+const ERROR_RETRY_DELAY = 5000;
+const MAX_ERROR_RETRIES = 3;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let autoCheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -50,6 +52,7 @@ export function startAutoWatcher(): void {
 }
 
 let matchedSince: number | null = null;
+let errorRetries = 0;
 
 function autoCheck(): void {
   const job = state.currentJob;
@@ -57,7 +60,23 @@ function autoCheck(): void {
     matchedSince = null;
     return;
   }
-  if (urlMatches(window.location.href, job.url)) {
+
+  // Detect error pages (502, 503, etc.) — auto-retry navigation.
+  if (isErrorPage()) {
+    matchedSince = null;
+    if (errorRetries < MAX_ERROR_RETRIES) {
+      errorRetries++;
+      showToast(`错误页面，${ERROR_RETRY_DELAY / 1000}s 后重试 (${errorRetries}/${MAX_ERROR_RETRIES})`);
+      setTimeout(() => { window.location.href = job.url; }, ERROR_RETRY_DELAY);
+    } else {
+      showToast('重试次数已用完，请手动处理');
+    }
+    return;
+  }
+
+  errorRetries = 0;
+
+  if (sameHost(window.location.href, job.url)) {
     if (matchedSince === null) {
       matchedSince = Date.now();
     } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -82,6 +101,7 @@ async function pollNext(): Promise<void> {
 }
 
 function assignJob(job: import('./types').FetchJob): void {
+  errorRetries = 0;
   setJob(job);
   if (state.autoMode) {
     // Navigate — the auto watcher will handle submission after page loads.
@@ -92,6 +112,10 @@ function assignJob(job: import('./types').FetchJob): void {
 export async function submitCurrent(): Promise<void> {
   const job = state.currentJob;
   if (!job || submitting) return;
+  if (isErrorPage()) {
+    showToast('当前是错误页面，无法提交');
+    return;
+  }
   submitting = true;
   const html = document.documentElement.outerHTML;
   try {

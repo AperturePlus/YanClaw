@@ -8,8 +8,8 @@ let panelEl: HTMLDivElement | null = null;
 export function mountPanel(): void {
   panelEl = document.createElement('div');
   panelEl.id = 'ycl-panel';
-  panelEl.addEventListener('click', () => {
-    if (state.minimized) {
+  panelEl.addEventListener('click', (event) => {
+    if (state.minimized && event.target === event.currentTarget) {
       toggle('minimized');
     }
   });
@@ -116,7 +116,10 @@ function bindEvents(): void {
   };
   const job = state.currentJob;
 
-  bind('ycl-min', 'click', () => toggle('minimized'));
+  document.getElementById('ycl-min')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    toggle('minimized');
+  });
   bind('ycl-copy', 'click', () => {
     if (job) navigator.clipboard.writeText(job.url);
   });

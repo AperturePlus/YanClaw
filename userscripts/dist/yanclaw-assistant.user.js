@@ -159,6 +159,15 @@
       return false;
     }
   }
+  function sameHost(a, b) {
+    try {
+      const h1 = new URL(a).hostname.replace(/^www\./, "");
+      const h2 = new URL(b).hostname.replace(/^www\./, "");
+      return h1 === h2;
+    } catch {
+      return false;
+    }
+  }
   function truncUrl(url, max = 40) {
     try {
       return new URL(url).pathname.slice(0, max);
@@ -179,9 +188,19 @@
   function statusIcon(status) {
     return STATUS_ICONS[status] ?? "❓";
   }
+  const ERROR_PATTERNS = /502 bad gateway|503 service|504 gateway|500 internal|error occurred|server error|nginx/i;
+  function isErrorPage() {
+    var _a;
+    const title = document.title || "";
+    const bodyText = ((_a = document.body) == null ? void 0 : _a.innerText) || "";
+    if (bodyText.length < 2e3 && ERROR_PATTERNS.test(title + " " + bodyText)) return true;
+    return false;
+  }
   const POLL_INTERVAL = 2e3;
   const AUTO_CHECK_INTERVAL = 1e3;
   const AUTO_SUBMIT_DELAY = 2e3;
+  const ERROR_RETRY_DELAY = 5e3;
+  const MAX_ERROR_RETRIES = 3;
   let autoCheckTimer = null;
   let submitting = false;
   async function recoverState() {
@@ -207,13 +226,28 @@
     autoCheckTimer = setInterval(autoCheck, AUTO_CHECK_INTERVAL);
   }
   let matchedSince = null;
+  let errorRetries = 0;
   function autoCheck() {
     const job = state.currentJob;
     if (!job || !state.autoMode || state.paused || submitting) {
       matchedSince = null;
       return;
     }
-    if (urlMatches(window.location.href, job.url)) {
+    if (isErrorPage()) {
+      matchedSince = null;
+      if (errorRetries < MAX_ERROR_RETRIES) {
+        errorRetries++;
+        showToast(`错误页面，${ERROR_RETRY_DELAY / 1e3}s 后重试 (${errorRetries}/${MAX_ERROR_RETRIES})`);
+        setTimeout(() => {
+          window.location.href = job.url;
+        }, ERROR_RETRY_DELAY);
+      } else {
+        showToast("重试次数已用完，请手动处理");
+      }
+      return;
+    }
+    errorRetries = 0;
+    if (sameHost(window.location.href, job.url)) {
       if (matchedSince === null) {
         matchedSince = Date.now();
       } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -236,6 +270,7 @@
     notify();
   }
   function assignJob(job) {
+    errorRetries = 0;
     setJob(job);
     if (state.autoMode) {
       window.location.href = job.url;
@@ -244,6 +279,10 @@
   async function submitCurrent() {
     const job = state.currentJob;
     if (!job || submitting) return;
+    if (isErrorPage()) {
+      showToast("当前是错误页面，无法提交");
+      return;
+    }
     submitting = true;
     const html = document.documentElement.outerHTML;
     try {
@@ -294,8 +333,8 @@
   function mountPanel() {
     panelEl = document.createElement("div");
     panelEl.id = "ycl-panel";
-    panelEl.addEventListener("click", () => {
-      if (state.minimized) {
+    panelEl.addEventListener("click", (event) => {
+      if (state.minimized && event.target === event.currentTarget) {
         toggle("minimized");
       }
     });
@@ -382,12 +421,16 @@
   </div>`;
   }
   function bindEvents() {
+    var _a;
     const bind = (id, event, fn) => {
-      var _a;
-      (_a = document.getElementById(id)) == null ? void 0 : _a.addEventListener(event, fn);
+      var _a2;
+      (_a2 = document.getElementById(id)) == null ? void 0 : _a2.addEventListener(event, fn);
     };
     const job = state.currentJob;
-    bind("ycl-min", "click", () => toggle("minimized"));
+    (_a = document.getElementById("ycl-min")) == null ? void 0 : _a.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggle("minimized");
+    });
     bind("ycl-copy", "click", () => {
       if (job) navigator.clipboard.writeText(job.url);
     });
