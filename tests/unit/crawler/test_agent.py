@@ -19,10 +19,10 @@ from agents.crawler.agent import (
     ORG_UNIT_PAGE_KEYWORDS,
 )
 from agents.crawler.fetchers import FetchResult, Fetcher
-from agents.crawler.models import CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
+from agents.crawler.models import CrawlExtractionFailure, CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
-from runtime.llm import LLMResult, ToolCallRecord
+from runtime.llm import LLMResult, ToolCallErrorRecord, ToolCallRecord
 from runtime.skills import SkillManager
 from tests.conftest import sqlite_url
 
@@ -218,6 +218,89 @@ async def test_agent_marks_failed_when_backtrack_limit_exceeded(tmp_path):
     result = await agent.run()
 
     assert result.status == CrawlStatus.FAILED.value
+    await db.close()
+
+
+async def test_agent_pipeline_retries_invalid_json_once_then_saves(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+    }
+
+    class RetryLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload["state"]
+            if state == "EXTRACT_PROFESSORS":
+                self.extract_calls += 1
+                if self.extract_calls == 1:
+                    return LLMResult(
+                        "",
+                        [],
+                        [ToolCallErrorRecord("save_professors", '{"org_unit_name":"CS","enrollment_pre', "invalid_json")],
+                    )
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="CS",
+                    org_unit_url="https://www.example.edu.cn/cs",
+                    source_url=payload["url"],
+                    professors=[{"name": "Ada", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    fetcher = FakeFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "retry_once.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+
+    agent = CrawlerAgent(
+        university_name="RetryU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=RetryLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        min_org_units=1,
+        invalid_json_max_retry=1,
+    )
+    result = await agent.run()
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+
+    async with db.session() as session:
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+        assert any(f.failure_type == "invalid_json" and f.resolver == "retry" for f in failures)
     await db.close()
 
 

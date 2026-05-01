@@ -40,6 +40,7 @@ class HumanFetcherBridge:
         self.job_timeout_seconds = job_timeout_seconds
         self.queue = JobQueue()
         self._context = JobContext()
+        self._agent_status_fn: Any = None
         self._runner: web.AppRunner | None = None
         self._helper = Fetcher()  # for html_to_text / extract_links
         self.logger = get_logger("crawler.human_bridge")
@@ -47,7 +48,7 @@ class HumanFetcherBridge:
     # -- async context manager (matches Fetcher / HybridFetcher) --
 
     async def __aenter__(self) -> "HumanFetcherBridge":
-        app = create_app(self.queue, agent_status_fn=None)
+        app = create_app(self.queue, agent_status_fn=lambda: self._agent_status_fn() if self._agent_status_fn else None)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -97,6 +98,10 @@ class HumanFetcherBridge:
     def set_context(self, context: JobContext) -> None:
         """Update the context attached to subsequent jobs."""
         self._context = context
+
+    def set_status_provider(self, status_fn: Any) -> None:
+        """Set callback used by /api/status to expose live agent metrics."""
+        self._agent_status_fn = status_fn
 
     async def request_decision(
         self,

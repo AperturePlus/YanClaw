@@ -10,7 +10,10 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import (
+    CrawlExtractionFailure,
     Academician,
+    CrawlTask,
+    CrawlTaskStatus,
     CrawlLog,
     CrawlLogStatus,
     CrawlStatus,
@@ -387,6 +390,184 @@ async def count_professors(session: AsyncSession) -> int:
 async def count_academicians(session: AsyncSession) -> int:
     count = (await session.execute(select(func.count()).select_from(Academician))).scalar_one()
     return int(count or 0)
+
+
+async def upsert_crawl_task(
+    session: AsyncSession,
+    *,
+    university: str,
+    org_unit_name: str,
+    org_unit_url: str | None,
+    source_url: str,
+    page_url: str,
+    page_hash: str,
+    page_text_snapshot: str,
+    allowed_tools: str | None,
+    attempt: int = 0,
+    priority: int = 0,
+    status: str | CrawlTaskStatus = CrawlTaskStatus.PENDING,
+    last_error: str | None = None,
+) -> CrawlTask:
+    org_unit_name = normalize_org_unit_name(org_unit_name, default="Unknown")
+    source_url = _normalize_url(source_url) or _normalize_url(page_url)
+    page_url = _normalize_url(page_url) or source_url
+    if not source_url:
+        raise ValueError("source_url or page_url is required for crawl task")
+    status_value = status.value if isinstance(status, CrawlTaskStatus) else str(status)
+
+    existing = (
+        await session.execute(
+            select(CrawlTask).where(
+                CrawlTask.source_url == source_url,
+                CrawlTask.org_unit_name == org_unit_name,
+                CrawlTask.page_hash == page_hash,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        changed = False
+        if page_text_snapshot and len(existing.page_text_snapshot or "") < len(page_text_snapshot):
+            existing.page_text_snapshot = page_text_snapshot
+            changed = True
+        if allowed_tools and existing.allowed_tools != allowed_tools:
+            existing.allowed_tools = allowed_tools
+            changed = True
+        if org_unit_url and existing.org_unit_url != org_unit_url:
+            existing.org_unit_url = org_unit_url
+            changed = True
+        if status_value and existing.status != status_value:
+            terminal_statuses = {CrawlTaskStatus.DONE.value, CrawlTaskStatus.FAILED.value}
+            if not (existing.status in terminal_statuses and status_value == CrawlTaskStatus.PENDING.value):
+                existing.status = status_value
+                changed = True
+        if attempt > existing.attempt:
+            existing.attempt = attempt
+            changed = True
+        if last_error is not None and existing.last_error != last_error:
+            existing.last_error = last_error
+            changed = True
+        if changed:
+            existing.updated_at = _now_utc()
+        await session.flush()
+        return existing
+
+    task = CrawlTask(
+        university=_clean_text(university),
+        org_unit_name=org_unit_name,
+        org_unit_url=_normalize_url(org_unit_url) if org_unit_url else None,
+        source_url=source_url,
+        page_url=page_url,
+        page_hash=(page_hash or "")[:64],
+        page_text_snapshot=page_text_snapshot or "",
+        allowed_tools=allowed_tools,
+        attempt=max(0, int(attempt)),
+        priority=int(priority),
+        status=status_value or CrawlTaskStatus.PENDING.value,
+        last_error=last_error,
+        created_at=_now_utc(),
+        updated_at=_now_utc(),
+    )
+    session.add(task)
+    await session.flush()
+    return task
+
+
+async def set_crawl_task_status(
+    session: AsyncSession,
+    task_id: int,
+    *,
+    status: str | CrawlTaskStatus,
+    attempt: int | None = None,
+    last_error: str | None = None,
+) -> CrawlTask | None:
+    task = await session.get(CrawlTask, int(task_id))
+    if task is None:
+        return None
+    status_value = status.value if isinstance(status, CrawlTaskStatus) else str(status)
+    task.status = status_value
+    if attempt is not None:
+        task.attempt = max(0, int(attempt))
+    if last_error is not None:
+        task.last_error = last_error
+    task.updated_at = _now_utc()
+    await session.flush()
+    return task
+
+
+async def list_recoverable_crawl_tasks(
+    session: AsyncSession,
+    *,
+    limit: int = 500,
+) -> list[CrawlTask]:
+    rows = (
+        await session.execute(
+            select(CrawlTask)
+            .where(
+                CrawlTask.status.in_(
+                    [
+                        CrawlTaskStatus.PENDING.value,
+                        CrawlTaskStatus.RETRY.value,
+                        CrawlTaskStatus.IN_PROGRESS.value,
+                    ]
+                )
+            )
+            .order_by(CrawlTask.priority.asc(), CrawlTask.id.asc())
+            .limit(max(1, int(limit)))
+        )
+    ).scalars().all()
+    recovered: list[CrawlTask] = []
+    for row in rows:
+        if row.status == CrawlTaskStatus.IN_PROGRESS.value:
+            row.status = CrawlTaskStatus.RETRY.value
+            row.last_error = row.last_error or "recovered_from_in_progress"
+            row.updated_at = _now_utc()
+        recovered.append(row)
+    await session.flush()
+    return recovered
+
+
+async def log_extraction_failure(
+    session: AsyncSession,
+    *,
+    task_id: int | None,
+    failure_type: str,
+    org_unit_name: str,
+    source_url: str,
+    professor_name_hint: str | None = None,
+    raw_arguments_preview: str | None = None,
+    attempt: int = 0,
+    resolver: str = "dropped",
+) -> CrawlExtractionFailure:
+    row = CrawlExtractionFailure(
+        task_id=task_id,
+        failure_type=(failure_type or "unknown").strip().lower(),
+        org_unit_name=normalize_org_unit_name(org_unit_name, default="Unknown"),
+        source_url=_normalize_url(source_url),
+        professor_name_hint=normalize_optional_text(professor_name_hint),
+        raw_arguments_preview=(raw_arguments_preview or "")[:5000] or None,
+        attempt=max(0, int(attempt)),
+        resolver=(resolver or "dropped").strip().lower(),
+        created_at=_now_utc(),
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def summarize_crawl_task_status(session: AsyncSession) -> dict[str, int]:
+    result = await session.execute(
+        select(CrawlTask.status, func.count()).group_by(CrawlTask.status)
+    )
+    summary: dict[str, int] = {
+        CrawlTaskStatus.PENDING.value: 0,
+        CrawlTaskStatus.IN_PROGRESS.value: 0,
+        CrawlTaskStatus.RETRY.value: 0,
+        CrawlTaskStatus.DONE.value: 0,
+        CrawlTaskStatus.FAILED.value: 0,
+    }
+    for status, count in result.all():
+        summary[str(status)] = int(count or 0)
+    return summary
 
 
 async def ensure_runtime_schema(session: AsyncSession) -> None:

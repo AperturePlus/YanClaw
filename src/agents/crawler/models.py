@@ -22,6 +22,14 @@ class CrawlLogStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class CrawlTaskStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RETRY = "retry"
+    DONE = "done"
+    FAILED = "failed"
+
+
 class OrgUnitStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -142,3 +150,48 @@ class CrawlLog(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class CrawlTask(Base):
+    __tablename__ = "crawl_tasks"
+    __table_args__ = (
+        UniqueConstraint("source_url", "org_unit_name", "page_hash", name="uq_crawl_task_dedup"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    university: Mapped[str] = mapped_column(String(255), index=True, default="")
+    org_unit_name: Mapped[str] = mapped_column(String(255), index=True)
+    org_unit_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str] = mapped_column(Text, index=True)
+    page_url: Mapped[str] = mapped_column(Text, index=True)
+    page_hash: Mapped[str] = mapped_column(String(64), index=True)
+    page_text_snapshot: Mapped[str] = mapped_column(Text, default="")
+    allowed_tools: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), index=True, default=CrawlTaskStatus.PENDING.value)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    failures: Mapped[list["CrawlExtractionFailure"]] = relationship(
+        back_populates="task",
+        cascade="all, delete-orphan",
+    )
+
+
+class CrawlExtractionFailure(Base):
+    __tablename__ = "crawl_extraction_failures"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("crawl_tasks.id"), nullable=True, index=True)
+    failure_type: Mapped[str] = mapped_column(String(64), index=True)
+    org_unit_name: Mapped[str] = mapped_column(String(255), index=True, default="")
+    source_url: Mapped[str] = mapped_column(Text, index=True, default="")
+    professor_name_hint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    raw_arguments_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, default=0)
+    resolver: Mapped[str] = mapped_column(String(32), default="dropped")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    task: Mapped[CrawlTask | None] = relationship(back_populates="failures")

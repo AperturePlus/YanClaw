@@ -40,6 +40,13 @@ class CrawlerSettings(BaseSettings):
     detail_fetch_backend: str = "human"
     detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
     detail_failure_threshold: int = Field(default=10, ge=1)
+    pipeline_enabled: bool = True
+    pipeline_fetch_workers: int = Field(default=1, ge=1)
+    pipeline_llm_workers: int = Field(default=1, ge=1)
+    pipeline_db_workers: int = Field(default=1, ge=1)
+    pipeline_queue_cap: int = Field(default=64, ge=1)
+    invalid_json_max_retry: int = Field(default=1, ge=0)
+    task_recovery_enabled: bool = True
     crawl4ai_base_url: str = "http://localhost:10086"
     crawl4ai_api_token: str = ""
     crawl4ai_timeout_seconds: float = Field(default=120.0, gt=0)

@@ -5,7 +5,15 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
-from agents.crawler.models import CrawlLogStatus, CrawlStatus, Professor, ProfessorAffiliation
+from agents.crawler.models import (
+    CrawlExtractionFailure,
+    CrawlLogStatus,
+    CrawlStatus,
+    CrawlTask,
+    CrawlTaskStatus,
+    Professor,
+    ProfessorAffiliation,
+)
 from runtime.database import DatabaseManager
 from tests.conftest import sqlite_url
 
@@ -225,5 +233,58 @@ async def test_get_or_create_org_unit_dedupes_same_name_with_different_urls(tmp_
             kind="college",
         )
         assert first.id == second.id
+
+    await db.close()
+
+
+async def test_crawl_task_recovery_and_failure_audit(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "tasks.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        created = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_hash="abc123",
+            page_text_snapshot="sample text",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        await crawler_db.set_crawl_task_status(
+            session,
+            created.id,
+            status=CrawlTaskStatus.IN_PROGRESS,
+            attempt=1,
+            last_error="timeout",
+        )
+        await crawler_db.log_extraction_failure(
+            session,
+            task_id=created.id,
+            failure_type="invalid_json",
+            org_unit_name="Computer Science",
+            source_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            raw_arguments_preview='{"professors":[{"name":"Ada","enrollment_pre',
+            attempt=1,
+            resolver="retry",
+        )
+
+    async with db.session() as session:
+        recovered = await crawler_db.list_recoverable_crawl_tasks(session, limit=20)
+        assert len(recovered) == 1
+        assert recovered[0].status == CrawlTaskStatus.RETRY.value
+        summary = await crawler_db.summarize_crawl_task_status(session)
+        assert summary[CrawlTaskStatus.RETRY.value] == 1
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+        assert len(failures) == 1
+        assert failures[0].failure_type == "invalid_json"
+
+    async with db.session() as session:
+        await crawler_db.set_crawl_task_status(session, recovered[0].id, status=CrawlTaskStatus.DONE)
+        done = (await session.execute(select(CrawlTask))).scalar_one()
+        assert done.status == CrawlTaskStatus.DONE.value
 
     await db.close()
