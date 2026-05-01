@@ -148,3 +148,20 @@ async def test_current_assigned_returns_active_job():
 
     await q.next(timeout=1)  # j2 → assigned
     assert q.current_assigned().id == j2.id
+
+async def test_decision_request_wait_and_resolve():
+    q = JobQueue()
+    decision = await q.request_decision(
+        kind="detail_fetch_failure",
+        org_unit_name="CS",
+        failure_count=10,
+        sample_urls=["https://www.example.edu.cn/cs/teacher/1"],
+    )
+    assert q.pending_decision() is not None
+    assert q.pending_decision().id == decision.id
+
+    q.resolve_decision(decision.id, "switch_failed_to_human")
+    resolved = await q.wait_decision(decision.id, timeout=1)
+    assert resolved.status.value == "resolved"
+    assert resolved.action == "switch_failed_to_human"
+    assert q.pending_decision() is None

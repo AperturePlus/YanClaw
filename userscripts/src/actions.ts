@@ -1,17 +1,24 @@
 import * as api from './api';
 import { addHistory, clearJob, notify, setJob, state } from './state';
+import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
 import { isErrorPage, sameHost, urlMatches } from './utils';
 
-const POLL_INTERVAL = 2000;
+const POLL_INTERVAL = 1000;
+const FAST_POLL_INTERVAL = 250;
+const FAST_POLL_ROUNDS = 4;
 const AUTO_CHECK_INTERVAL = 1000;
 const AUTO_SUBMIT_DELAY = 2000;
 const ERROR_RETRY_DELAY = 5000;
 const MAX_ERROR_RETRIES = 3;
+const DEFAULT_DECISION_ACTION = 'switch_failed_to_human';
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let autoCheckTimer: ReturnType<typeof setInterval> | null = null;
 let submitting = false;
+let polling = false;
+let decisionPromptedId: string | null = null;
+let resolvingDecision = false;
 
 /** Sync persisted state with backend on page load. */
 export async function recoverState(): Promise<void> {
@@ -19,6 +26,7 @@ export async function recoverState(): Promise<void> {
     const status = await api.fetchStatus();
     if (!status) return;
     state.connected = true;
+    state.pendingDecision = status.pending_decision ?? null;
     if (status.current_job) {
       setJob(status.current_job);
     } else if (state.currentJob) {
@@ -31,6 +39,7 @@ export async function recoverState(): Promise<void> {
 }
 
 export function startPolling(): void {
+  void pollNext();
   pollTimer = setInterval(pollNext, POLL_INTERVAL);
 }
 
@@ -89,13 +98,17 @@ function autoCheck(): void {
 }
 
 async function pollNext(): Promise<void> {
-  if (state.paused || state.currentJob) return;
+  await checkPendingDecision();
+  if (state.paused || state.currentJob || polling) return;
+  polling = true;
   try {
     const job = await api.fetchNextJob();
     state.connected = true;
     if (job) assignJob(job);
   } catch {
     state.connected = false;
+  } finally {
+    polling = false;
   }
   notify();
 }
@@ -107,6 +120,68 @@ function assignJob(job: import('./types').FetchJob): void {
     // Navigate — the auto watcher will handle submission after page loads.
     window.location.href = job.url;
   }
+}
+
+function triggerFastPollBurst(): void {
+  if (state.paused || state.currentJob) return;
+  for (let i = 0; i < FAST_POLL_ROUNDS; i += 1) {
+    setTimeout(() => {
+      void pollNext();
+    }, i * FAST_POLL_INTERVAL);
+  }
+}
+
+async function checkPendingDecision(): Promise<void> {
+  if (resolvingDecision) return;
+  const previousId = state.pendingDecision?.id ?? null;
+  try {
+    const decision = await api.fetchDecision();
+    state.pendingDecision = decision;
+    const nextId = decision?.id ?? null;
+    if (previousId !== nextId) {
+      notify();
+    }
+    if (!decision) {
+      decisionPromptedId = null;
+      return;
+    }
+    if (decisionPromptedId === decision.id) return;
+    decisionPromptedId = decision.id;
+    showToast(`详情补抓连续失败 ${decision.failure_count} 次，等待人工决策`);
+    const accepted = window.confirm(
+      [
+        `院系：${decision.org_unit_name || 'Unknown'}`,
+        `后台详情抓取连续失败：${decision.failure_count}`,
+        '点击“确定”将失败链接切人工处理。',
+      ].join('\n'),
+    );
+    if (accepted) {
+      await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+async function resolvePendingDecision(decision: PendingDecision, action: string): Promise<void> {
+  if (resolvingDecision) return;
+  resolvingDecision = true;
+  try {
+    await api.resolveDecision(decision.id, action);
+    state.pendingDecision = null;
+    decisionPromptedId = null;
+    showToast('已切换为人工处理详情失败链接');
+  } catch (e) {
+    showToast(`决策提交失败: ${e instanceof Error ? e.message : e}`);
+  }
+  resolvingDecision = false;
+  notify();
+}
+
+export async function switchPendingDecisionToHuman(): Promise<void> {
+  const decision = state.pendingDecision;
+  if (!decision) return;
+  await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
 }
 
 export async function submitCurrent(): Promise<void> {
@@ -125,6 +200,8 @@ export async function submitCurrent(): Promise<void> {
     if (res?.next_job) {
       // Defer navigation so the current response is fully processed.
       setTimeout(() => assignJob(res.next_job!), 100);
+    } else {
+      triggerFastPollBurst();
     }
   } catch (e) {
     showToast(`提交失败: ${e instanceof Error ? e.message : e}`);
@@ -141,6 +218,7 @@ export async function skipCurrent(): Promise<void> {
     addHistory(job, 'skipped');
   } catch { /* ignore */ }
   clearJob();
+  triggerFastPollBurst();
 }
 
 export async function failCurrent(msg?: string): Promise<void> {
@@ -151,6 +229,7 @@ export async function failCurrent(msg?: string): Promise<void> {
     addHistory(job, 'failed');
   } catch { /* ignore */ }
   clearJob();
+  triggerFastPollBurst();
 }
 
 export async function overrideUrl(): Promise<void> {

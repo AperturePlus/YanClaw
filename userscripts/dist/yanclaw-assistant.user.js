@@ -64,6 +64,12 @@
   async function fetchStatus() {
     return request("GET", "/status");
   }
+  async function fetchDecision() {
+    return request("GET", "/decision");
+  }
+  async function resolveDecision(id, action) {
+    await request("POST", `/decision/${id}/resolve`, { action });
+  }
   const MAX_HISTORY = 20;
   const STORAGE_KEY = "ycl_state";
   const listeners = [];
@@ -109,6 +115,7 @@
     paused: persisted.paused ?? false,
     connected: false,
     minimized: persisted.minimized ?? false,
+    pendingDecision: null,
     history: persisted.history ?? []
   };
   function subscribe(fn) {
@@ -196,18 +203,25 @@
     if (bodyText.length < 2e3 && ERROR_PATTERNS.test(title + " " + bodyText)) return true;
     return false;
   }
-  const POLL_INTERVAL = 2e3;
+  const POLL_INTERVAL = 1e3;
+  const FAST_POLL_INTERVAL = 250;
+  const FAST_POLL_ROUNDS = 4;
   const AUTO_CHECK_INTERVAL = 1e3;
   const AUTO_SUBMIT_DELAY = 2e3;
   const ERROR_RETRY_DELAY = 5e3;
   const MAX_ERROR_RETRIES = 3;
+  const DEFAULT_DECISION_ACTION = "switch_failed_to_human";
   let autoCheckTimer = null;
   let submitting = false;
+  let polling = false;
+  let decisionPromptedId = null;
+  let resolvingDecision = false;
   async function recoverState() {
     try {
       const status = await fetchStatus();
       if (!status) return;
       state.connected = true;
+      state.pendingDecision = status.pending_decision ?? null;
       if (status.current_job) {
         setJob(status.current_job);
       } else if (state.currentJob) {
@@ -219,6 +233,7 @@
     notify();
   }
   function startPolling() {
+    void pollNext();
     setInterval(pollNext, POLL_INTERVAL);
   }
   function startAutoWatcher() {
@@ -259,13 +274,17 @@
     }
   }
   async function pollNext() {
-    if (state.paused || state.currentJob) return;
+    await checkPendingDecision();
+    if (state.paused || state.currentJob || polling) return;
+    polling = true;
     try {
       const job = await fetchNextJob();
       state.connected = true;
       if (job) assignJob(job);
     } catch {
       state.connected = false;
+    } finally {
+      polling = false;
     }
     notify();
   }
@@ -275,6 +294,64 @@
     if (state.autoMode) {
       window.location.href = job.url;
     }
+  }
+  function triggerFastPollBurst() {
+    if (state.paused || state.currentJob) return;
+    for (let i = 0; i < FAST_POLL_ROUNDS; i += 1) {
+      setTimeout(() => {
+        void pollNext();
+      }, i * FAST_POLL_INTERVAL);
+    }
+  }
+  async function checkPendingDecision() {
+    var _a;
+    if (resolvingDecision) return;
+    const previousId = ((_a = state.pendingDecision) == null ? void 0 : _a.id) ?? null;
+    try {
+      const decision = await fetchDecision();
+      state.pendingDecision = decision;
+      const nextId = (decision == null ? void 0 : decision.id) ?? null;
+      if (previousId !== nextId) {
+        notify();
+      }
+      if (!decision) {
+        decisionPromptedId = null;
+        return;
+      }
+      if (decisionPromptedId === decision.id) return;
+      decisionPromptedId = decision.id;
+      showToast(`详情补抓连续失败 ${decision.failure_count} 次，等待人工决策`);
+      const accepted = window.confirm(
+        [
+          `院系：${decision.org_unit_name || "Unknown"}`,
+          `后台详情抓取连续失败：${decision.failure_count}`,
+          "点击“确定”将失败链接切人工处理。"
+        ].join("\n")
+      );
+      if (accepted) {
+        await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
+      }
+    } catch {
+    }
+  }
+  async function resolvePendingDecision(decision, action) {
+    if (resolvingDecision) return;
+    resolvingDecision = true;
+    try {
+      await resolveDecision(decision.id, action);
+      state.pendingDecision = null;
+      decisionPromptedId = null;
+      showToast("已切换为人工处理详情失败链接");
+    } catch (e) {
+      showToast(`决策提交失败: ${e instanceof Error ? e.message : e}`);
+    }
+    resolvingDecision = false;
+    notify();
+  }
+  async function switchPendingDecisionToHuman() {
+    const decision = state.pendingDecision;
+    if (!decision) return;
+    await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
   }
   async function submitCurrent() {
     const job = state.currentJob;
@@ -291,6 +368,8 @@
       clearJob();
       if (res == null ? void 0 : res.next_job) {
         setTimeout(() => assignJob(res.next_job), 100);
+      } else {
+        triggerFastPollBurst();
       }
     } catch (e) {
       showToast(`提交失败: ${e instanceof Error ? e.message : e}`);
@@ -307,6 +386,7 @@
     } catch {
     }
     clearJob();
+    triggerFastPollBurst();
   }
   async function failCurrent(msg) {
     const job = state.currentJob;
@@ -317,6 +397,7 @@
     } catch {
     }
     clearJob();
+    triggerFastPollBurst();
   }
   async function overrideUrl() {
     const job = state.currentJob;
@@ -352,6 +433,7 @@
     const matched = job != null && urlMatches(window.location.href, job.url);
     panelEl.innerHTML = [
       renderHeader(),
+      renderDecision(),
       matched ? renderMatchBanner() : "",
       job ? renderJobDetail(job) : renderEmpty(),
       job ? renderActions() : "",
@@ -369,6 +451,19 @@
   }
   function renderMatchBanner() {
     return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
+  }
+  function renderDecision() {
+    var _a;
+    const decision = state.pendingDecision;
+    if (!decision) return "";
+    const sample = ((_a = decision.sample_urls) == null ? void 0 : _a[0]) || "-";
+    return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
+    <div class="ycl-label">待决策</div>
+    <div>院系: <b>${decision.org_unit_name || "-"}</b></div>
+    <div>连续失败: ${decision.failure_count}</div>
+    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch">失败链接切人工</button>
+  </div>`;
   }
   function renderJobDetail(job) {
     var _a;
@@ -441,6 +536,9 @@
     bind("ycl-skip", "click", skipCurrent);
     bind("ycl-fail", "click", () => failCurrent());
     bind("ycl-override", "click", overrideUrl);
+    bind("ycl-decision-switch", "click", () => {
+      void switchPendingDecisionToHuman();
+    });
     bind("ycl-auto", "change", () => {
       state.autoMode = !state.autoMode;
       notify();

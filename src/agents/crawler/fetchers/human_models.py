@@ -18,6 +18,11 @@ class FetchJobStatus(str, Enum):
     SKIPPED = "skipped"
 
 
+class DecisionStatus(str, Enum):
+    PENDING = "pending"
+    RESOLVED = "resolved"
+
+
 @dataclass
 class JobContext:
     """Agent decision context shown to the human operator."""
@@ -73,12 +78,45 @@ class FetchJob:
         }
 
 
+@dataclass
+class DecisionRequest:
+    """Human decision request raised by the crawler runtime."""
+
+    kind: str
+    org_unit_name: str
+    failure_count: int
+    sample_urls: list[str]
+    suggested_action: str = "switch_failed_to_human"
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    status: DecisionStatus = DecisionStatus.PENDING
+    action: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    resolved_at: datetime | None = None
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "org_unit_name": self.org_unit_name,
+            "failure_count": self.failure_count,
+            "sample_urls": self.sample_urls,
+            "suggested_action": self.suggested_action,
+            "status": self.status.value,
+            "action": self.action,
+            "created_at": self.created_at.isoformat(),
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
 class JobQueue:
     """In-memory job queue. Lifecycle matches the agent run."""
 
     def __init__(self) -> None:
         self._pending: asyncio.Queue[FetchJob] = asyncio.Queue()
         self._jobs: dict[str, FetchJob] = {}
+        self._decisions: dict[str, DecisionRequest] = {}
+        self._pending_decision_id: str | None = None
 
     async def submit(self, job: FetchJob) -> None:
         self._jobs[job.id] = job
@@ -139,6 +177,58 @@ class JobQueue:
             if job.status == FetchJobStatus.ASSIGNED:
                 return job
         return None
+
+    async def request_decision(
+        self,
+        *,
+        kind: str,
+        org_unit_name: str,
+        failure_count: int,
+        sample_urls: list[str],
+        suggested_action: str = "switch_failed_to_human",
+    ) -> DecisionRequest:
+        current = self.pending_decision()
+        if current is not None:
+            return current
+        decision = DecisionRequest(
+            kind=kind,
+            org_unit_name=org_unit_name,
+            failure_count=failure_count,
+            sample_urls=sample_urls[:5],
+            suggested_action=suggested_action,
+        )
+        self._decisions[decision.id] = decision
+        self._pending_decision_id = decision.id
+        return decision
+
+    def pending_decision(self) -> DecisionRequest | None:
+        if not self._pending_decision_id:
+            return None
+        return self._decisions.get(self._pending_decision_id)
+
+    def resolve_decision(self, decision_id: str, action: str) -> DecisionRequest:
+        decision = self._decisions.get(decision_id)
+        if decision is None or decision.status != DecisionStatus.PENDING:
+            raise KeyError(f"Decision not found or already resolved: {decision_id}")
+        decision.status = DecisionStatus.RESOLVED
+        decision.action = action
+        decision.resolved_at = datetime.now(timezone.utc)
+        decision.done_event.set()
+        if self._pending_decision_id == decision_id:
+            self._pending_decision_id = None
+        return decision
+
+    async def wait_decision(self, decision_id: str, timeout: float | None = None) -> DecisionRequest:
+        decision = self._decisions.get(decision_id)
+        if decision is None:
+            raise KeyError(f"Decision not found: {decision_id}")
+        if decision.status == DecisionStatus.RESOLVED:
+            return decision
+        if timeout is None:
+            await decision.done_event.wait()
+        else:
+            await asyncio.wait_for(decision.done_event.wait(), timeout=timeout)
+        return decision
 
     def _require(self, job_id: str) -> FetchJob:
         job = self._jobs.get(job_id)

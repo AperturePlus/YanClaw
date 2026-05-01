@@ -1,5 +1,5 @@
 import { GM_xmlhttpRequest } from '$';
-import type { CompleteResponse, FetchJob, StatusResponse } from './types';
+import type { CompleteResponse, FetchJob, PendingDecision, StatusResponse } from './types';
 
 const API_BASE = 'http://127.0.0.1:21520/api';
 const TIMEOUT = 10_000;
@@ -53,4 +53,12 @@ export async function overrideJobUrl(id: string, newUrl: string): Promise<FetchJ
 
 export async function fetchStatus(): Promise<StatusResponse | null> {
   return request<StatusResponse>('GET', '/status');
+}
+
+export async function fetchDecision(): Promise<PendingDecision | null> {
+  return request<PendingDecision>('GET', '/decision');
+}
+
+export async function resolveDecision(id: string, action: string): Promise<void> {
+  await request('POST', `/decision/${id}/resolve`, { action });
 }

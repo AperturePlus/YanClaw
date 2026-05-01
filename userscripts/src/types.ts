@@ -33,9 +33,23 @@ export interface QueueStats {
   skipped: number;
 }
 
+export interface PendingDecision {
+  id: string;
+  kind: string;
+  org_unit_name: string;
+  failure_count: number;
+  sample_urls: string[];
+  suggested_action: string;
+  status: string;
+  action?: string | null;
+  created_at: string;
+  resolved_at?: string | null;
+}
+
 export interface StatusResponse {
   queue: QueueStats;
   current_job?: FetchJob;
+  pending_decision?: PendingDecision;
   agent?: Record<string, unknown>;
   server_uptime_seconds: number;
 }

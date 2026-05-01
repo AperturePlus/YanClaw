@@ -15,6 +15,7 @@ from aiohttp import web
 
 from agents.crawler.fetchers.httpx_fetcher import FetchResult, Fetcher
 from agents.crawler.fetchers.human_models import (
+    DecisionRequest,
     FetchJob,
     FetchJobStatus,
     JobContext,
@@ -96,6 +97,27 @@ class HumanFetcherBridge:
     def set_context(self, context: JobContext) -> None:
         """Update the context attached to subsequent jobs."""
         self._context = context
+
+    async def request_decision(
+        self,
+        *,
+        kind: str,
+        org_unit_name: str,
+        failure_count: int,
+        sample_urls: list[str],
+        suggested_action: str = "switch_failed_to_human",
+    ) -> DecisionRequest:
+        return await self.queue.request_decision(
+            kind=kind,
+            org_unit_name=org_unit_name,
+            failure_count=failure_count,
+            sample_urls=sample_urls,
+            suggested_action=suggested_action,
+        )
+
+    async def wait_decision(self, decision_id: str, timeout: float | None = None) -> str:
+        decision = await self.queue.wait_decision(decision_id, timeout=timeout)
+        return decision.action or ""
 
     @staticmethod
     def filter_same_domain(links: Iterable[Any], base_url: str) -> list[str]:

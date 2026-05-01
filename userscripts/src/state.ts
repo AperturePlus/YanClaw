@@ -1,5 +1,5 @@
 import { GM_getValue, GM_setValue } from '$';
-import type { FetchJob, HistoryEntry } from './types';
+import type { FetchJob, HistoryEntry, PendingDecision } from './types';
 
 const MAX_HISTORY = 20;
 const STORAGE_KEY = 'ycl_state';
@@ -10,6 +10,7 @@ export interface AppState {
   paused: boolean;
   connected: boolean;
   minimized: boolean;
+  pendingDecision: PendingDecision | null;
   history: HistoryEntry[];
 }
 
@@ -70,6 +71,7 @@ export const state: AppState = {
   paused: persisted.paused ?? false,
   connected: false,
   minimized: persisted.minimized ?? false,
+  pendingDecision: null,
   history: persisted.history ?? [],
 };
 

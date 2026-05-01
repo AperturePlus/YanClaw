@@ -30,6 +30,8 @@ def create_app(queue: JobQueue, agent_status_fn: Any = None) -> web.Application:
     app.router.add_post("/api/jobs/{id}/fail", _handle_fail)
     app.router.add_post("/api/jobs/{id}/skip", _handle_skip)
     app.router.add_post("/api/jobs/{id}/override", _handle_override)
+    app.router.add_get("/api/decision", _handle_get_decision)
+    app.router.add_post("/api/decision/{id}/resolve", _handle_resolve_decision)
     app.router.add_get("/api/status", _handle_status)
     # Preflight
     app.router.add_route("OPTIONS", "/{path:.*}", _handle_options)
@@ -139,6 +141,32 @@ async def _handle_override(request: web.Request) -> web.Response:
     return _json_response(job.to_dict())
 
 
+async def _handle_get_decision(request: web.Request) -> web.Response:
+    queue: JobQueue = request.app[_KEY_QUEUE]
+    decision = queue.pending_decision()
+    if decision is None:
+        return web.Response(status=204)
+    return _json_response(decision.to_dict())
+
+
+async def _handle_resolve_decision(request: web.Request) -> web.Response:
+    queue: JobQueue = request.app[_KEY_QUEUE]
+    decision_id = request.match_info["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str(body.get("action", "")).strip()
+    if not action:
+        return _json_response({"error": "action is required"}, status=400)
+    try:
+        decision = queue.resolve_decision(decision_id, action)
+    except KeyError:
+        return _json_response({"error": "not found"}, status=404)
+    logger.info("Decision resolved id=%s action=%s", decision.id, action)
+    return _json_response({"status": "resolved", "decision": decision.to_dict()})
+
+
 async def _handle_status(request: web.Request) -> web.Response:
     queue: JobQueue = request.app[_KEY_QUEUE]
     status_fn = request.app[_KEY_AGENT_STATUS]
@@ -149,6 +177,9 @@ async def _handle_status(request: web.Request) -> web.Response:
     assigned = queue.current_assigned()
     if assigned is not None:
         data["current_job"] = assigned.to_dict()
+    pending_decision = queue.pending_decision()
+    if pending_decision is not None:
+        data["pending_decision"] = pending_decision.to_dict()
     if status_fn is not None:
         try:
             data["agent"] = status_fn()

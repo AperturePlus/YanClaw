@@ -1,4 +1,4 @@
-import { failCurrent, overrideUrl, skipCurrent, submitCurrent } from '../actions';
+import { failCurrent, overrideUrl, skipCurrent, submitCurrent, switchPendingDecisionToHuman } from '../actions';
 import { notify, state, toggle } from '../state';
 import type { FetchJob } from '../types';
 import { statusIcon, timeAgo, truncUrl, urlMatches } from '../utils';
@@ -31,6 +31,7 @@ export function renderPanel(): void {
 
   panelEl.innerHTML = [
     renderHeader(),
+    renderDecision(),
     matched ? renderMatchBanner() : '',
     job ? renderJobDetail(job) : renderEmpty(),
     job ? renderActions() : '',
@@ -51,6 +52,19 @@ function renderHeader(): string {
 
 function renderMatchBanner(): string {
   return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
+}
+
+function renderDecision(): string {
+  const decision = state.pendingDecision;
+  if (!decision) return '';
+  const sample = decision.sample_urls?.[0] || '-';
+  return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
+    <div class="ycl-label">待决策</div>
+    <div>院系: <b>${decision.org_unit_name || '-'}</b></div>
+    <div>连续失败: ${decision.failure_count}</div>
+    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch">失败链接切人工</button>
+  </div>`;
 }
 
 function renderJobDetail(job: FetchJob): string {
@@ -130,6 +144,9 @@ function bindEvents(): void {
   bind('ycl-skip', 'click', skipCurrent);
   bind('ycl-fail', 'click', () => failCurrent());
   bind('ycl-override', 'click', overrideUrl);
+  bind('ycl-decision-switch', 'click', () => {
+    void switchPendingDecisionToHuman();
+  });
   bind('ycl-auto', 'change', () => {
     state.autoMode = !state.autoMode;
     notify();

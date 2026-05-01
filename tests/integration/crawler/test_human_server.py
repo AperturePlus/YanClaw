@@ -162,3 +162,39 @@ async def test_status_includes_current_job(client: TestClient):
     data = await resp.json()
     assert data["current_job"]["id"] == job.id
     assert data["current_job"]["url"] == job.url
+
+async def test_decision_get_and_resolve(client: TestClient):
+    queue: JobQueue = client.app_queue  # type: ignore[attr-defined]
+    decision = await queue.request_decision(
+        kind="detail_fetch_failure",
+        org_unit_name="CS",
+        failure_count=10,
+        sample_urls=["https://www.example.edu.cn/cs/teacher/1"],
+    )
+
+    resp = await client.get("/api/decision")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["id"] == decision.id
+    assert data["org_unit_name"] == "CS"
+
+    resp = await client.post(f"/api/decision/{decision.id}/resolve", json={"action": "switch_failed_to_human"})
+    assert resp.status == 200
+
+    resp = await client.get("/api/decision")
+    assert resp.status == 204
+
+
+async def test_status_includes_pending_decision(client: TestClient):
+    queue: JobQueue = client.app_queue  # type: ignore[attr-defined]
+    await queue.request_decision(
+        kind="detail_fetch_failure",
+        org_unit_name="Math",
+        failure_count=11,
+        sample_urls=["https://www.example.edu.cn/math/teacher/2"],
+    )
+
+    resp = await client.get("/api/status")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["pending_decision"]["org_unit_name"] == "Math"
