@@ -9,6 +9,7 @@ from agents.crawler.url_heuristics import (
     _dedupe_query_terms,
     _extract_urls_from_text,
     _is_academician_showcase_page,
+    _is_non_faculty_noise_url,
     _is_faculty_platform,
     _is_pagination_link,
     _looks_like_faculty_page,
@@ -34,31 +35,14 @@ def extract_followup_faculty_links(self: Any, links: list[str], current_url: str
     current_host = (urlparse(current_url).hostname or "").lower()
     current_path = urlparse(current_url).path.lower()
     current_dir = self._derive_section_prefix(current_path)
-    noise_hints = (
-        "/gywm/",
-        "/djgz/",
-        "/rcpy/",
-        "/pxfz/",
-        "/zsjy/",
-        "/xsgz/",
-        "/kxyj/",
-        "/xwzx/",
-        "/news/",
-        "/notice/",
-        "/tzgg/",
-        "/about/",
-        "/intro/",
-        "/history/",
-        "/leader/",
-        "/download/",
-        "/index",
-    )
+    noise_hints = ("/gywm/", "/djgz/", "/rcpy/", "/pxfz/", "/about/", "/intro/", "/history/", "/leader/", "/index")
     candidates = [
         link
         for link in same_domain
         if link != current_url
         and not _is_faculty_platform(link)
         and not _looks_like_retired_url(link)
+        and not _is_non_faculty_noise_url(link)
         and (not current_host or (urlparse(link).hostname or "").lower() == current_host)
         and not any(token in link.lower() for token in noise_hints)
         and (
@@ -202,7 +186,7 @@ async def search_engine_fallback(self: Any, query_suffix: str) -> list[str]:
         text_urls = _extract_urls_from_text(fetched.text)
         all_urls = list(dict.fromkeys(fetched.links + text_urls))
         same_domain = self.fetcher.filter_same_domain(all_urls, self.start_url)
-        same_domain = [u for u in same_domain if not _is_faculty_platform(u)]
+        same_domain = [u for u in same_domain if not _is_faculty_platform(u) and not _is_non_faculty_noise_url(u)]
         self.execution_log.append(f"search_fallback query={query!r} found={len(same_domain)} links")
         self.logger.info("Search fallback found %d same-domain links", len(same_domain))
         return same_domain

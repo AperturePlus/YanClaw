@@ -51,3 +51,9 @@ Prefer these normalized titles:
 - If a page is only a navigation page, continue to list/profile pages before saving.
 - Prefer complete list extraction for each org unit page before moving on.
 - Do not fabricate any value not present in page text.
+
+## Exclusion Strategy (Important)
+
+- If the page is mainly news/notice/policy/recruitment/personnel content, do not call `save_professors`.
+- Typical noise examples: `通知`, `公告`, `新闻`, `政策`, `规章`, `人事`, `招聘`, `党建`, `学工`, `招生`.
+- Even under `szdw/jsdw/faculty` path, skip such non-roster pages and continue to actual teacher list/profile pages.

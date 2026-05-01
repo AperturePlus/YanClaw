@@ -86,6 +86,49 @@ def _looks_like_faculty_page(url: str) -> bool:
     return bool(_keyword_filter([url], FACULTY_KEYWORDS))
 
 
+_FACULTY_NOISE_URL_HINTS = (
+    "/news/",
+    "/xwzx/",
+    "/notice/",
+    "/tzgg/",
+    "/gonggao/",
+    "/announcement/",
+    "/events/",
+    "/event/",
+    "/rczp/",
+    "/zhaopin/",
+    "/jobs/",
+    "/job/",
+    "/hr/",
+    "/renshi/",
+    "/rsrc/",
+    "/rsc/",
+    "/personnel/",
+    "/policy/",
+    "/zcwj/",
+    "/rule/",
+    "/rules/",
+    "/regulation/",
+    "/dangjian/",
+    "/party/",
+    "/student/",
+    "/xsgz/",
+    "/zsjy/",
+    "/download/",
+)
+
+
+def _is_non_faculty_noise_url(url: str) -> bool:
+    lowered = url.lower()
+    if any(token in lowered for token in _FACULTY_NOISE_URL_HINTS):
+        return True
+    # Dated news/article URLs are usually irrelevant for faculty extraction.
+    path = urlparse(lowered).path
+    if re.search(r"/20\d{2}/\d{2}(/\d{2})?/", path):
+        return True
+    return False
+
+
 _ORG_UNIT_LISTING_STRONG_HINTS = (
     "/yx.htm",
     "/yxsz",

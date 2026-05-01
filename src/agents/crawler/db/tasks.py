@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import CrawlExtractionFailure, CrawlTask, CrawlTaskStatus
 from agents.crawler.sanitizer import normalize_org_unit_name
-from agents.crawler.db_utils import _normalize_url, _now_utc, _serialize_optional
+from agents.crawler.db.utils import _normalize_url, _now_utc, _serialize_optional
 
 
 async def upsert_crawl_task(

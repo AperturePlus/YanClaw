@@ -1,23 +1,23 @@
 """Compatibility facade for crawler DB operations.
 
-This module intentionally re-exports stable public functions while the
-implementation lives in smaller focused modules.
+This package re-exports stable public functions while the implementation
+lives in smaller focused modules.
 """
 
-from agents.crawler.db_professors import (
+from agents.crawler.db.professors import (
     ensure_professor_affiliation,
     upsert_academician,
     upsert_professor,
 )
-from agents.crawler.db_schema import ensure_runtime_schema
-from agents.crawler.db_tasks import (
+from agents.crawler.db.schema import ensure_runtime_schema
+from agents.crawler.db.tasks import (
     list_recoverable_crawl_tasks,
     log_extraction_failure,
     set_crawl_task_status,
     summarize_crawl_task_status,
     upsert_crawl_task,
 )
-from agents.crawler.db_university import (
+from agents.crawler.db.university import (
     count_academicians,
     count_professors,
     ensure_university_meta,
@@ -51,4 +51,3 @@ __all__ = [
     "upsert_crawl_task",
     "upsert_professor",
 ]
-

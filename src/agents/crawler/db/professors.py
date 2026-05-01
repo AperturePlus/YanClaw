@@ -15,8 +15,8 @@ from agents.crawler.sanitizer import (
     normalize_org_unit_name,
     normalize_title,
 )
-from agents.crawler.db_university import get_or_create_org_unit
-from agents.crawler.db_utils import (
+from agents.crawler.db.university import get_or_create_org_unit
+from agents.crawler.db.utils import (
     _merge_org_unit_names,
     _normalize_email,
     _normalize_homepage,
@@ -399,4 +399,3 @@ __all__ = [
     "upsert_academician",
     "upsert_professor",
 ]
-

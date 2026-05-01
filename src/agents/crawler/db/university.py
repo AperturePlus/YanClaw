@@ -18,7 +18,7 @@ from agents.crawler.models import (
     UniversityMeta,
 )
 from agents.crawler.sanitizer import normalize_org_unit_name
-from agents.crawler.db_utils import (
+from agents.crawler.db.utils import (
     _clean_text,
     _clean_url,
     _merge_org_unit_names,
@@ -275,4 +275,3 @@ __all__ = [
     "set_university_status",
     "_dedupe_org_units_by_name",
 ]
-

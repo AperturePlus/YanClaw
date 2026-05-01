@@ -5,6 +5,7 @@ from urllib.parse import urlparse
 
 from agents.crawler.url_heuristics import (
     _is_faculty_platform,
+    _is_non_faculty_noise_url,
     _is_pagination_link,
     _looks_like_retired_content,
     _looks_like_retired_url,
@@ -225,13 +226,7 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
         "/djgz/",
         "/rcpy/",
         "/pxfz/",
-        "/zsjy/",
-        "/xsgz/",
         "/kxyj/",
-        "/xwzx/",
-        "/news/",
-        "/notice/",
-        "/tzgg/",
         "/download/",
         "/about/",
         "/intro/",
@@ -249,6 +244,8 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
         if _is_faculty_platform(link) or _is_pagination_link(link):
             continue
         if _looks_like_retired_url(link):
+            continue
+        if _is_non_faculty_noise_url(link):
             continue
         parsed = urlparse(link)
         host = (parsed.hostname or "").lower()

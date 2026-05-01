@@ -27,6 +27,7 @@ from agents.crawler.url_heuristics import (
     _is_college_subdomain,
     _is_core_academic_kind,
     _is_faculty_platform,
+    _is_non_faculty_noise_url,
     _is_pagination_link,
     _keyword_filter,
     _looks_like_faculty_page,
@@ -586,7 +587,13 @@ class CrawlerAgent:
 
             # --- Find faculty links for this org unit ---
             links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l) and not _looks_like_retired_url(l)]
+            links = [
+                l
+                for l in self.fetcher.filter_same_domain(links, self.start_url)
+                if not _is_faculty_platform(l)
+                and not _looks_like_retired_url(l)
+                and not _is_non_faculty_noise_url(l)
+            ]
             links = _rank_faculty_page_candidates(links)
             non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
             if non_showcase:
@@ -606,7 +613,13 @@ class CrawlerAgent:
                 links = self._links_from_result(result.content)
                 if not links:
                     links = self._links_from_tool_call_log(result, tool_name="extract_links")
-                links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l) and not _looks_like_retired_url(l)]
+                links = [
+                    l
+                    for l in self.fetcher.filter_same_domain(links, self.start_url)
+                    if not _is_faculty_platform(l)
+                    and not _looks_like_retired_url(l)
+                    and not _is_non_faculty_noise_url(l)
+                ]
                 links = _rank_faculty_page_candidates(links)
                 non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
                 if non_showcase:
@@ -677,7 +690,9 @@ class CrawlerAgent:
             links = [
                 l
                 for l in self.fetcher.filter_same_domain(links, self.start_url)
-                if not _is_faculty_platform(l) and not _looks_like_retired_url(l)
+                if not _is_faculty_platform(l)
+                and not _looks_like_retired_url(l)
+                and not _is_non_faculty_noise_url(l)
             ]
             links = _rank_faculty_page_candidates(links)
             non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
@@ -710,7 +725,9 @@ class CrawlerAgent:
                 links = [
                     l
                     for l in self.fetcher.filter_same_domain(links, self.start_url)
-                    if not _is_faculty_platform(l) and not _looks_like_retired_url(l)
+                    if not _is_faculty_platform(l)
+                    and not _looks_like_retired_url(l)
+                    and not _is_non_faculty_noise_url(l)
                 ]
                 links = _rank_faculty_page_candidates(links)
                 non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
@@ -732,7 +749,11 @@ class CrawlerAgent:
         if not faculty_links:
             self.logger.info("No faculty links from org units, trying search engine fallback")
             search_links = await self._search_engine_fallback("faculty teachers professors list szdw jsdw")
-            search_links = [l for l in search_links if not _is_faculty_platform(l)]
+            search_links = [
+                l
+                for l in search_links
+                if not _is_faculty_platform(l) and not _is_non_faculty_noise_url(l)
+            ]
             search_links = _rank_faculty_page_candidates(search_links)
             for link in search_links:
                 if self._within_depth(2):
@@ -1355,18 +1376,20 @@ class CrawlerAgent:
         if detail_mode:
             base = (
                 "Extract professor records from this detail page and call save_professors when records are found. "
-                f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                "Prioritize fields: email, phone, research_areas. "
-                "Only save records that include at least one of email/phone/research_areas. "
-                "If this page only contains category/list names without these fields, do not save placeholders. "
-                "Do not include retired/emeritus/离退休/荣休 records."
+                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
+                + "Prioritize fields: email, phone, research_areas. "
+                + "Only save records that include at least one of email/phone/research_areas. "
+                + "If this page only contains category/list names without these fields, do not save placeholders. "
+                + "Do not include retired/emeritus records. "
+                + "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
             )
         else:
             base = (
                 "Extract public professor records and call save_professors when records are found. "
-                f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
-                "Do not include retired/emeritus/离退休/荣休 records."
+                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
+                + "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
+                + "Do not include retired/emeritus records. "
+                + "Skip noise pages dominated by notices/news/policies/recruitment/personnel content."
             )
         if not strict_retry:
             return base
@@ -1820,5 +1843,6 @@ def _dedupe_queue(items: list[_QueuedUrl]) -> list[_QueuedUrl]:
         seen.add(item.url)
         result.append(item)
     return result
+
 
 

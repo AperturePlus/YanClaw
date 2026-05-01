@@ -890,12 +890,16 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
         "https://www.example.edu.cn/gywm/jxdw1/jjx.htm",
         "https://sub.example.edu.cn/info/1012/3958.htm",
         "https://www.example.edu.cn/news/1234.htm",
+        "https://www.example.edu.cn/szdw/tzgg/202603/t20260315_1024.shtml",
+        "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml",
     ]
     out = agent._extract_detail_profile_links(links, "https://www.example.edu.cn/szdw.htm")
     assert "https://www.example.edu.cn/szdw/zzjs1/jjx.htm" in out
     assert "https://www.example.edu.cn/gywm/jxdw1/jjx.htm" not in out
     assert "https://sub.example.edu.cn/info/1012/3958.htm" not in out
     assert "https://www.example.edu.cn/news/1234.htm" not in out
+    assert "https://www.example.edu.cn/szdw/tzgg/202603/t20260315_1024.shtml" not in out
+    assert "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml" not in out
     await db.close()
 
 
@@ -906,10 +910,14 @@ async def test_followup_faculty_links_filter_noise_sections(tmp_path):
         "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm",
         "https://www.example.edu.cn/rcpy/sys.htm",
         "https://sub.example.edu.cn/szdw/xx.htm",
+        "https://www.example.edu.cn/szdw/tzgg/list.htm",
+        "https://www.example.edu.cn/faculty/renshi/recruitment.htm",
     ]
     out = agent._extract_followup_faculty_links(links, "https://www.example.edu.cn/szdw.htm")
     assert "https://www.example.edu.cn/szdw/zzjs1.htm" in out
     assert "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm" not in out
     assert "https://www.example.edu.cn/rcpy/sys.htm" not in out
     assert "https://sub.example.edu.cn/szdw/xx.htm" not in out
+    assert "https://www.example.edu.cn/szdw/tzgg/list.htm" not in out
+    assert "https://www.example.edu.cn/faculty/renshi/recruitment.htm" not in out
     await db.close()

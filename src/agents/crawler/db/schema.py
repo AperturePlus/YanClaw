@@ -3,8 +3,8 @@ from __future__ import annotations
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.crawler.db_university import _dedupe_org_units_by_name
-from agents.crawler.db_utils import _normalize_nullish_columns, _sqlite_has_column
+from agents.crawler.db.university import _dedupe_org_units_by_name
+from agents.crawler.db.utils import _normalize_nullish_columns, _sqlite_has_column
 
 
 async def ensure_runtime_schema(session: AsyncSession) -> None:
@@ -75,4 +75,3 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
 
 
 __all__ = ["ensure_runtime_schema"]
-
