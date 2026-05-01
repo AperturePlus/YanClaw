@@ -10,6 +10,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
+from agents.crawler import agent_detail, agent_parsing
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus, OrgUnit, UniversityMeta
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
@@ -1452,133 +1453,13 @@ class CrawlerAgent:
     async def _enrich_profiles_with_detail_backend(
         self, current: _QueuedUrl, fetched: FetchResult, skills: str
     ) -> None:
-        if not self._is_interactive or not self.detail_enrich_enabled:
-            return
-        if self.detail_fetch_backend == "human":
-            await self._enrich_profiles_with_human(current, fetched, skills)
-            return
-        if self.detail_fetch_backend == "httpx":
-            await self._enrich_profiles_with_httpx(current, fetched, skills)
-            return
-        self.logger.debug("Unsupported detail backend=%s; skip detail enrichment", self.detail_fetch_backend)
+        await agent_detail.enrich_profiles_with_detail_backend(self, current, fetched, skills)
 
     async def _enrich_profiles_with_human(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
-        org_unit_key = self._detail_org_unit_key(current)
-        processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
-        remaining = self.detail_profile_hard_cap_per_org_unit - processed
-        if remaining <= 0:
-            self.logger.debug(
-                "Detail enrichment cap reached org_unit=%s cap=%s",
-                current.label or "Unknown",
-                self.detail_profile_hard_cap_per_org_unit,
-            )
-            return
-
-        candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
-        if not candidates:
-            return
-
-        pending: list[str] = []
-        for link in candidates:
-            if len(pending) >= remaining:
-                break
-            if link in self._detail_visited_urls or link in self.visited_urls:
-                continue
-            self._detail_visited_urls.add(link)
-            pending.append(link)
-        if not pending:
-            return
-        self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
-        await self._process_detail_urls_with_human(pending, current, skills)
+        await agent_detail.enrich_profiles_with_human(self, current, fetched, skills)
 
     async def _enrich_profiles_with_httpx(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
-        if self._detail_fetcher is None:
-            return
-
-        org_unit_key = self._detail_org_unit_key(current)
-        processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
-        remaining = self.detail_profile_hard_cap_per_org_unit - processed
-        if remaining <= 0:
-            self.logger.debug(
-                "Detail enrichment cap reached org_unit=%s cap=%s",
-                current.label or "Unknown",
-                self.detail_profile_hard_cap_per_org_unit,
-            )
-            return
-
-        candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
-        if not candidates:
-            return
-
-        pending: list[str] = []
-        for link in candidates:
-            if len(pending) >= remaining:
-                break
-            if link in self._detail_visited_urls or link in self.visited_urls:
-                continue
-            self._detail_visited_urls.add(link)
-            pending.append(link)
-        if not pending:
-            return
-        self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
-
-        consecutive_failures = 0
-        failed_urls: list[str] = []
-        while pending:
-            link = pending.pop(0)
-            if _looks_like_retired_url(link):
-                continue
-            try:
-                detail_fetched = await self._detail_fetcher.fetch(link)
-            except Exception as error:
-                self.logger.debug("Detail httpx fetch failed url=%s error=%s", link, error)
-                consecutive_failures += 1
-                failed_urls.append(link)
-                if consecutive_failures >= self.detail_failure_threshold:
-                    switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
-                    if switched:
-                        self.logger.info(
-                            "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
-                            current.label or "Unknown",
-                            len(failed_urls),
-                            len(pending),
-                        )
-                    consecutive_failures = 0
-                    failed_urls = []
-                continue
-
-            if self._is_failed_detail_fetch(detail_fetched):
-                consecutive_failures += 1
-                failed_urls.append(link)
-                if consecutive_failures >= self.detail_failure_threshold:
-                    switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
-                    if switched:
-                        self.logger.info(
-                            "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
-                            current.label or "Unknown",
-                            len(failed_urls),
-                            len(pending),
-                        )
-                    consecutive_failures = 0
-                    failed_urls = []
-                continue
-
-            consecutive_failures = 0
-            failed_urls = []
-
-            clean_url = _sanitize_url(detail_fetched.url)
-            if clean_url:
-                self.visited_urls.add(clean_url)
-            if self._is_retired_page(detail_fetched):
-                self.logger.info("Skip retired detail page url=%s", detail_fetched.url)
-                continue
-
-            await self._extract_professors_from_page(
-                current,
-                detail_fetched,
-                skills,
-                detail_mode=True,
-            )
+        await agent_detail.enrich_profiles_with_httpx(self, current, fetched, skills)
 
     async def _handle_detail_failure_decision(
         self,
@@ -1586,170 +1467,20 @@ class CrawlerAgent:
         failed_urls: list[str],
         skills: str,
     ) -> bool:
-        if not hasattr(self.fetcher, "request_decision") or not hasattr(self.fetcher, "wait_decision"):
-            return False
-        urls = list(dict.fromkeys(failed_urls))
-        if not urls:
-            return False
-        decision = await self.fetcher.request_decision(  # type: ignore[attr-defined]
-            kind="detail_fetch_failure",
-            org_unit_name=current.label or "Unknown",
-            failure_count=len(failed_urls),
-            sample_urls=urls[:3],
-            suggested_action="switch_failed_to_human",
-        )
-        action = await self.fetcher.wait_decision(decision.id)  # type: ignore[attr-defined]
-        if action != "switch_failed_to_human":
-            return False
-        self.logger.info(
-            "Switching failed detail links to human for org_unit=%s urls=%s",
-            current.label or "Unknown",
-            len(urls),
-        )
-        await self._process_detail_urls_with_human(urls, current, skills)
-        return True
+        return await agent_detail.handle_detail_failure_decision(self, current, failed_urls, skills)
 
     async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
-        next_depth = current.depth + 1
-        if not self._within_depth(next_depth):
-            return
-        for url in urls:
-            if url in self.visited_urls:
-                continue
-            fetched = await self._fetch_url(url, next_depth)
-            if fetched is None:
-                continue
-            if self._is_retired_page(fetched):
-                self.logger.info("Skip retired human detail page url=%s", fetched.url)
-                continue
-            await self._extract_professors_from_page(
-                current,
-                fetched,
-                skills,
-                detail_mode=True,
-            )
+        await agent_detail.process_detail_urls_with_human(self, urls, current, skills)
 
     def _extract_detail_profile_links(self, links: list[str], current_url: str) -> list[str]:
-        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
-        current_parsed = urlparse(current_url)
-        current_host = (current_parsed.hostname or "").lower()
-        current_path = current_parsed.path.lower()
-        current_dir = self._derive_section_prefix(current_path)
-
-        detail_hints = (
-            "/info/",
-            "/teacher/",
-            "/teachers/",
-            "/faculty/",
-            "/people/",
-            "/show",
-            "/detail",
-            "/profile",
-            "/mentor",
-            "teacher",
-            "faculty",
-            "people",
-            "profile",
-            "detail",
-            "show",
-        )
-        section_hints = ("/szdw/", "/team/", "/staff/", "/jsdw/")
-        noise_hints = (
-            "/gywm/",
-            "/djgz/",
-            "/rcpy/",
-            "/pxfz/",
-            "/zsjy/",
-            "/xsgz/",
-            "/kxyj/",
-            "/xwzx/",
-            "/news/",
-            "/notice/",
-            "/tzgg/",
-            "/download/",
-            "/about/",
-            "/intro/",
-            "/history/",
-            "/leader/",
-            "/lxdh/",
-            "/index",
-        )
-        file_ext_hints = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar")
-
-        candidates: list[str] = []
-        for link in same_domain:
-            if link == current_url:
-                continue
-            if _is_faculty_platform(link) or _is_pagination_link(link):
-                continue
-            if _looks_like_retired_url(link):
-                continue
-            parsed = urlparse(link)
-            host = (parsed.hostname or "").lower()
-            if current_host and host != current_host:
-                continue
-            lowered = link.lower()
-            if any(token in lowered for token in noise_hints):
-                continue
-            if any(lowered.endswith(ext) for ext in file_ext_hints):
-                continue
-            path = parsed.path.lower()
-            related_by_path = False
-            if current_dir:
-                prefix = current_dir.rstrip("/")
-                related_by_path = bool(prefix and path.startswith(prefix + "/"))
-            related_by_hint = any(token in lowered for token in detail_hints)
-            if not related_by_path and not related_by_hint:
-                continue
-            candidates.append(link)
-
-        def _score(url: str) -> tuple[int, int]:
-            lowered = url.lower()
-            depth = max(0, urlparse(url).path.count("/") - 1)
-            score = depth
-            if current_dir and urlparse(url).path.lower().startswith(current_dir.rstrip("/") + "/"):
-                score += 4
-            if any(token in lowered for token in detail_hints):
-                score += 4
-            if any(token in lowered for token in section_hints):
-                score += 2
-            if any(token in lowered for token in noise_hints):
-                score -= 6
-            return score, -len(url)
-
-        ranked = sorted(candidates, key=_score, reverse=True)
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for link in ranked:
-            if link in seen:
-                continue
-            if _score(link)[0] < 3:
-                continue
-            seen.add(link)
-            deduped.append(link)
-        return deduped
+        return agent_detail.extract_detail_profile_links(self, links, current_url)
 
     def _detail_org_unit_key(self, current: _QueuedUrl) -> str:
-        if current.org_unit_id is not None:
-            return f"id:{current.org_unit_id}"
-        label = (current.label or "").strip().lower()
-        if label:
-            return f"label:{label}"
-        return f"url:{_sanitize_url(current.url)}"
+        return agent_detail.detail_org_unit_key(self, current)
 
     @staticmethod
     def _derive_section_prefix(path: str) -> str:
-        normalized = (path or "").strip().lower()
-        if not normalized:
-            return ""
-        parent, _, leaf = normalized.rpartition("/")
-        if leaf.endswith((".htm", ".html", ".shtml")):
-            stem = leaf.rsplit(".", 1)[0]
-            if stem:
-                return f"{parent}/{stem}" if parent else f"/{stem}"
-        if parent:
-            return parent
-        return normalized
+        return agent_detail.derive_section_prefix(path)
 
     def _log_org_unit_queue_preview(self, candidates: list[OrgUnit], start_host: str, *, stage: str) -> None:
         if not candidates:
@@ -1766,20 +1497,10 @@ class CrawlerAgent:
         )
 
     def _is_failed_detail_fetch(self, fetched: FetchResult) -> bool:
-        if fetched.block_reason:
-            return True
-        if fetched.status_code in {0, 202, 429, 503}:
-            return True
-        if fetched.status_code >= 400:
-            return True
-        if len((fetched.text or "").strip()) < 160 and len(fetched.links) < 2:
-            return True
-        return False
+        return agent_detail.is_failed_detail_fetch(self, fetched)
 
     def _is_retired_page(self, fetched: FetchResult) -> bool:
-        if _looks_like_retired_url(fetched.url):
-            return True
-        return _looks_like_retired_content(fetched.text, fetched.url)
+        return agent_detail.is_retired_page(self, fetched)
 
     async def _ask_llm(
         self,
@@ -2035,105 +1756,19 @@ class CrawlerAgent:
         return all(checks)
 
     def _links_from_result(self, content: str) -> list[str]:
-        payload = self._parse_json_from_text(content)
-        if payload is None:
-            return []
-        if isinstance(payload, list):
-            return [_sanitize_url(str(item)) for item in payload if _sanitize_url(str(item))]
-        if not isinstance(payload, dict):
-            return []
-        for key in ("links", "org_unit_pages", "faculty_links", "urls"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                raw = [str(item.get("url") if isinstance(item, dict) else item) for item in value]
-                return [_sanitize_url(u) for u in raw if _sanitize_url(u)]
-        return []
+        return agent_parsing.links_from_result(self, content)
 
     def _org_unit_followup_links_from_result(self, content: str, current_url: str) -> list[str]:
-        payload = self._parse_json_from_text(content)
-        links: list[str] = []
-        if isinstance(payload, dict):
-            for key in ("next_url", "url", "next_page", "target_url", "org_unit_page"):
-                value = payload.get(key)
-                if isinstance(value, str):
-                    link = _sanitize_url(value)
-                    if link:
-                        links.append(urljoin(current_url, link))
-
-        links.extend(self._links_from_result(content))
-
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for link in links:
-            clean = _sanitize_url(link)
-            if not clean or clean in seen:
-                continue
-            seen.add(clean)
-            deduped.append(clean)
-        return deduped
+        return agent_parsing.org_unit_followup_links_from_result(self, content, current_url)
 
     def _links_from_tool_call_log(self, result: Any, *, tool_name: str = "extract_links") -> list[str]:
-        records = getattr(result, "tool_call_log", None)
-        if not isinstance(records, list):
-            return []
-        for record in records:
-            if getattr(record, "name", "") != tool_name:
-                continue
-            payload = getattr(record, "result", None)
-            if isinstance(payload, dict):
-                links = payload.get("links")
-                if isinstance(links, list):
-                    return [_sanitize_url(str(link)) for link in links if _sanitize_url(str(link))]
-            if isinstance(payload, list):
-                return [_sanitize_url(str(link)) for link in payload if _sanitize_url(str(link))]
-        return []
+        return agent_parsing.links_from_tool_call_log(self, result, tool_name=tool_name)
 
     def _org_units_from_result(self, content: str) -> list[dict[str, Any]]:
-        payload = self._parse_json_from_text(content)
-        if payload is None or not isinstance(payload, dict):
-            return []
-        units = payload.get("org_units")
-        if isinstance(units, list):
-            return [item for item in units if isinstance(item, dict)]
-        return []
+        return agent_parsing.org_units_from_result(self, content)
 
     def _parse_json_from_text(self, content: str) -> Any | None:
-        if not content:
-            return None
-        text = content.strip()
-
-        def _try_load(candidate: str) -> Any | None:
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError:
-                return None
-
-        loaded = _try_load(text)
-        if loaded is not None:
-            return loaded
-
-        fence = "```"
-        if fence in text:
-            start = text.find(fence)
-            end = text.find(fence, start + len(fence))
-            if start != -1 and end != -1 and end > start:
-                block = text[start + len(fence) : end]
-                if "\n" in block:
-                    block = block.split("\n", 1)[1]
-                loaded = _try_load(block.strip())
-                if loaded is not None:
-                    return loaded
-
-        for open_char, close_char in (("{", "}"), ("[", "]")):
-            start = text.find(open_char)
-            end = text.rfind(close_char)
-            if start == -1 or end == -1 or end <= start:
-                continue
-            loaded = _try_load(text[start : end + 1].strip())
-            if loaded is not None:
-                return loaded
-
-        return None
+        return agent_parsing.parse_json_from_text(self, content)
 
     def _within_depth(self, depth: int) -> bool:
         return depth <= self.max_depth
@@ -2168,91 +1803,13 @@ class CrawlerAgent:
         )
 
     def _extract_pagination_links(self, links: list[str], current_url: str) -> list[str]:
-        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
-        pagination: list[str] = []
-        for link in same_domain:
-            if link == current_url or link in self.visited_urls:
-                continue
-            if _is_pagination_link(link):
-                pagination.append(link)
-        return pagination
+        return agent_parsing.extract_pagination_links(self, links, current_url)
 
     def _extract_followup_faculty_links(self, links: list[str], current_url: str) -> list[str]:
-        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
-        current_host = (urlparse(current_url).hostname or "").lower()
-        current_path = urlparse(current_url).path.lower()
-        current_dir = self._derive_section_prefix(current_path)
-        noise_hints = (
-            "/gywm/",
-            "/djgz/",
-            "/rcpy/",
-            "/pxfz/",
-            "/zsjy/",
-            "/xsgz/",
-            "/kxyj/",
-            "/xwzx/",
-            "/news/",
-            "/notice/",
-            "/tzgg/",
-            "/about/",
-            "/intro/",
-            "/history/",
-            "/leader/",
-            "/download/",
-            "/index",
-        )
-        candidates = [
-            link
-            for link in same_domain
-            if link != current_url
-            and not _is_faculty_platform(link)
-            and not _looks_like_retired_url(link)
-            and (not current_host or (urlparse(link).hostname or "").lower() == current_host)
-            and not any(token in link.lower() for token in noise_hints)
-            and (
-                _looks_like_faculty_page(link)
-                or (
-                    bool(current_dir)
-                    and urlparse(link).path.lower().startswith(current_dir.rstrip("/") + "/")
-                )
-            )
-        ]
-        candidates = _rank_faculty_page_candidates(candidates)
-        non_showcase = [link for link in candidates if not _is_academician_showcase_page(link)]
-        if non_showcase:
-            candidates = non_showcase
-        return candidates
+        return agent_parsing.extract_followup_faculty_links(self, links, current_url)
 
     async def _search_engine_fallback(self, query_suffix: str) -> list[str]:
-        """Use Bing search as fallback to find relevant pages on the university domain."""
-        hostname = urlparse(self.start_url).hostname or ""
-        domain = hostname.removeprefix("www.")
-        suffix = (query_suffix or "").strip()
-        if suffix and not _contains_cjk(suffix) and any(ord(ch) > 127 for ch in suffix):
-            suffix = ""
-        extra = "jgsz yxsz xysz zzjg xy yx xygk xxgk szdw jsdw faculty teacher staff people"
-        query = _dedupe_query_terms(f"{suffix} {extra} site:{domain}".strip())
-        search_url = f"https://www.bing.com/search?q={quote(query)}&count=20&setlang=en&cc=us"
-        self.logger.info("Search engine fallback: %s", query)
-        try:
-            fetched = await self.fetcher.fetch(search_url)
-            self.logger.info(
-                "Search fallback response status=%s final_url=%s block_reason=%s",
-                fetched.status_code,
-                fetched.url,
-                fetched.block_reason or "-",
-            )
-            text_urls = _extract_urls_from_text(fetched.text)
-            all_urls = list(dict.fromkeys(fetched.links + text_urls))
-            same_domain = self.fetcher.filter_same_domain(all_urls, self.start_url)
-            same_domain = [u for u in same_domain if not _is_faculty_platform(u)]
-            self.execution_log.append(f"search_fallback query={query!r} found={len(same_domain)} links")
-            self.logger.info("Search fallback found %d same-domain links", len(same_domain))
-            return same_domain
-        except Exception as error:
-            self.logger.warning("Search engine fallback failed: %s", error)
-            self.execution_log.append(f"search_fallback failed: {error}")
-            return []
+        return await agent_parsing.search_engine_fallback(self, query_suffix)
 
 def _dedupe_queue(items: list[_QueuedUrl]) -> list[_QueuedUrl]:
     seen: set[str] = set()
