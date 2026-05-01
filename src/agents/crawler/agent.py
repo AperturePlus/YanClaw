@@ -110,6 +110,11 @@ class CrawlerAgent:
         self._skip_cross_run_dedup = False
         self._blocked_hosts: set[str] = set()
 
+    @property
+    def _is_interactive(self) -> bool:
+        """True when using a human-assisted fetcher (streaming per-org-unit is preferred)."""
+        return hasattr(self.fetcher, 'set_context')
+
     async def run(self) -> AgentResult:
         await self._ensure_university()
         await self._set_status(CrawlStatus.IN_PROGRESS)
@@ -179,6 +184,12 @@ class CrawlerAgent:
                     self._skip_cross_run_dedup = True
                     continue
 
+                if self._is_interactive:
+                    # Interactive (human) mode: find faculty + extract professors
+                    # per org unit to avoid spending all time on discovery.
+                    await self._find_and_extract_streaming(org_units)
+                    break
+
                 if not faculty_links:
                     faculty_links = await self._find_faculty_pages(org_units)
                 if not faculty_links:
@@ -190,11 +201,11 @@ class CrawlerAgent:
 
                 break
 
-            if not faculty_links:
-                # Last resort: treat home page as faculty page
-                faculty_links = [_QueuedUrl(home.url, 0, label="Unknown")]
+            if not self._is_interactive:
+                if not faculty_links:
+                    faculty_links = [_QueuedUrl(home.url, 0, label="Unknown")]
+                await self._extract_professors(faculty_links)
 
-            await self._extract_professors(faculty_links)
 
             total_professor_count = await self._professor_count()
             newly_saved_count = max(0, total_professor_count - initial_professor_count)
@@ -404,6 +415,84 @@ class CrawlerAgent:
 
         async with self.db.session() as session:
             return await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
+    async def _find_and_extract_streaming(self, org_units: list[OrgUnit]) -> None:
+        """Interactive mode: for each org unit, find faculty pages then immediately extract professors."""
+        self._log_state(CrawlerState.FIND_FACULTY_PAGES)
+        max_links_per_org_unit = 3
+        skills_find = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
+        llm_fallback_budget = 3
+
+        preferred: list[OrgUnit] = []
+        fallback: list[OrgUnit] = []
+        for unit in org_units:
+            kind = (unit.kind or "").strip().lower()
+            if kind in {"division", "xuebu"}:
+                continue
+            if _is_core_academic_kind(kind):
+                preferred.append(unit)
+            else:
+                fallback.append(unit)
+        candidates = preferred or fallback or org_units
+
+        start_host = (urlparse(self.start_url).hostname or "").lower()
+        candidates = sorted(candidates, key=lambda unit: _org_unit_faculty_priority(unit, start_host))
+
+        for org_unit in candidates[: self.max_org_units_per_university]:
+            item = _QueuedUrl(url=org_unit.url, depth=1, label=org_unit.name, org_unit_id=org_unit.id)
+
+            if _is_faculty_platform(item.url):
+                continue
+            item_host = (urlparse(item.url).hostname or "").lower()
+            if item_host in self._blocked_hosts:
+                continue
+
+            fetched = await self._fetch_url(item.url, item.depth)
+            if fetched is None:
+                continue
+
+            # --- Find faculty links for this org unit ---
+            links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
+            links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l)]
+            links = _rank_faculty_page_candidates(links)
+            non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
+            if non_showcase:
+                links = non_showcase
+
+            if not links and _is_college_subdomain(fetched.url, self.start_url):
+                links.extend(await self._probe_faculty_paths(fetched.url))
+            if not links and _looks_like_faculty_page(fetched.url):
+                links = [fetched.url]
+            if not links and llm_fallback_budget > 0:
+                llm_fallback_budget -= 1
+                result = await self._ask_llm(
+                    CrawlerState.FIND_FACULTY_PAGES,
+                    "Find links that lead to faculty list pages for this org unit.",
+                    fetched, skills_find,
+                )
+                links = self._links_from_result(result.content)
+                if not links:
+                    links = self._links_from_tool_call_log(result, tool_name="extract_links")
+                links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l)]
+                links = _rank_faculty_page_candidates(links)
+                non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
+                if non_showcase:
+                    links = non_showcase
+
+            # --- Immediately extract professors from found links ---
+            faculty_for_unit: list[_QueuedUrl] = []
+            for link in links[:max_links_per_org_unit]:
+                depth = item.depth + (0 if link == fetched.url else 1)
+                if self._within_depth(depth):
+                    faculty_for_unit.append(_QueuedUrl(url=link, depth=depth, label=item.label, org_unit_id=item.org_unit_id))
+
+            if faculty_for_unit:
+                self.logger.info(
+                    "Streaming: extracting professors for %s (%d faculty pages)",
+                    org_unit.name, len(faculty_for_unit),
+                )
+                await self._extract_professors(faculty_for_unit)
+
+
     async def _find_faculty_pages(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
         faculty_links: list[_QueuedUrl] = []
