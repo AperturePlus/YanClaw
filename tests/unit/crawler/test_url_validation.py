@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from agents.crawler.agent import _url_found_on_page, _is_category_name
+from agents.crawler.agent import _is_category_name, _url_found_on_page
+from agents.crawler.url_heuristics import (
+    _looks_like_org_unit_listing_url,
+    _looks_like_retired_content,
+)
 
 
 def test_url_found_exact_match_in_links():
@@ -61,3 +65,28 @@ def test_real_college_name_accepted():
     assert not _is_category_name("法学院")
     assert not _is_category_name("华西临床医学院")
     assert not _is_category_name("信息与通信工程学院")
+
+
+def test_retired_content_not_triggered_on_mixed_faculty_tabs():
+    text = (
+        "\u5e08\u8d44\u961f\u4f0d\n"
+        "\u5728\u804c\u6559\u5e08\n"
+        "\u8363\u4f11\u6559\u5e08\n"
+        "\u6559\u5e08\u540d\u5f55\n"
+    )
+    assert not _looks_like_retired_content(text, "https://example.edu.cn/szdw.htm")
+
+
+def test_retired_content_triggered_for_retired_only_page():
+    text = (
+        "\u8363\u4f11\u6559\u804c\u5de5\n"
+        "\u79bb\u9000\u4f11\u4eba\u5458\n"
+        "\u9000\u4f11\u6559\u5e08\n"
+    )
+    assert _looks_like_retired_content(text, "https://example.edu.cn/szdw/rxjzg.htm")
+
+
+def test_org_unit_listing_url_filters_non_academic_pages():
+    assert _looks_like_org_unit_listing_url("https://www.scu.edu.cn/zzjg1/yx.htm")
+    assert not _looks_like_org_unit_listing_url("https://www.scu.edu.cn/xxgk/xxjj.htm")
+    assert not _looks_like_org_unit_listing_url("https://www.scu.edu.cn/zzjg1/jgbc.htm")

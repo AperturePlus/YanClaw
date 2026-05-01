@@ -37,6 +37,16 @@ _ENROLLMENT_RULES: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 _ACADEMICIAN_HINTS = ("院士", "academician")
+_RETIRED_HINTS = (
+    "离退休",
+    "退休",
+    "荣休",
+    "退休教师",
+    "离休",
+    "退休人员",
+    "retired",
+    "emeritus",
+)
 _SEPARATOR_RE = re.compile(r"[;,，；、/|]+")
 _BULLET_PREFIX_RE = re.compile(r"^[\s\d\.\-、:：\)\(]+")
 
@@ -176,6 +186,17 @@ def contains_academician_hint(*values: Any) -> bool:
             continue
         lowered = text.lower()
         if any(hint in text or hint in lowered for hint in _ACADEMICIAN_HINTS):
+            return True
+    return False
+
+
+def contains_retired_hint(*values: Any) -> bool:
+    for value in values:
+        text = normalize_optional_text(value)
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(hint in text or hint in lowered for hint in _RETIRED_HINTS):
             return True
     return False
 

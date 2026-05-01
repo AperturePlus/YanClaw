@@ -26,6 +26,9 @@ from agents.crawler.url_heuristics import (
     _is_pagination_link,
     _keyword_filter,
     _looks_like_faculty_page,
+    _looks_like_org_unit_listing_url,
+    _looks_like_retired_content,
+    _looks_like_retired_url,
     _org_unit_faculty_priority,
     _rank_faculty_page_candidates,
     _rank_org_unit_page_candidates,
@@ -86,6 +89,10 @@ class CrawlerAgent:
         max_org_units_per_university: int = 50,
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
+        detail_enrich_enabled: bool = True,
+        detail_fetch_backend: str = "httpx",
+        detail_profile_hard_cap_per_org_unit: int = 200,
+        detail_failure_threshold: int = 10,
     ) -> None:
         self.university_name = university_name
         self.start_url = start_url
@@ -101,6 +108,10 @@ class CrawlerAgent:
         self.max_org_units_per_university = max_org_units_per_university
         self.min_org_units = min_org_units
         self.model_max_tokens = model_max_tokens
+        self.detail_enrich_enabled = detail_enrich_enabled
+        self.detail_fetch_backend = detail_fetch_backend
+        self.detail_profile_hard_cap_per_org_unit = max(1, int(detail_profile_hard_cap_per_org_unit))
+        self.detail_failure_threshold = max(1, int(detail_failure_threshold))
         self.visited_urls: set[str] = set()
         self._fetch_cache: dict[str, FetchResult] = {}
         self.backtrack_count = 0
@@ -109,6 +120,9 @@ class CrawlerAgent:
         self._university_cache: UniversityMeta | None = None
         self._skip_cross_run_dedup = False
         self._blocked_hosts: set[str] = set()
+        self._detail_fetcher: Fetcher | None = None
+        self._detail_visited_urls: set[str] = set()
+        self._detail_processed_by_org_unit: dict[str, int] = {}
 
     @property
     def _is_interactive(self) -> bool:
@@ -118,6 +132,15 @@ class CrawlerAgent:
     async def run(self) -> AgentResult:
         await self._ensure_university()
         await self._set_status(CrawlStatus.IN_PROGRESS)
+
+        detail_fetcher_cm: Fetcher | None = None
+        if self._is_interactive and self.detail_enrich_enabled and self.detail_fetch_backend == "httpx":
+            detail_fetcher_cm = Fetcher(
+                request_interval_seconds=self.fetcher.request_interval_seconds if hasattr(self.fetcher, "request_interval_seconds") else 2.0,
+                max_retries=self.fetcher.max_retries if hasattr(self.fetcher, "max_retries") else 3,
+                timeout_seconds=self.fetcher._timeout_seconds if hasattr(self.fetcher, "_timeout_seconds") else 30.0,
+            )
+            self._detail_fetcher = await detail_fetcher_cm.__aenter__()
 
         try:
             self.logger.info("Starting crawl for %s", self.university_name)
@@ -236,6 +259,10 @@ class CrawlerAgent:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
+        finally:
+            if detail_fetcher_cm is not None:
+                await detail_fetcher_cm.__aexit__(None, None, None)
+            self._detail_fetcher = None
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
         links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
@@ -263,6 +290,9 @@ class CrawlerAgent:
         links = self.fetcher.filter_same_domain(links, self.start_url)
         links = [l for l in links if not _is_faculty_platform(l)]
         links = _rank_org_unit_page_candidates(links, self.start_url)
+        preferred_org_pages = [link for link in links if _looks_like_org_unit_listing_url(link)]
+        if preferred_org_pages:
+            links = preferred_org_pages
         if links:
             self.logger.debug(
                 "Org-page discovery same_domain_ranked=%s sample=%s",
@@ -333,6 +363,12 @@ class CrawlerAgent:
             units = self._org_units_from_result(result.content)
             if not units:
                 followups = self._org_unit_followup_links_from_result(result.content, fetched.url)
+                ranked_followups = _rank_org_unit_page_candidates(followups, self.start_url)
+                preferred_followups = [link for link in ranked_followups if _looks_like_org_unit_listing_url(link)]
+                if preferred_followups:
+                    followups = preferred_followups
+                else:
+                    followups = ranked_followups
                 added_followups: list[str] = []
                 for link in followups:
                     if link in seen_pages:
@@ -396,11 +432,38 @@ class CrawlerAgent:
                     validated,
                     hallucinated,
                 )
-            if core_validated_total >= self.min_org_units:
+            if validated == 0:
+                followups = self._org_unit_followup_links_from_result(result.content, fetched.url)
+                if not followups:
+                    followups = _keyword_filter(fetched.links, ORG_UNIT_PAGE_KEYWORDS) or list(fetched.links)
+                followups = self.fetcher.filter_same_domain(followups, self.start_url)
+                followups = [link for link in followups if not _is_faculty_platform(link)]
+                followups = _rank_org_unit_page_candidates(followups, self.start_url)
+                preferred_followups = [link for link in followups if _looks_like_org_unit_listing_url(link)]
+                if preferred_followups:
+                    followups = preferred_followups
+                added_followups: list[str] = []
+                for link in followups[:8]:
+                    if link in seen_pages:
+                        continue
+                    next_depth = page.depth + (0 if link == fetched.url else 1)
+                    if not self._within_depth(next_depth):
+                        continue
+                    seen_pages.add(link)
+                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    added_followups.append(link)
+                if added_followups:
+                    self.logger.debug(
+                        "Org-unit validation produced 0 accepted; queued followups page=%s added=%s sample=%s",
+                        fetched.url,
+                        len(added_followups),
+                        added_followups[:3],
+                    )
+            if core_validated_total >= self.max_org_units_per_university:
                 self.logger.info(
-                    "Collected %s core org units (min=%s); stop org-unit extraction early",
+                    "Collected %s core org units (limit=%s); stop org-unit extraction",
                     core_validated_total,
-                    self.min_org_units,
+                    self.max_org_units_per_university,
                 )
                 break
 
@@ -418,7 +481,7 @@ class CrawlerAgent:
     async def _find_and_extract_streaming(self, org_units: list[OrgUnit]) -> None:
         """Interactive mode: for each org unit, find faculty pages then immediately extract professors."""
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
-        max_links_per_org_unit = 3
+        max_links_per_org_unit = 8
         skills_find = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
         llm_fallback_budget = 3
 
@@ -452,7 +515,7 @@ class CrawlerAgent:
 
             # --- Find faculty links for this org unit ---
             links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l)]
+            links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l) and not _looks_like_retired_url(l)]
             links = _rank_faculty_page_candidates(links)
             non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
             if non_showcase:
@@ -472,7 +535,7 @@ class CrawlerAgent:
                 links = self._links_from_result(result.content)
                 if not links:
                     links = self._links_from_tool_call_log(result, tool_name="extract_links")
-                links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l)]
+                links = [l for l in self.fetcher.filter_same_domain(links, self.start_url) if not _is_faculty_platform(l) and not _looks_like_retired_url(l)]
                 links = _rank_faculty_page_candidates(links)
                 non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
                 if non_showcase:
@@ -496,7 +559,7 @@ class CrawlerAgent:
     async def _find_faculty_pages(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
         faculty_links: list[_QueuedUrl] = []
-        max_links_per_org_unit = 3
+        max_links_per_org_unit = 8
         skills = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
         llm_fallback_budget = 3
 
@@ -542,7 +605,7 @@ class CrawlerAgent:
             links = [
                 l
                 for l in self.fetcher.filter_same_domain(links, self.start_url)
-                if not _is_faculty_platform(l)
+                if not _is_faculty_platform(l) and not _looks_like_retired_url(l)
             ]
             links = _rank_faculty_page_candidates(links)
             non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
@@ -575,7 +638,7 @@ class CrawlerAgent:
                 links = [
                     l
                     for l in self.fetcher.filter_same_domain(links, self.start_url)
-                    if not _is_faculty_platform(l)
+                    if not _is_faculty_platform(l) and not _looks_like_retired_url(l)
                 ]
                 links = _rank_faculty_page_candidates(links)
                 non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
@@ -703,45 +766,38 @@ class CrawlerAgent:
                 fetched = await self._fetch_url(current.url, current.depth)
                 if fetched is None:
                     continue
+                if self._is_retired_page(fetched):
+                    self.logger.info("Skip retired faculty page url=%s", fetched.url)
+                    continue
 
-                saved_before = self.saved_professors
-                result = await self._ask_llm(
-                    CrawlerState.EXTRACT_PROFESSORS,
-                    "Extract public professor records and call save_professors when records are found. "
-                    f"Use org_unit_name={current.label!r}. Set source_url to the current page URL. "
-                    "If this is a paginated list, also return pagination links (next page, page 2, etc.).",
+                saved_delta = await self._extract_professors_from_page(
+                    current,
                     fetched,
                     skills,
+                    detail_mode=False,
                 )
-
-                tool_saved = False
-                for record in result.tool_call_log:
-                    if record.name == "save_professors":
-                        saved = int(record.result.get("saved", 0)) if isinstance(record.result, dict) else 0
-                        self.saved_professors += saved
-                        if saved > 0:
-                            tool_saved = True
-
-                if not tool_saved:
-                    await self._save_professors_from_content(result.content, current.label or "Unknown")
-
-                saved_delta = self.saved_professors - saved_before
-                if saved_delta <= 0:
-                    followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-                    for link in followups[:3]:
-                        if link in self.visited_urls:
-                            continue
-                        next_depth = current.depth + 1
-                        if not self._within_depth(next_depth):
-                            continue
-                        pages_to_process.append(
-                            _QueuedUrl(
-                                url=link,
-                                depth=next_depth,
-                                label=current.label,
-                                org_unit_id=current.org_unit_id,
-                            )
+                await self._enrich_profiles_with_httpx(current, fetched, skills)
+                followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
+                if saved_delta > 0 and followups:
+                    self.logger.debug(
+                        "Faculty page saved records but still following sub-pages for coverage url=%s followups=%s",
+                        fetched.url,
+                        len(followups),
+                    )
+                for link in followups[:10]:
+                    if link in self.visited_urls:
+                        continue
+                    next_depth = current.depth + 1
+                    if not self._within_depth(next_depth):
+                        continue
+                    pages_to_process.append(
+                        _QueuedUrl(
+                            url=link,
+                            depth=next_depth,
+                            label=current.label,
+                            org_unit_id=current.org_unit_id,
                         )
+                    )
 
                 pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
                 for plink in pagination_links:
@@ -754,6 +810,331 @@ class CrawlerAgent:
                                 org_unit_id=current.org_unit_id,
                             )
                         )
+
+    async def _extract_professors_from_page(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        skills: str,
+        *,
+        detail_mode: bool,
+    ) -> int:
+        saved_before = self.saved_professors
+        if detail_mode:
+            instruction = (
+                "Extract professor records from this detail page and call save_professors when records are found. "
+                f"Use org_unit_name={current.label!r}. Set source_url to the current page URL. "
+                "Prioritize fields: email, phone, research_areas. "
+                "Only save records that include at least one of email/phone/research_areas. "
+                "If this page only contains category/list names without these fields, do not save placeholders. "
+                "Do not include retired/emeritus/离退休/荣休 records."
+            )
+        else:
+            instruction = (
+                "Extract public professor records and call save_professors when records are found. "
+                f"Use org_unit_name={current.label!r}. Set source_url to the current page URL. "
+                "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
+                "Do not include retired/emeritus/离退休/荣休 records."
+            )
+        result = await self._ask_llm(
+            CrawlerState.EXTRACT_PROFESSORS,
+            instruction,
+            fetched,
+            skills,
+        )
+
+        tool_saved = False
+        for record in result.tool_call_log:
+            if record.name == "save_professors":
+                saved = int(record.result.get("saved", 0)) if isinstance(record.result, dict) else 0
+                self.saved_professors += saved
+                if saved > 0:
+                    tool_saved = True
+
+        if not tool_saved:
+            await self._save_professors_from_content(result.content, current.label or "Unknown")
+
+        return self.saved_professors - saved_before
+
+    async def _enrich_profiles_with_httpx(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
+        if not self._is_interactive or not self.detail_enrich_enabled:
+            return
+        if self.detail_fetch_backend != "httpx":
+            return
+        if self._detail_fetcher is None:
+            return
+
+        org_unit_key = self._detail_org_unit_key(current)
+        processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
+        remaining = self.detail_profile_hard_cap_per_org_unit - processed
+        if remaining <= 0:
+            self.logger.debug(
+                "Detail enrichment cap reached org_unit=%s cap=%s",
+                current.label or "Unknown",
+                self.detail_profile_hard_cap_per_org_unit,
+            )
+            return
+
+        candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
+        if not candidates:
+            return
+
+        pending: list[str] = []
+        for link in candidates:
+            if len(pending) >= remaining:
+                break
+            if link in self._detail_visited_urls or link in self.visited_urls:
+                continue
+            self._detail_visited_urls.add(link)
+            pending.append(link)
+        if not pending:
+            return
+        self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
+
+        consecutive_failures = 0
+        failed_urls: list[str] = []
+        while pending:
+            link = pending.pop(0)
+            if _looks_like_retired_url(link):
+                continue
+            try:
+                detail_fetched = await self._detail_fetcher.fetch(link)
+            except Exception as error:
+                self.logger.debug("Detail httpx fetch failed url=%s error=%s", link, error)
+                consecutive_failures += 1
+                failed_urls.append(link)
+                if consecutive_failures >= self.detail_failure_threshold:
+                    switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
+                    if switched:
+                        self.logger.info(
+                            "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
+                            current.label or "Unknown",
+                            len(failed_urls),
+                            len(pending),
+                        )
+                    consecutive_failures = 0
+                    failed_urls = []
+                continue
+
+            if self._is_failed_detail_fetch(detail_fetched):
+                consecutive_failures += 1
+                failed_urls.append(link)
+                if consecutive_failures >= self.detail_failure_threshold:
+                    switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
+                    if switched:
+                        self.logger.info(
+                            "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
+                            current.label or "Unknown",
+                            len(failed_urls),
+                            len(pending),
+                        )
+                    consecutive_failures = 0
+                    failed_urls = []
+                continue
+
+            consecutive_failures = 0
+            failed_urls = []
+
+            clean_url = _sanitize_url(detail_fetched.url)
+            if clean_url:
+                self.visited_urls.add(clean_url)
+            if self._is_retired_page(detail_fetched):
+                self.logger.info("Skip retired detail page url=%s", detail_fetched.url)
+                continue
+
+            await self._extract_professors_from_page(
+                current,
+                detail_fetched,
+                skills,
+                detail_mode=True,
+            )
+
+    async def _handle_detail_failure_decision(
+        self,
+        current: _QueuedUrl,
+        failed_urls: list[str],
+        skills: str,
+    ) -> bool:
+        if not hasattr(self.fetcher, "request_decision") or not hasattr(self.fetcher, "wait_decision"):
+            return False
+        urls = list(dict.fromkeys(failed_urls))
+        if not urls:
+            return False
+        decision = await self.fetcher.request_decision(  # type: ignore[attr-defined]
+            kind="detail_fetch_failure",
+            org_unit_name=current.label or "Unknown",
+            failure_count=len(failed_urls),
+            sample_urls=urls[:3],
+            suggested_action="switch_failed_to_human",
+        )
+        action = await self.fetcher.wait_decision(decision.id)  # type: ignore[attr-defined]
+        if action != "switch_failed_to_human":
+            return False
+        self.logger.info(
+            "Switching failed detail links to human for org_unit=%s urls=%s",
+            current.label or "Unknown",
+            len(urls),
+        )
+        await self._process_detail_urls_with_human(urls, current, skills)
+        return True
+
+    async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
+        next_depth = current.depth + 1
+        if not self._within_depth(next_depth):
+            return
+        for url in urls:
+            if url in self.visited_urls:
+                continue
+            fetched = await self._fetch_url(url, next_depth)
+            if fetched is None:
+                continue
+            if self._is_retired_page(fetched):
+                self.logger.info("Skip retired human detail page url=%s", fetched.url)
+                continue
+            await self._extract_professors_from_page(
+                current,
+                fetched,
+                skills,
+                detail_mode=True,
+            )
+
+    def _extract_detail_profile_links(self, links: list[str], current_url: str) -> list[str]:
+        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
+        current_parsed = urlparse(current_url)
+        current_host = (current_parsed.hostname or "").lower()
+        current_path = current_parsed.path.lower()
+        current_dir = self._derive_section_prefix(current_path)
+
+        detail_hints = (
+            "/info/",
+            "/teacher/",
+            "/teachers/",
+            "/faculty/",
+            "/people/",
+            "/show",
+            "/detail",
+            "/profile",
+            "/mentor",
+            "teacher",
+            "faculty",
+            "people",
+            "profile",
+            "detail",
+            "show",
+        )
+        section_hints = ("/szdw/", "/team/", "/staff/", "/jsdw/")
+        noise_hints = (
+            "/gywm/",
+            "/djgz/",
+            "/rcpy/",
+            "/pxfz/",
+            "/zsjy/",
+            "/xsgz/",
+            "/kxyj/",
+            "/xwzx/",
+            "/news/",
+            "/notice/",
+            "/tzgg/",
+            "/download/",
+            "/about/",
+            "/intro/",
+            "/history/",
+            "/leader/",
+            "/lxdh/",
+            "/index",
+        )
+        file_ext_hints = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar")
+
+        candidates: list[str] = []
+        for link in same_domain:
+            if link == current_url:
+                continue
+            if _is_faculty_platform(link) or _is_pagination_link(link):
+                continue
+            if _looks_like_retired_url(link):
+                continue
+            parsed = urlparse(link)
+            host = (parsed.hostname or "").lower()
+            if current_host and host != current_host:
+                continue
+            lowered = link.lower()
+            if any(token in lowered for token in noise_hints):
+                continue
+            if any(lowered.endswith(ext) for ext in file_ext_hints):
+                continue
+            path = parsed.path.lower()
+            related_by_path = False
+            if current_dir:
+                prefix = current_dir.rstrip("/")
+                related_by_path = bool(prefix and path.startswith(prefix + "/"))
+            related_by_hint = any(token in lowered for token in detail_hints)
+            if not related_by_path and not related_by_hint:
+                continue
+            candidates.append(link)
+
+        def _score(url: str) -> tuple[int, int]:
+            lowered = url.lower()
+            depth = max(0, urlparse(url).path.count("/") - 1)
+            score = depth
+            if current_dir and urlparse(url).path.lower().startswith(current_dir.rstrip("/") + "/"):
+                score += 4
+            if any(token in lowered for token in detail_hints):
+                score += 4
+            if any(token in lowered for token in section_hints):
+                score += 2
+            if any(token in lowered for token in noise_hints):
+                score -= 6
+            return score, -len(url)
+
+        ranked = sorted(candidates, key=_score, reverse=True)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for link in ranked:
+            if link in seen:
+                continue
+            if _score(link)[0] < 3:
+                continue
+            seen.add(link)
+            deduped.append(link)
+        return deduped
+
+    def _detail_org_unit_key(self, current: _QueuedUrl) -> str:
+        if current.org_unit_id is not None:
+            return f"id:{current.org_unit_id}"
+        label = (current.label or "").strip().lower()
+        if label:
+            return f"label:{label}"
+        return f"url:{_sanitize_url(current.url)}"
+
+    @staticmethod
+    def _derive_section_prefix(path: str) -> str:
+        normalized = (path or "").strip().lower()
+        if not normalized:
+            return ""
+        parent, _, leaf = normalized.rpartition("/")
+        if leaf.endswith((".htm", ".html", ".shtml")):
+            stem = leaf.rsplit(".", 1)[0]
+            if stem:
+                return f"{parent}/{stem}" if parent else f"/{stem}"
+        if parent:
+            return parent
+        return normalized
+
+    def _is_failed_detail_fetch(self, fetched: FetchResult) -> bool:
+        if fetched.block_reason:
+            return True
+        if fetched.status_code in {0, 202, 429, 503}:
+            return True
+        if fetched.status_code >= 400:
+            return True
+        if len((fetched.text or "").strip()) < 160 and len(fetched.links) < 2:
+            return True
+        return False
+
+    def _is_retired_page(self, fetched: FetchResult) -> bool:
+        if _looks_like_retired_url(fetched.url):
+            return True
+        return _looks_like_retired_content(fetched.text, fetched.url)
 
     async def _ask_llm(
         self,
@@ -1143,7 +1524,44 @@ class CrawlerAgent:
 
     def _extract_followup_faculty_links(self, links: list[str], current_url: str) -> list[str]:
         same_domain = self.fetcher.filter_same_domain(links, self.start_url)
-        candidates = [link for link in same_domain if link != current_url and not _is_faculty_platform(link)]
+        current_host = (urlparse(current_url).hostname or "").lower()
+        current_path = urlparse(current_url).path.lower()
+        current_dir = self._derive_section_prefix(current_path)
+        noise_hints = (
+            "/gywm/",
+            "/djgz/",
+            "/rcpy/",
+            "/pxfz/",
+            "/zsjy/",
+            "/xsgz/",
+            "/kxyj/",
+            "/xwzx/",
+            "/news/",
+            "/notice/",
+            "/tzgg/",
+            "/about/",
+            "/intro/",
+            "/history/",
+            "/leader/",
+            "/download/",
+            "/index",
+        )
+        candidates = [
+            link
+            for link in same_domain
+            if link != current_url
+            and not _is_faculty_platform(link)
+            and not _looks_like_retired_url(link)
+            and (not current_host or (urlparse(link).hostname or "").lower() == current_host)
+            and not any(token in link.lower() for token in noise_hints)
+            and (
+                _looks_like_faculty_page(link)
+                or (
+                    bool(current_dir)
+                    and urlparse(link).path.lower().startswith(current_dir.rstrip("/") + "/")
+                )
+            )
+        ]
         candidates = _rank_faculty_page_candidates(candidates)
         non_showcase = [link for link in candidates if not _is_academician_showcase_page(link)]
         if non_showcase:

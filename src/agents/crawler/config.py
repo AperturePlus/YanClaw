@@ -36,6 +36,10 @@ class CrawlerSettings(BaseSettings):
     human_server_host: str = "127.0.0.1"
     human_server_port: int = 21520
     human_job_timeout_seconds: float = 60.0
+    detail_enrich_enabled: bool = True
+    detail_fetch_backend: str = "httpx"
+    detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
+    detail_failure_threshold: int = Field(default=10, ge=1)
     crawl4ai_base_url: str = "http://localhost:10086"
     crawl4ai_api_token: str = ""
     crawl4ai_timeout_seconds: float = Field(default=120.0, gt=0)

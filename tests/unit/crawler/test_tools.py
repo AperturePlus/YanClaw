@@ -72,5 +72,14 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
         assert prof_b.email is None
         assert prof_b.phone is None
         assert prof_b.enrollment_pref == "PhD Supervisor"
+    retired_filtered = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/retired",
+        professors=[
+            {"name": "Prof C", "title": "Retired Professor"},
+        ],
+    )
+    assert retired_filtered == {"saved": 0, "filtered_retired": 1}
 
     await db.close()

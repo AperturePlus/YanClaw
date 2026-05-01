@@ -312,6 +312,10 @@ class CrawlDispatcher:
                         context_manager=ContextManager(self.settings.openai_model),
                         fetcher=effective_fetcher,
                         model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
+                        detail_enrich_enabled=self.settings.detail_enrich_enabled,
+                        detail_fetch_backend=self.settings.detail_fetch_backend,
+                        detail_profile_hard_cap_per_org_unit=self.settings.detail_profile_hard_cap_per_org_unit,
+                        detail_failure_threshold=self.settings.detail_failure_threshold,
                     )
                     return await agent.run()
 

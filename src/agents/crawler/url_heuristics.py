@@ -86,6 +86,53 @@ def _looks_like_faculty_page(url: str) -> bool:
     return bool(_keyword_filter([url], FACULTY_KEYWORDS))
 
 
+_ORG_UNIT_LISTING_STRONG_HINTS = (
+    "/yx.htm",
+    "/yxsz",
+    "/xysz",
+    "/jgsz",
+    "/zzjg",
+    "/xybm",
+    "/jxkydw",
+    "zuzhijigou",
+    "jiaoxuejigou",
+    "jiaoxuedanwei",
+    "yuanxishezhi",
+    "xueyuanshezhi",
+    "college",
+    "school",
+    "department",
+    "academy",
+    "xueyuan",
+    "yuanxi",
+)
+
+_ORG_UNIT_LISTING_NOISE_HINTS = (
+    "/xxgk/xxjj",
+    "/xxgk/ls",
+    "/xxgk/ld",
+    "/xxgk/xrld",
+    "/xygk/",
+    "/about",
+    "/overview",
+    "/intro",
+    "/history",
+    "/leader",
+    "/news",
+    "/notice",
+    "/jgbc",
+    "/ywdw",
+    "/jjjcjg",
+)
+
+
+def _looks_like_org_unit_listing_url(url: str) -> bool:
+    lowered = url.lower()
+    if any(token in lowered for token in _ORG_UNIT_LISTING_NOISE_HINTS):
+        return False
+    return any(token in lowered for token in _ORG_UNIT_LISTING_STRONG_HINTS)
+
+
 def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
     if not links:
         return []
@@ -146,6 +193,92 @@ def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
 def _is_academician_showcase_page(url: str) -> bool:
     lowered = url.lower()
     return any(token in lowered for token in ("lyys", "yuanshi", "academician", "yuan-shi"))
+
+
+_RETIRED_URL_HINTS = (
+    "ltx",
+    "ltxjs",
+    "ltxgz",
+    "ltgz",
+    "retired",
+    "emeritus",
+    "rongxiu",
+    "tuixiu",
+    "rxjzg",
+    "rxjs",
+    "laojiaoshi",
+)
+
+_RETIRED_TEXT_HINTS = (
+    "离退休",
+    "退休",
+    "荣休",
+    "退休教师",
+    "离休",
+    "退休人员",
+    "retired",
+    "emeritus",
+)
+
+
+_ACTIVE_TEXT_HINTS = (
+    "\u5728\u804c",
+    "\u4e13\u4efb\u6559\u5e08",
+    "\u73b0\u804c",
+    "\u5e08\u8d44\u961f\u4f0d",
+    "\u5e08\u8d44\u529b\u91cf",
+    "\u6559\u5e08\u540d\u5f55",
+    "\u5bfc\u5e08\u961f\u4f0d",
+    "\u7855\u5bfc",
+    "\u535a\u5bfc",
+    "teacher",
+    "faculty",
+    "professor",
+    "staff",
+    "mentor",
+    "supervisor",
+)
+
+
+def _looks_like_retired_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(token in lowered for token in _RETIRED_URL_HINTS) or any(token in url for token in _RETIRED_TEXT_HINTS)
+
+
+def _looks_like_retired_content(text: str, title_or_url: str = "") -> bool:
+    scope = (title_or_url or "").lower()
+    if any(token.lower() in scope for token in _RETIRED_TEXT_HINTS):
+        return True
+
+    snippet = (text or "")[:12000].lower()
+    if not snippet:
+        return False
+
+    # Focus on heading/intro text first. Mixed pages often contain both active and retired tabs.
+    lines = [line.strip().lower() for line in snippet.splitlines() if line.strip()]
+    head = "\n".join(lines[:40])
+
+    retired_head_hits = _count_hint_hits(head, _RETIRED_TEXT_HINTS)
+    active_head_hits = _count_hint_hits(head, _ACTIVE_TEXT_HINTS)
+    if retired_head_hits > 0 and active_head_hits == 0:
+        return True
+
+    retired_total_hits = _count_hint_hits(snippet, _RETIRED_TEXT_HINTS)
+    active_total_hits = _count_hint_hits(snippet, _ACTIVE_TEXT_HINTS)
+
+    # Require strong retired signal and no active signal to avoid false positives.
+    return retired_total_hits >= 3 and active_total_hits == 0
+
+
+def _count_hint_hits(text: str, hints: tuple[str, ...]) -> int:
+    if not text:
+        return 0
+    total = 0
+    for hint in hints:
+        token = hint.lower()
+        if token and token in text:
+            total += text.count(token)
+    return total
 
 
 def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str]:

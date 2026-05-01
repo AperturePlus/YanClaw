@@ -4,7 +4,7 @@ from typing import Any
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetchers import Fetcher
-from agents.crawler.sanitizer import sanitize_professor_payload
+from agents.crawler.sanitizer import contains_retired_hint, sanitize_professor_payload
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
 
@@ -129,9 +129,18 @@ def get_crawler_tools(
     ) -> dict[str, Any]:
         saved = 0
         academicians_saved = 0
+        filtered_retired = 0
         errors: list[str] = []
         for professor in professors:
             try:
+                if contains_retired_hint(
+                    professor.get("name"),
+                    professor.get("title"),
+                    professor.get("bio"),
+                    source_url,
+                ):
+                    filtered_retired += 1
+                    continue
                 cleaned, is_academician = sanitize_professor_payload(
                     professor,
                     org_unit_name=org_unit_name,
@@ -153,6 +162,8 @@ def get_crawler_tools(
         result: dict[str, Any] = {"saved": saved}
         if academicians_saved:
             result["academicians_saved"] = academicians_saved
+        if filtered_retired:
+            result["filtered_retired"] = filtered_retired
         if errors:
             result["errors"] = errors
         return result

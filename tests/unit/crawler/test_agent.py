@@ -277,6 +277,53 @@ async def test_agent_extracts_from_followup_faculty_pages_when_landing_page_has_
     await db.close()
 
 
+async def test_agent_still_follows_sub_faculty_links_after_saving_from_parent_page(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/landing"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/landing": FetchResult(
+            "https://www.example.edu.cn/cs/landing",
+            "faculty landing",
+            ["https://www.example.edu.cn/cs/software"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/software": FetchResult(
+            "https://www.example.edu.cn/cs/software",
+            "faculty software",
+            [],
+            200,
+        ),
+    }
+
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMWithFacultyFollowup(),
+        pages=pages,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 2
+    assert "https://www.example.edu.cn/cs/software" in fetcher.calls
+    await db.close()
+
+
 async def test_agent_refetches_successful_urls_for_incomplete_university(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     async with db.session() as session:
@@ -625,7 +672,7 @@ def test_is_core_academic_kind_and_priority():
     )
 
 
-async def test_extract_org_units_stops_early_after_enough_core_units(tmp_path):
+async def test_extract_org_units_keeps_processing_candidates_after_minimum_core_units(tmp_path):
     pages = {
         "https://www.example.edu.cn/xybm/bm.htm": FetchResult(
             "https://www.example.edu.cn/xybm/bm.htm",
@@ -701,6 +748,38 @@ async def test_extract_org_units_stops_early_after_enough_core_units(tmp_path):
 
     names = {u.name for u in units}
     assert {"CS", "EE", "Math"} <= names
-    # Once core units are enough, extractor should stop before spending time on xxgk page.
-    assert "https://www.example.edu.cn/xxgk/xxjj.htm" not in fetcher.calls
+    # Do not stop after only reaching a low minimum; continue scanning candidates for better coverage.
+    assert "https://www.example.edu.cn/xxgk/xxjj.htm" in fetcher.calls
+    await db.close()
+
+
+async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    links = [
+        "https://www.example.edu.cn/szdw/zzjs1/jjx.htm",
+        "https://www.example.edu.cn/gywm/jxdw1/jjx.htm",
+        "https://sub.example.edu.cn/info/1012/3958.htm",
+        "https://www.example.edu.cn/news/1234.htm",
+    ]
+    out = agent._extract_detail_profile_links(links, "https://www.example.edu.cn/szdw.htm")
+    assert "https://www.example.edu.cn/szdw/zzjs1/jjx.htm" in out
+    assert "https://www.example.edu.cn/gywm/jxdw1/jjx.htm" not in out
+    assert "https://sub.example.edu.cn/info/1012/3958.htm" not in out
+    assert "https://www.example.edu.cn/news/1234.htm" not in out
+    await db.close()
+
+
+async def test_followup_faculty_links_filter_noise_sections(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    links = [
+        "https://www.example.edu.cn/szdw/zzjs1.htm",
+        "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm",
+        "https://www.example.edu.cn/rcpy/sys.htm",
+        "https://sub.example.edu.cn/szdw/xx.htm",
+    ]
+    out = agent._extract_followup_faculty_links(links, "https://www.example.edu.cn/szdw.htm")
+    assert "https://www.example.edu.cn/szdw/zzjs1.htm" in out
+    assert "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm" not in out
+    assert "https://www.example.edu.cn/rcpy/sys.htm" not in out
+    assert "https://sub.example.edu.cn/szdw/xx.htm" not in out
     await db.close()
