@@ -51,6 +51,7 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
         max_concurrency=1,
         request_interval_seconds=0,
         max_retries=0,
+        fetcher_backend="httpx",
     )
     FakeAgent.active = 0
     FakeAgent.max_active = 0
@@ -95,6 +96,7 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
         request_interval_seconds=0,
         max_retries=0,
         university_timeout_seconds=0.5,
+        fetcher_backend="httpx",
     )
     dispatcher = CrawlDispatcher(settings=settings, agent_factory=SlowAgent)
     summary = await dispatcher.run(universities=["A"])
@@ -142,6 +144,7 @@ async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monke
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
+        fetcher_backend="httpx",
     )
 
     async def _raise_import_error(self, universities):
