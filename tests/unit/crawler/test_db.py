@@ -113,8 +113,8 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
         assert len(professors) == 1
         assert len(affiliations) == 2
         assert professors[0].email == "ada@testu.edu.cn"
-        assert professors[0].external_link == "https://cs.testu.edu.cn/ada"
-        assert professors[0].homepage is None
+        assert professors[0].external_link is None
+        assert professors[0].homepage == "https://cs.testu.edu.cn/ada"
         # Cross-org-unit merge should be conservative (do not overwrite existing title).
         assert professors[0].title == "教授"
         assert "Computer Science" in professors[0].org_unit_name
@@ -175,6 +175,7 @@ async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path)
                 title="",
                 email="",
                 phone="",
+                homepage="https://cs.example.edu.cn/info/1001/1.htm",
                 created_at=datetime.now(timezone.utc),
                 updated_at=datetime.now(timezone.utc),
             )
@@ -187,11 +188,12 @@ async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path)
         assert professor.title is None
         assert professor.email is None
         assert professor.phone is None
+        assert professor.homepage == "https://cs.example.edu.cn/info/1001/1.htm"
 
     await db.close()
 
 
-async def test_upsert_professor_homepage_is_source_url_and_external_link_is_personal_link(tmp_path):
+async def test_upsert_professor_assigns_external_link_without_overwriting_homepage_with_list_page(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "homepage_source.db"))
     await db.init_db()
 
@@ -209,8 +211,66 @@ async def test_upsert_professor_homepage_is_source_url_and_external_link_is_pers
 
     async with db.session() as session:
         professor = (await session.execute(select(Professor))).scalar_one()
-        assert professor.homepage == "https://cs.testu.edu.cn/szdw/ada.htm"
+        assert professor.homepage is None
         assert professor.external_link == "https://external.example.com/ada"
+
+    await db.close()
+
+
+async def test_upsert_professor_prefers_detail_homepage_and_prevents_downgrade_to_list_page(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "homepage_downgrade.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.testu.edu.cn/",
+                "source_url": "https://cs.testu.edu.cn/info/1001/1.htm",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.testu.edu.cn/",
+                "source_url": "https://cs.testu.edu.cn/szdw.htm",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        assert professor.homepage == "https://cs.testu.edu.cn/info/1001/1.htm"
+        affiliation = (await session.execute(select(ProfessorAffiliation))).scalar_one()
+        assert affiliation.source_url == "https://cs.testu.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_upsert_professor_separates_internal_homepage_and_external_link(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "homepage_external_split.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.testu.edu.cn/",
+                "source_url": "https://cs.testu.edu.cn/info/1001/1.htm",
+                "homepage": "https://cs.testu.edu.cn/info/1001/1.htm",
+                "external_link": "https://scholar.google.com/citations?user=ada",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        assert professor.homepage == "https://cs.testu.edu.cn/info/1001/1.htm"
+        assert professor.external_link == "https://scholar.google.com/citations?user=ada"
 
     await db.close()
 
