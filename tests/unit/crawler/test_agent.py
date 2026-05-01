@@ -763,21 +763,39 @@ def test_org_unit_priority_prefers_computing_and_electronics():
         url="https://history.scu.edu.cn/",
         id=1,
     )
+    computer_college = SimpleNamespace(
+        name="School of Computer Science",
+        kind="college",
+        url="https://cs.scu.edu.cn/",
+        id=2,
+    )
     software_college = SimpleNamespace(
         name="School of Software",
         kind="college",
         url="https://software.scu.edu.cn/",
-        id=2,
+        id=3,
+    )
+    ai_college = SimpleNamespace(
+        name="School of Artificial Intelligence",
+        kind="college",
+        url="https://ai.scu.edu.cn/",
+        id=4,
     )
     ece_college = SimpleNamespace(
         name="School of Electronic Information",
         kind="college",
         url="https://eie.scu.edu.cn/",
-        id=3,
+        id=5,
     )
 
+    assert _org_unit_faculty_priority(computer_college, start_host) < _org_unit_faculty_priority(
+        software_college, start_host
+    )
     assert _org_unit_faculty_priority(software_college, start_host) < _org_unit_faculty_priority(
-        generic_college, start_host
+        ai_college, start_host
+    )
+    assert _org_unit_faculty_priority(ai_college, start_host) < _org_unit_faculty_priority(
+        ece_college, start_host
     )
     assert _org_unit_faculty_priority(ece_college, start_host) < _org_unit_faculty_priority(
         generic_college, start_host

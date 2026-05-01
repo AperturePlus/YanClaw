@@ -373,28 +373,46 @@ def _is_core_academic_kind(kind: str | None) -> bool:
     return any(token in value for token in core_tokens)
 
 
-_FOCUS_DISCIPLINE_HIGH_HINTS = (
+_FOCUS_COMPUTER_HINTS = (
     "computer",
     "computing",
+    "computer science",
+    "\u8ba1\u7b97\u673a",  # 计算机
+    "\u8ba1\u7b97\u673a\u79d1\u5b66",  # 计算机科学
+)
+_FOCUS_COMPUTER_HOST_LABELS = {"cs", "cse", "computer", "computing"}
+_FOCUS_COMPUTER_ASCII_TERMS = {"cs", "cse"}
+
+_FOCUS_SOFTWARE_HINTS = (
     "software",
+    "software engineering",
+    "\u8f6f\u4ef6",  # 软件
+    "\u8f6f\u4ef6\u5de5\u7a0b",  # 软件工程
+)
+_FOCUS_SOFTWARE_HOST_LABELS = {"software", "se", "sse"}
+_FOCUS_SOFTWARE_ASCII_TERMS = {"software"}
+
+_FOCUS_AI_HINTS = (
+    "artificial intelligence",
+    "machine intelligence",
+    "\u4eba\u5de5\u667a\u80fd",  # 人工智能
+    "\u667a\u80fd\u79d1\u5b66",  # 智能科学
+)
+_FOCUS_AI_HOST_LABELS = {"ai", "iai", "aai"}
+_FOCUS_AI_ASCII_TERMS = {"ai"}
+
+_FOCUS_ELECTRONICS_HINTS = (
     "electronics",
     "electronic",
     "electrical",
     "microelectronics",
     "information engineering",
     "information science",
-    "\u8ba1\u7b97\u673a",  # 计算机
-    "\u8f6f\u4ef6",  # 软件
     "\u7535\u5b50\u4fe1\u606f",  # 电子信息
     "\u7535\u6c14\u5de5\u7a0b",  # 电气工程
     "\u5fae\u7535\u5b50",  # 微电子
 )
-
-_FOCUS_DISCIPLINE_HIGH_HOST_LABELS = {
-    "cs",
-    "cse",
-    "software",
-    "se",
+_FOCUS_ELECTRONICS_HOST_LABELS = {
     "ee",
     "ece",
     "eie",
@@ -402,27 +420,27 @@ _FOCUS_DISCIPLINE_HIGH_HOST_LABELS = {
     "electronics",
     "microelectronics",
 }
-
-_FOCUS_DISCIPLINE_MEDIUM_HINTS = (
-    "artificial intelligence",
-    "intelligence",
-    "cybersecurity",
-    "cyber security",
-    "security",
-    "network",
-    "communication",
-    "automation",
-    "robot",
-    "\u4eba\u5de5\u667a\u80fd",  # 人工智能
-    "\u7f51\u7edc\u5b89\u5168",  # 网络安全
-    "\u4fe1\u606f\u5de5\u7a0b",  # 信息工程
-    "\u901a\u4fe1",  # 通信
-    "\u81ea\u52a8\u5316",  # 自动化
-)
+_FOCUS_ELECTRONICS_ASCII_TERMS = {"ee", "ece", "eie"}
 
 
 def _ascii_terms(value: str) -> set[str]:
     return {term for term in re.split(r"[^a-z0-9]+", value.lower()) if term}
+
+
+def _matches_focus_bucket(
+    *,
+    text: str,
+    host_labels: set[str],
+    ascii_terms: set[str],
+    hint_tokens: tuple[str, ...],
+    host_tokens: set[str],
+    ascii_tokens: set[str],
+) -> bool:
+    if host_labels & host_tokens:
+        return True
+    if ascii_terms & ascii_tokens:
+        return True
+    return any(token in text for token in hint_tokens)
 
 
 def _org_unit_focus_rank(unit: OrgUnit) -> int:
@@ -436,16 +454,43 @@ def _org_unit_focus_rank(unit: OrgUnit) -> int:
     host_labels = {label for label in re.split(r"[.\-]+", host) if label}
     ascii_terms = _ascii_terms(f"{name} {kind} {path}")
 
-    if host_labels & _FOCUS_DISCIPLINE_HIGH_HOST_LABELS:
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_COMPUTER_HINTS,
+        host_tokens=_FOCUS_COMPUTER_HOST_LABELS,
+        ascii_tokens=_FOCUS_COMPUTER_ASCII_TERMS,
+    ):
         return 0
-    if any(token in text for token in _FOCUS_DISCIPLINE_HIGH_HINTS):
-        return 0
-    if any(token in text for token in _FOCUS_DISCIPLINE_MEDIUM_HINTS):
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_SOFTWARE_HINTS,
+        host_tokens=_FOCUS_SOFTWARE_HOST_LABELS,
+        ascii_tokens=_FOCUS_SOFTWARE_ASCII_TERMS,
+    ):
         return 1
-    if {"ai", "robotics"} & ascii_terms:
-        return 1
-    return 2
-
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_AI_HINTS,
+        host_tokens=_FOCUS_AI_HOST_LABELS,
+        ascii_tokens=_FOCUS_AI_ASCII_TERMS,
+    ):
+        return 2
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_ELECTRONICS_HINTS,
+        host_tokens=_FOCUS_ELECTRONICS_HOST_LABELS,
+        ascii_tokens=_FOCUS_ELECTRONICS_ASCII_TERMS,
+    ):
+        return 3
+    return 4
 
 def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int, int]:
     kind = (getattr(unit, "kind", "") or "").strip().lower()
@@ -625,4 +670,7 @@ def _dedupe_query_terms(query: str) -> str:
         seen.add(key)
         deduped.append(term)
     return " ".join(deduped)
+
+
+
 
