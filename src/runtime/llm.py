@@ -24,9 +24,17 @@ class ToolCallRecord:
 
 
 @dataclass
+class ToolCallErrorRecord:
+    name: str
+    raw_args_preview: str
+    error_type: str
+
+
+@dataclass
 class LLMResult:
     content: str
     tool_call_log: list[ToolCallRecord] = field(default_factory=list)
+    invalid_tool_calls: list[ToolCallErrorRecord] = field(default_factory=list)
 
 
 class LLMResponseError(RuntimeError):
@@ -84,6 +92,7 @@ class LLMClient:
         working_messages: list[dict[str, Any]] = list(messages)
         handlers = tool_handlers or {}
         records: list[ToolCallRecord] = []
+        invalid_calls: list[ToolCallErrorRecord] = []
         last_content = ""
 
         for round_index in range(1, self.max_rounds + 1):
@@ -115,7 +124,11 @@ class LLMClient:
             if content:
                 self.logger.debug("LLM response preview: %s", self._preview_text(content))
             if not tool_calls:
-                return LLMResult(content=last_content, tool_call_log=records)
+                return LLMResult(
+                    content=last_content,
+                    tool_call_log=records,
+                    invalid_tool_calls=invalid_calls,
+                )
 
             # Append assistant message (including provider-specific fields such as reasoning_content).
             working_messages.append(message)
@@ -128,6 +141,13 @@ class LLMClient:
                 args = self._parse_tool_arguments(raw_args)
                 if args is None:
                     self.logger.warning("Invalid JSON in tool arguments for %s: %s", name, str(raw_args)[:200])
+                    invalid_calls.append(
+                        ToolCallErrorRecord(
+                            name=name,
+                            raw_args_preview=str(raw_args)[:500],
+                            error_type="invalid_json",
+                        )
+                    )
                     working_messages.append(
                         {
                             "role": "tool",
@@ -166,10 +186,18 @@ class LLMClient:
             # Most crawler tools are "fire-and-forget" (persisting results). Avoid a second
             # LLM round to reduce latency and to prevent provider-specific requirements
             # (e.g. DeepSeek thinking mode requiring reasoning_content passback).
-            return LLMResult(content=last_content, tool_call_log=records)
+            return LLMResult(
+                content=last_content,
+                tool_call_log=records,
+                invalid_tool_calls=invalid_calls,
+            )
 
         self.logger.warning("LLM tool loop stopped after max_rounds=%s", self.max_rounds)
-        return LLMResult(content=last_content, tool_call_log=records)
+        return LLMResult(
+            content=last_content,
+            tool_call_log=records,
+            invalid_tool_calls=invalid_calls,
+        )
 
     async def _call_with_retry(self, **request: Any) -> Any:
         _RETRYABLE_CODES = {429, 500, 502, 503, 529}

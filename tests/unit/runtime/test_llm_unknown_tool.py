@@ -141,3 +141,33 @@ async def test_llm_client_repairs_truncated_tool_arguments():
     assert seen["org_unit_name"] == "School of Economics"
     assert seen["professors"][0]["name"] == "Zeng Zhongdong"
     assert seen["professors"][0]["research_areas"].startswith("Risk Management")
+
+
+async def test_llm_client_tracks_invalid_tool_arguments_when_unrecoverable():
+    raw_args = '{"org_unit_name":"School","professors":[{"name":"Ada"}], "broken": [{{'
+    responses = [
+        _chat_response(
+            content="need tool",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "save_professors",
+                        "arguments": raw_args,
+                    },
+                }
+            ],
+        )
+    ]
+    client = LLMClient("http://example", "key", "model", client=_Client(responses))
+
+    result = await client.chat(
+        [{"role": "user", "content": "test"}],
+        tools=[{"type": "function", "name": "save_professors"}],
+        tool_handlers={"save_professors": lambda **kwargs: {"saved": 0}},
+    )
+
+    assert result.tool_call_log == []
+    assert result.invalid_tool_calls
+    assert result.invalid_tool_calls[0].name == "save_professors"
