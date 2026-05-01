@@ -24,7 +24,7 @@ class CrawlerSettings(BaseSettings):
     max_retries: int = Field(default=3, ge=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
-    university_timeout_seconds: float = Field(default=1800.0, gt=0)
+    university_timeout_seconds: float = Field(default=3600.0, gt=0)
     model_max_tokens: int = Field(default=128000, gt=0)
     response_reserved_tokens: int = Field(default=2000, ge=0)
     log_dir: Path = Path("logs")
@@ -35,7 +35,7 @@ class CrawlerSettings(BaseSettings):
     fetcher_backend: str = "human"  # "human" (default), "hybrid", "httpx", "playwright", "curl_cffi", or "crawl4ai"
     human_server_host: str = "127.0.0.1"
     human_server_port: int = 21520
-    human_job_timeout_seconds: float = 300.0
+    human_job_timeout_seconds: float = 60.0
     crawl4ai_base_url: str = "http://localhost:10086"
     crawl4ai_api_token: str = ""
     crawl4ai_timeout_seconds: float = Field(default=120.0, gt=0)
