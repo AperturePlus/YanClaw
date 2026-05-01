@@ -5,6 +5,8 @@
 // @description  Human-assisted crawler frontend for Yanclaw
 // @match        *://*.edu.cn/*
 // @match        *://*.ac.cn/*
+// @exclude      *://dx.scu.edu.cn/*
+// @exclude      *://mail.scu.edu.cn/*
 // @connect      127.0.0.1
 // @connect      localhost
 // @grant        GM_addStyle
@@ -23,9 +25,19 @@
   var _GM_getValue = (() => typeof GM_getValue != "undefined" ? GM_getValue : void 0)();
   var _GM_setValue = (() => typeof GM_setValue != "undefined" ? GM_setValue : void 0)();
   var _GM_xmlhttpRequest = (() => typeof GM_xmlhttpRequest != "undefined" ? GM_xmlhttpRequest : void 0)();
+  const BLOCKED_HOSTS = new Set([
+    "dx.scu.edu.cn",
+    "mail.scu.edu.cn"
+  ]);
+  function isAssistantBlockedHost(hostname = window.location.hostname) {
+    return BLOCKED_HOSTS.has((hostname || "").toLowerCase());
+  }
   const API_BASE = "http://127.0.0.1:21520/api";
   const TIMEOUT = 1e4;
   function request(method, path, data) {
+    if (isAssistantBlockedHost()) {
+      return Promise.resolve(null);
+    }
     return new Promise((resolve, reject) => {
       _GM_xmlhttpRequest({
         method,
@@ -548,13 +560,15 @@
       notify();
     });
   }
-  mountToast();
-  mountPanel();
-  subscribe(renderPanel);
-  recoverState().then(() => {
-    renderPanel();
-    startPolling();
-    startAutoWatcher();
-  });
+  if (!isAssistantBlockedHost()) {
+    mountToast();
+    mountPanel();
+    subscribe(renderPanel);
+    recoverState().then(() => {
+      renderPanel();
+      startPolling();
+      startAutoWatcher();
+    });
+  }
 
 })();

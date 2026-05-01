@@ -11,6 +11,7 @@ export default defineConfig({
         version: '1.0.0',
         description: 'Human-assisted crawler frontend for Yanclaw',
         match: ['*://*.edu.cn/*', '*://*.ac.cn/*'],
+        exclude: ['*://dx.scu.edu.cn/*', '*://mail.scu.edu.cn/*'],
         grant: ['GM_xmlhttpRequest', 'GM_addStyle', 'GM_setValue', 'GM_getValue'],
         connect: ['127.0.0.1', 'localhost'],
       },

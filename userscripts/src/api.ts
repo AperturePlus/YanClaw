@@ -1,10 +1,14 @@
 import { GM_xmlhttpRequest } from '$';
+import { isAssistantBlockedHost } from './hostPolicy';
 import type { CompleteResponse, FetchJob, PendingDecision, StatusResponse } from './types';
 
 const API_BASE = 'http://127.0.0.1:21520/api';
 const TIMEOUT = 10_000;
 
 function request<T>(method: string, path: string, data?: unknown): Promise<T | null> {
+  if (isAssistantBlockedHost()) {
+    return Promise.resolve(null);
+  }
   return new Promise((resolve, reject) => {
     GM_xmlhttpRequest({
       method: method as 'GET' | 'POST',
