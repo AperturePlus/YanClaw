@@ -90,7 +90,7 @@ class CrawlerAgent:
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
         detail_enrich_enabled: bool = True,
-        detail_fetch_backend: str = "httpx",
+        detail_fetch_backend: str = "human",
         detail_profile_hard_cap_per_org_unit: int = 200,
         detail_failure_threshold: int = 10,
     ) -> None:
@@ -776,7 +776,7 @@ class CrawlerAgent:
                     skills,
                     detail_mode=False,
                 )
-                await self._enrich_profiles_with_httpx(current, fetched, skills)
+                await self._enrich_profiles_with_detail_backend(current, fetched, skills)
                 followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
                 if saved_delta > 0 and followups:
                     self.logger.debug(
@@ -856,11 +856,49 @@ class CrawlerAgent:
 
         return self.saved_professors - saved_before
 
-    async def _enrich_profiles_with_httpx(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
+    async def _enrich_profiles_with_detail_backend(
+        self, current: _QueuedUrl, fetched: FetchResult, skills: str
+    ) -> None:
         if not self._is_interactive or not self.detail_enrich_enabled:
             return
-        if self.detail_fetch_backend != "httpx":
+        if self.detail_fetch_backend == "human":
+            await self._enrich_profiles_with_human(current, fetched, skills)
             return
+        if self.detail_fetch_backend == "httpx":
+            await self._enrich_profiles_with_httpx(current, fetched, skills)
+            return
+        self.logger.debug("Unsupported detail backend=%s; skip detail enrichment", self.detail_fetch_backend)
+
+    async def _enrich_profiles_with_human(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
+        org_unit_key = self._detail_org_unit_key(current)
+        processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
+        remaining = self.detail_profile_hard_cap_per_org_unit - processed
+        if remaining <= 0:
+            self.logger.debug(
+                "Detail enrichment cap reached org_unit=%s cap=%s",
+                current.label or "Unknown",
+                self.detail_profile_hard_cap_per_org_unit,
+            )
+            return
+
+        candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
+        if not candidates:
+            return
+
+        pending: list[str] = []
+        for link in candidates:
+            if len(pending) >= remaining:
+                break
+            if link in self._detail_visited_urls or link in self.visited_urls:
+                continue
+            self._detail_visited_urls.add(link)
+            pending.append(link)
+        if not pending:
+            return
+        self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
+        await self._process_detail_urls_with_human(pending, current, skills)
+
+    async def _enrich_profiles_with_httpx(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
         if self._detail_fetcher is None:
             return
 
