@@ -105,6 +105,8 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
         assert len(professors) == 1
         assert len(affiliations) == 2
         assert professors[0].email == "ada@testu.edu.cn"
+        assert professors[0].external_link == "https://cs.testu.edu.cn/ada"
+        assert professors[0].homepage is None
         # Cross-org-unit merge should be conservative (do not overwrite existing title).
         assert professors[0].title == "教授"
         assert "Computer Science" in professors[0].org_unit_name
@@ -177,5 +179,51 @@ async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path)
         assert professor.title is None
         assert professor.email is None
         assert professor.phone is None
+
+    await db.close()
+
+
+async def test_upsert_professor_homepage_is_source_url_and_external_link_is_personal_link(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "homepage_source.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://cs.testu.edu.cn/",
+                "homepage": "https://external.example.com/ada",
+                "source_url": "https://cs.testu.edu.cn/szdw/ada.htm",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        assert professor.homepage == "https://cs.testu.edu.cn/szdw/ada.htm"
+        assert professor.external_link == "https://external.example.com/ada"
+
+    await db.close()
+
+
+async def test_get_or_create_org_unit_dedupes_same_name_with_different_urls(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "org_unit_name.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.get_or_create_org_unit(
+            session,
+            name="经济学院",
+            url="https://econ1.testu.edu.cn/",
+            kind="college",
+        )
+        second = await crawler_db.get_or_create_org_unit(
+            session,
+            name="经济学院",
+            url="https://econ2.testu.edu.cn/",
+            kind="college",
+        )
+        assert first.id == second.id
 
     await db.close()
