@@ -4,6 +4,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agents.crawler.url_heuristics import (
+    _is_explicit_faculty_directory_url,
     _is_faculty_platform,
     _is_non_faculty_noise_url,
     _is_pagination_link,
@@ -202,6 +203,7 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
     current_host = (current_parsed.hostname or "").lower()
     current_path = current_parsed.path.lower()
     current_dir = self._derive_section_prefix(current_path)
+    current_is_noise = _is_non_faculty_noise_url(current_url)
 
     detail_hints = (
         "/info/",
@@ -237,6 +239,8 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
     )
     file_ext_hints = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar")
 
+    dropped_noise = 0
+    dropped_parent_noise = 0
     candidates: list[str] = []
     for link in same_domain:
         if link == current_url:
@@ -246,6 +250,7 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
         if _looks_like_retired_url(link):
             continue
         if _is_non_faculty_noise_url(link):
+            dropped_noise += 1
             continue
         parsed = urlparse(link)
         host = (parsed.hostname or "").lower()
@@ -262,9 +267,26 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
             prefix = current_dir.rstrip("/")
             related_by_path = bool(prefix and path.startswith(prefix + "/"))
         related_by_hint = any(token in lowered for token in detail_hints)
+        # If current page is noise, avoid same-directory fan-out unless target is explicit faculty directory.
+        if current_is_noise and related_by_path and not _is_explicit_faculty_directory_url(link):
+            dropped_parent_noise += 1
+            continue
         if not related_by_path and not related_by_hint:
             continue
         candidates.append(link)
+
+    if dropped_noise:
+        self._pipeline_stats["detail_links_dropped_noise"] = int(self._pipeline_stats.get("detail_links_dropped_noise", 0)) + dropped_noise
+    if dropped_parent_noise:
+        self._pipeline_stats["detail_links_dropped_noise"] = int(self._pipeline_stats.get("detail_links_dropped_noise", 0)) + dropped_parent_noise
+    if dropped_noise or dropped_parent_noise:
+        self.logger.debug(
+            "Detail links filtered current=%s kept=%s dropped_noise=%s dropped_parent_noise=%s drop_reason=url_noise_token",
+            current_url,
+            len(candidates),
+            dropped_noise,
+            dropped_parent_noise,
+        )
 
     def _score(url: str) -> tuple[int, int]:
         lowered = url.lower()

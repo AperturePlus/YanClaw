@@ -24,7 +24,7 @@ class CrawlerSettings(BaseSettings):
     max_retries: int = Field(default=3, ge=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
-    university_timeout_seconds: float = Field(default=3600.0, gt=0)
+    university_timeout_seconds: float = Field(default=36000.0, gt=0)
     model_max_tokens: int = Field(default=128000, gt=0)
     response_reserved_tokens: int = Field(default=2000, ge=0)
     log_dir: Path = Path("logs")

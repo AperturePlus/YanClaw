@@ -117,16 +117,92 @@ _FACULTY_NOISE_URL_HINTS = (
     "/download/",
 )
 
+_FACULTY_NOISE_TOKEN_HINTS = frozenset(
+    {
+        "news",
+        "xwzx",
+        "notice",
+        "tzgg",
+        "gonggao",
+        "announcement",
+        "events",
+        "event",
+        "rczp",
+        "zhaopin",
+        "jobs",
+        "job",
+        "hr",
+        "renshi",
+        "rsrc",
+        "rsc",
+        "rszc",
+        "personnel",
+        "policy",
+        "zcwj",
+        "rule",
+        "rules",
+        "regulation",
+        "dangjian",
+        "party",
+        "student",
+        "xsgz",
+        "zsjy",
+        "download",
+    }
+)
+
+_FACULTY_NOISE_STEM_HINTS = frozenset({"rszc", "tzgg", "xwzx", "rczp", "zcwj", "renshi", "policy"})
+
+_EXPLICIT_FACULTY_DIR_HINTS = (
+    "/faculty/",
+    "/facultylist",
+    "/teacher/",
+    "/teachers/",
+    "/teacherlist",
+    "/staff/",
+    "/people/",
+    "/jsdw/",
+    "/szll",
+    "/qzjs",
+    "/mentor",
+    "/supervisor",
+    "/jzg",
+)
+
+
+def _iter_url_noise_tokens(url: str) -> list[str]:
+    parsed = urlparse(url.lower())
+    text = " ".join((parsed.path or "", parsed.query or "", parsed.fragment or ""))
+    return [token for token in re.split(r"[^a-z0-9]+", text) if token]
+
+
+def _matches_noise_stem(token: str) -> bool:
+    for stem in _FACULTY_NOISE_STEM_HINTS:
+        if not token.startswith(stem):
+            continue
+        suffix = token[len(stem) :]
+        if not suffix or suffix.isdigit():
+            return True
+    return False
+
 
 def _is_non_faculty_noise_url(url: str) -> bool:
     lowered = url.lower()
     if any(token in lowered for token in _FACULTY_NOISE_URL_HINTS):
         return True
+    for token in _iter_url_noise_tokens(lowered):
+        if token in _FACULTY_NOISE_TOKEN_HINTS or _matches_noise_stem(token):
+            return True
     # Dated news/article URLs are usually irrelevant for faculty extraction.
     path = urlparse(lowered).path
     if re.search(r"/20\d{2}/\d{2}(/\d{2})?/", path):
         return True
     return False
+
+
+def _is_explicit_faculty_directory_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(token in lowered for token in _EXPLICIT_FACULTY_DIR_HINTS)
 
 
 _ORG_UNIT_LISTING_STRONG_HINTS = (

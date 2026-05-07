@@ -9,6 +9,7 @@ from agents.crawler.url_heuristics import (
     _dedupe_query_terms,
     _extract_urls_from_text,
     _is_academician_showcase_page,
+    _is_explicit_faculty_directory_url,
     _is_non_faculty_noise_url,
     _is_faculty_platform,
     _is_pagination_link,
@@ -35,24 +36,49 @@ def extract_followup_faculty_links(self: Any, links: list[str], current_url: str
     current_host = (urlparse(current_url).hostname or "").lower()
     current_path = urlparse(current_url).path.lower()
     current_dir = self._derive_section_prefix(current_path)
+    current_is_noise = _is_non_faculty_noise_url(current_url)
     noise_hints = ("/gywm/", "/djgz/", "/rcpy/", "/pxfz/", "/about/", "/intro/", "/history/", "/leader/", "/index")
-    candidates = [
-        link
-        for link in same_domain
-        if link != current_url
-        and not _is_faculty_platform(link)
-        and not _looks_like_retired_url(link)
-        and not _is_non_faculty_noise_url(link)
-        and (not current_host or (urlparse(link).hostname or "").lower() == current_host)
-        and not any(token in link.lower() for token in noise_hints)
-        and (
-            _looks_like_faculty_page(link)
-            or (
-                bool(current_dir)
-                and urlparse(link).path.lower().startswith(current_dir.rstrip("/") + "/")
-            )
+    dropped_noise = 0
+    dropped_parent_noise = 0
+    candidates: list[str] = []
+    for link in same_domain:
+        if link == current_url:
+            continue
+        if _is_faculty_platform(link) or _looks_like_retired_url(link):
+            continue
+        if _is_non_faculty_noise_url(link):
+            dropped_noise += 1
+            continue
+        parsed = urlparse(link)
+        host = (parsed.hostname or "").lower()
+        if current_host and host != current_host:
+            continue
+        lowered = link.lower()
+        if any(token in lowered for token in noise_hints):
+            continue
+        related_by_path = bool(current_dir) and parsed.path.lower().startswith(current_dir.rstrip("/") + "/")
+        looks_like_faculty = _looks_like_faculty_page(link)
+        if not (looks_like_faculty or related_by_path):
+            continue
+        # If current page is already identified as noise, avoid directory-wide blind expansion.
+        if current_is_noise and related_by_path and not _is_explicit_faculty_directory_url(link):
+            dropped_parent_noise += 1
+            continue
+        candidates.append(link)
+
+    if dropped_noise:
+        self._pipeline_stats["followup_dropped_noise"] = int(self._pipeline_stats.get("followup_dropped_noise", 0)) + dropped_noise
+    if dropped_parent_noise:
+        self._pipeline_stats["followup_dropped_noise"] = int(self._pipeline_stats.get("followup_dropped_noise", 0)) + dropped_parent_noise
+    if dropped_noise or dropped_parent_noise:
+        self.logger.debug(
+            "Followup links filtered current=%s kept=%s dropped_noise=%s dropped_parent_noise=%s drop_reason=url_noise_token",
+            current_url,
+            len(candidates),
+            dropped_noise,
+            dropped_parent_noise,
         )
-    ]
+
     candidates = _rank_faculty_page_candidates(candidates)
     non_showcase = [link for link in candidates if not _is_academician_showcase_page(link)]
     if non_showcase:

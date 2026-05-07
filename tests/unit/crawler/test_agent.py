@@ -7,6 +7,7 @@ from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler.agent import (
+    CrawlerState,
     CrawlerAgent,
     _QueuedUrl,
     _dedupe_query_terms,
@@ -301,6 +302,138 @@ async def test_agent_pipeline_retries_invalid_json_once_then_saves(tmp_path):
     async with db.session() as session:
         failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
         assert any(f.failure_type == "invalid_json" and f.resolver == "retry" for f in failures)
+    await db.close()
+
+
+async def test_agent_build_llm_payload_trims_links_and_visited_fields(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    agent.visited_urls = {f"https://www.example.edu.cn/v/{i}" for i in range(100)}
+    links = [f"https://www.example.edu.cn/path/{i}" for i in range(120)]
+
+    discover_content, _ = agent._build_llm_payload(
+        state=CrawlerState.DISCOVER_ORG_UNIT_PAGES,
+        instruction="discover",
+        url="https://www.example.edu.cn/",
+        page_text="faculty list",
+        links=links,
+        allowed_tools={"extract_links"},
+    )
+    discover_payload = json.loads(discover_content)
+    assert "visited_urls" in discover_payload
+    assert "visited_count" in discover_payload
+    assert len(discover_payload["links"]) <= 40
+
+    org_content, _ = agent._build_llm_payload(
+        state=CrawlerState.EXTRACT_ORG_UNITS,
+        instruction="org",
+        url="https://www.example.edu.cn/orgs",
+        page_text="org page text",
+        links=links,
+        allowed_tools=set(),
+    )
+    org_payload = json.loads(org_content)
+    assert "visited_urls" not in org_payload
+    assert "visited_count" in org_payload
+    assert len(org_payload["links"]) <= 40
+
+    faculty_content, _ = agent._build_llm_payload(
+        state=CrawlerState.FIND_FACULTY_PAGES,
+        instruction="faculty",
+        url="https://www.example.edu.cn/cs",
+        page_text="faculty directory",
+        links=links,
+        allowed_tools={"extract_links"},
+    )
+    faculty_payload = json.loads(faculty_content)
+    assert len(faculty_payload["links"]) <= 30
+
+    extract_content, _ = agent._build_llm_payload(
+        state=CrawlerState.EXTRACT_PROFESSORS,
+        instruction="extract",
+        url="https://www.example.edu.cn/cs/faculty",
+        page_text="faculty profile",
+        links=links,
+        allowed_tools={"save_professors"},
+    )
+    extract_payload = json.loads(extract_content)
+    assert extract_payload["links"] == []
+    await db.close()
+
+
+async def test_agent_skips_noise_page_llm_but_keeps_followups(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/szdw/faculty_entry.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/szdw/faculty_entry.htm": FetchResult(
+            "https://www.example.edu.cn/cs/szdw/faculty_entry.htm",
+            "通知 公告 人事 政策",
+            ["https://www.example.edu.cn/cs/szdw/faculty.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/szdw/faculty.htm": FetchResult(
+            "https://www.example.edu.cn/cs/szdw/faculty.htm",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+
+    class TrackExtractUrlsLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_urls: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "FIND_FACULTY_PAGES":
+                return LLMResult('{"links": ["https://www.example.edu.cn/cs/szdw/faculty_entry.htm"]}')
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                self.extract_urls.append(payload.get("url", ""))
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    fetcher = FakeFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "skip_noise.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    llm = TrackExtractUrlsLLM()
+
+    agent = CrawlerAgent(
+        university_name="SkipNoiseU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=llm,
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        min_org_units=1,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert "https://www.example.edu.cn/cs/szdw/faculty_entry.htm" not in llm.extract_urls
+    assert "https://www.example.edu.cn/cs/szdw/faculty.htm" in fetcher.calls
+    assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) >= 1
     await db.close()
 
 
@@ -892,6 +1025,7 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
         "https://www.example.edu.cn/news/1234.htm",
         "https://www.example.edu.cn/szdw/tzgg/202603/t20260315_1024.shtml",
         "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml",
+        "https://www.example.edu.cn/szdw/rszc/4.htm",
     ]
     out = agent._extract_detail_profile_links(links, "https://www.example.edu.cn/szdw.htm")
     assert "https://www.example.edu.cn/szdw/zzjs1/jjx.htm" in out
@@ -900,6 +1034,8 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
     assert "https://www.example.edu.cn/news/1234.htm" not in out
     assert "https://www.example.edu.cn/szdw/tzgg/202603/t20260315_1024.shtml" not in out
     assert "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml" not in out
+    assert "https://www.example.edu.cn/szdw/rszc/4.htm" not in out
+    assert int(agent._pipeline_stats.get("detail_links_dropped_noise", 0)) >= 1
     await db.close()
 
 
@@ -907,6 +1043,8 @@ async def test_followup_faculty_links_filter_noise_sections(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
     links = [
         "https://www.example.edu.cn/szdw/zzjs1.htm",
+        "https://www.example.edu.cn/szdw/rszc.htm",
+        "https://www.example.edu.cn/szdw/rszc/4.htm",
         "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm",
         "https://www.example.edu.cn/rcpy/sys.htm",
         "https://sub.example.edu.cn/szdw/xx.htm",
@@ -918,6 +1056,44 @@ async def test_followup_faculty_links_filter_noise_sections(tmp_path):
     assert "https://www.example.edu.cn/djgz1/lilubn/zzxx.htm" not in out
     assert "https://www.example.edu.cn/rcpy/sys.htm" not in out
     assert "https://sub.example.edu.cn/szdw/xx.htm" not in out
+    assert "https://www.example.edu.cn/szdw/rszc.htm" not in out
+    assert "https://www.example.edu.cn/szdw/rszc/4.htm" not in out
     assert "https://www.example.edu.cn/szdw/tzgg/list.htm" not in out
     assert "https://www.example.edu.cn/faculty/renshi/recruitment.htm" not in out
+    assert int(agent._pipeline_stats.get("followup_dropped_noise", 0)) >= 1
     await db.close()
+
+
+async def test_followup_from_noise_parent_keeps_explicit_faculty_dirs(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    links = [
+        "https://www.example.edu.cn/szdw/rszc/4.htm",
+        "https://www.example.edu.cn/szdw/rszc/3.htm",
+        "https://www.example.edu.cn/szdw/jsdw.htm",
+        "https://www.example.edu.cn/faculty/teacher_list.htm",
+    ]
+    out = agent._extract_followup_faculty_links(links, "https://www.example.edu.cn/szdw/rszc.htm")
+    assert "https://www.example.edu.cn/szdw/rszc/4.htm" not in out
+    assert "https://www.example.edu.cn/szdw/rszc/3.htm" not in out
+    assert "https://www.example.edu.cn/szdw/jsdw.htm" in out
+    assert "https://www.example.edu.cn/faculty/teacher_list.htm" in out
+    await db.close()
+
+
+async def test_professor_gate_skips_rszc_without_strong_faculty_evidence(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    skip, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/rszc.htm",
+        text="通知 公告 人事 政策",
+    )
+    assert skip
+    assert reason == "url_noise_token"
+
+    keep, keep_reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/rszc.htm",
+        text="张三 教授 邮箱 zhangsan@example.edu.cn 电话 12345678",
+    )
+    assert not keep
+    assert keep_reason == ""
+    await db.close()
+

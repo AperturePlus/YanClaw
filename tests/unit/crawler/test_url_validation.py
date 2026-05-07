@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from agents.crawler.agent import _is_category_name, _url_found_on_page
 from agents.crawler.url_heuristics import (
+    _is_non_faculty_noise_url,
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
 )
@@ -90,3 +91,14 @@ def test_org_unit_listing_url_filters_non_academic_pages():
     assert _looks_like_org_unit_listing_url("https://www.scu.edu.cn/zzjg1/yx.htm")
     assert not _looks_like_org_unit_listing_url("https://www.scu.edu.cn/xxgk/xxjj.htm")
     assert not _looks_like_org_unit_listing_url("https://www.scu.edu.cn/zzjg1/jgbc.htm")
+
+
+def test_non_faculty_noise_url_matches_rszc_variants():
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/rszc.htm")
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/rszc/4.htm")
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/rszc2.htm")
+
+
+def test_non_faculty_noise_url_does_not_block_regular_faculty_paths():
+    assert not _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/jsdw.htm")
+    assert not _is_non_faculty_noise_url("https://www.example.edu.cn/faculty/teacher_list.htm")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -188,6 +189,12 @@ class CrawlerAgent:
             "timed_tasks": 0,
             "average_task_ms": 0.0,
             "queue_depth": 0,
+            "llm_calls_total": 0,
+            "llm_calls_skipped_by_gate": 0,
+            "llm_payload_bytes_total": 0,
+            "avg_payload_bytes": 0.0,
+            "followup_dropped_noise": 0,
+            "detail_links_dropped_noise": 0,
         }
 
     @property
@@ -872,12 +879,23 @@ class CrawlerAgent:
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
                         continue
-                    await self._extract_professors_from_page(
-                        current,
-                        fetched,
-                        skills,
-                        detail_mode=False,
-                    )
+                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
+                    if skip_llm:
+                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
+                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
+                        ) + 1
+                        self.logger.debug(
+                            "Skip professor LLM extraction by gate url=%s reason=%s",
+                            fetched.url,
+                            skip_reason,
+                        )
+                    else:
+                        await self._extract_professors_from_page(
+                            current,
+                            fetched,
+                            skills,
+                            detail_mode=False,
+                        )
                     await self._enrich_profiles_with_detail_backend(current, fetched, skills)
                     followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
                     for link in followups[:10]:
@@ -937,14 +955,24 @@ class CrawlerAgent:
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
                         continue
-
-                    await self._enqueue_extraction_task(
-                        current,
-                        fetched,
-                        llm_queue=llm_queue,
-                        detail_mode=False,
-                        priority=0,
-                    )
+                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
+                    if skip_llm:
+                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
+                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
+                        ) + 1
+                        self.logger.debug(
+                            "Skip professor LLM enqueue by gate url=%s reason=%s",
+                            fetched.url,
+                            skip_reason,
+                        )
+                    else:
+                        await self._enqueue_extraction_task(
+                            current,
+                            fetched,
+                            llm_queue=llm_queue,
+                            detail_mode=False,
+                            priority=0,
+                        )
                     await self._enrich_profiles_with_detail_backend(current, fetched, skills)
 
                     followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
@@ -986,12 +1014,15 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s avg_task_ms=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
                 self._pipeline_stats.get("failed", 0),
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
+                self._pipeline_stats.get("llm_calls_total", 0),
+                self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
+                float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
             )
 
     async def _enqueue_extraction_task(
@@ -1006,8 +1037,8 @@ class CrawlerAgent:
         source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
         if not source_url:
             return
-        text_limit = 20000 if not detail_mode else 24000
-        snapshot = _truncate_middle(fetched.text or "", text_limit)
+        text_limit = self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode)
+        snapshot = self._compact_page_text(fetched.text or "", text_limit)
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
         allowed_tools = ["save_professors"]
         async with self.db.session() as session:
@@ -1020,7 +1051,7 @@ class CrawlerAgent:
                 page_url=source_url,
                 page_hash=page_hash,
                 page_text_snapshot=snapshot,
-                allowed_tools=json.dumps(allowed_tools, ensure_ascii=False),
+                allowed_tools=json.dumps(sorted(allowed_tools), ensure_ascii=False, separators=(",", ":")),
                 attempt=0,
                 priority=priority,
                 status=CrawlTaskStatus.PENDING,
@@ -1271,21 +1302,32 @@ class CrawlerAgent:
 
     async def _run_extraction_task(self, task: _ExtractionTaskItem, skills: str) -> _ExtractionOutcome:
         instruction = self._build_professor_instruction(task.org_unit_name, detail_mode=task.detail_mode, strict_retry=task.strict_retry)
-        tool_defs = [tool for tool in get_crawler_tool_definitions() if tool.get("name") in {"save_professors"}]
-        user_content = json.dumps(
-            {
-                "university": self.university_name,
-                "location": self.location,
-                "state": CrawlerState.EXTRACT_PROFESSORS.value,
-                "url": task.page_url or task.source_url,
-                "instruction": instruction,
-                "visited_urls": sorted(self.visited_urls)[-15:],
-                "links": [],
-                "page_text": task.page_text_snapshot,
-                "allowed_tools": ["save_professors"],
-                "tool_call_policy": "Only call save_professors. Keep output short and strict JSON.",
-            },
-            ensure_ascii=False,
+        allowed_tools = {"save_professors"}
+        tool_defs = [tool for tool in get_crawler_tool_definitions() if tool.get("name") in allowed_tools]
+        user_content, payload_meta = self._build_llm_payload(
+            state=CrawlerState.EXTRACT_PROFESSORS,
+            instruction=instruction,
+            url=task.page_url or task.source_url,
+            page_text=task.page_text_snapshot,
+            links=[],
+            allowed_tools=allowed_tools,
+            detail_mode=task.detail_mode,
+        )
+        self._record_llm_payload(int(payload_meta.get("payload_bytes", 0)))
+        self.logger.debug(
+            "LLM extraction payload task_id=%s url=%s raw_chars=%s compacted_chars=%s links_raw=%s links_kept=%s payload_bytes=%s",
+            task.task_id,
+            task.page_url or task.source_url,
+            payload_meta.get("raw_chars", 0),
+            payload_meta.get("compacted_chars", 0),
+            payload_meta.get("links_raw", 0),
+            payload_meta.get("links_kept", 0),
+            payload_meta.get("payload_bytes", 0),
+        )
+        dynamic_system_content = (
+            "Tool call policy: "
+            + self._build_tool_call_policy(allowed_tools)
+            + " Keep output short and strict JSON."
         )
         prompt_max_tokens = min(int(self.model_max_tokens), 16000)
         batches = self.context_manager.build_messages(
@@ -1294,6 +1336,7 @@ class CrawlerAgent:
             skills,
             user_content,
             prompt_max_tokens,
+            dynamic_system_content=dynamic_system_content,
         )
 
         captured_payloads: list[dict[str, Any]] = []
@@ -1406,6 +1449,209 @@ class CrawlerAgent:
         self._pipeline_stats["average_task_ms"] = ((total * timed) + elapsed_ms) / current
         self._pipeline_stats["timed_tasks"] = current
 
+    @staticmethod
+    def _state_link_limit(state: CrawlerState) -> int:
+        limits = {
+            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 40,
+            CrawlerState.EXTRACT_ORG_UNITS: 40,
+            CrawlerState.FIND_FACULTY_PAGES: 30,
+            CrawlerState.EXTRACT_PROFESSORS: 0,
+        }
+        return limits.get(state, 30)
+
+    @staticmethod
+    def _state_text_limit(state: CrawlerState, *, detail_mode: bool = False) -> int:
+        if detail_mode:
+            return 8000
+        limits = {
+            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 3000,
+            CrawlerState.EXTRACT_ORG_UNITS: 8000,
+            CrawlerState.FIND_FACULTY_PAGES: 6000,
+            CrawlerState.EXTRACT_PROFESSORS: 6000,
+        }
+        return limits.get(state, 6000)
+
+    def _compact_page_text(self, text: str, max_chars: int, *, min_chars: int = 300) -> str:
+        if max_chars <= 0 or not text:
+            return ""
+        compacted = self.context_manager.compact_text(text)
+        if compacted and len(compacted) > max_chars:
+            compacted = _truncate_middle(compacted, max_chars)
+
+        # Avoid over-filtering: fallback to middle truncation when compacted text is too short.
+        if not compacted or (len(compacted) < min(min_chars, max_chars // 2) and len(text) > len(compacted) * 2):
+            return _truncate_middle(text, max_chars)
+        return compacted
+
+    @staticmethod
+    def _serialize_payload(payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _build_tool_call_policy(allowed_tools: set[str]) -> str:
+        if not allowed_tools:
+            return "Do not call any tools."
+        names = sorted(allowed_tools)
+        if len(names) == 1:
+            return f"Only call {names[0]}. Do not invent tool names."
+        return f"Only call tools listed in allowed_tools ({', '.join(names)}). Do not invent tool names."
+
+    def _record_llm_payload(self, payload_bytes: int) -> None:
+        calls = int(self._pipeline_stats.get("llm_calls_total", 0)) + 1
+        total = int(self._pipeline_stats.get("llm_payload_bytes_total", 0)) + max(0, int(payload_bytes))
+        self._pipeline_stats["llm_calls_total"] = calls
+        self._pipeline_stats["llm_payload_bytes_total"] = total
+        self._pipeline_stats["avg_payload_bytes"] = float(total) / float(calls)
+
+    def _build_llm_payload(
+        self,
+        *,
+        state: CrawlerState,
+        instruction: str,
+        url: str,
+        page_text: str,
+        links: list[str],
+        allowed_tools: set[str],
+        detail_mode: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        raw_links = list(links or [])
+        same_domain_links = self.fetcher.filter_same_domain(raw_links, self.start_url) if raw_links else []
+        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.EXTRACT_ORG_UNITS}:
+            candidate_links = _keyword_filter(same_domain_links, ORG_UNIT_PAGE_KEYWORDS) or same_domain_links
+        elif state in {CrawlerState.FIND_FACULTY_PAGES, CrawlerState.EXTRACT_PROFESSORS}:
+            candidate_links = _keyword_filter(same_domain_links, FACULTY_KEYWORDS) or same_domain_links
+        else:
+            candidate_links = same_domain_links
+        link_limit = self._state_link_limit(state)
+        kept_links = candidate_links[:link_limit] if link_limit > 0 else []
+
+        text_limit = self._state_text_limit(state, detail_mode=detail_mode)
+        compacted_text = self._compact_page_text(page_text or "", text_limit)
+
+        payload: dict[str, Any] = {
+            "allowed_tools": sorted(allowed_tools),
+            "instruction": instruction,
+            "links": kept_links,
+            "location": self.location,
+            "page_text": compacted_text,
+            "state": state.value,
+            "university": self.university_name,
+            "url": url,
+            "visited_count": len(self.visited_urls),
+        }
+        if state is CrawlerState.DISCOVER_ORG_UNIT_PAGES:
+            payload["visited_urls"] = sorted(self.visited_urls)[-15:]
+
+        user_content = self._serialize_payload(payload)
+        payload_bytes = len(user_content.encode("utf-8", errors="ignore"))
+        metadata = {
+            "raw_chars": len(page_text or ""),
+            "compacted_chars": len(compacted_text),
+            "links_raw": len(raw_links),
+            "links_kept": len(kept_links),
+            "payload_bytes": payload_bytes,
+        }
+        return user_content, metadata
+
+    def _should_skip_professor_llm(self, *, url: str, text: str) -> tuple[bool, str]:
+        lowered_url = (url or "").lower()
+        lowered_text = (text or "").lower()
+
+        strong_noise_url_tokens = (
+            "/news",
+            "/notice",
+            "/tzgg",
+            "/gonggao",
+            "/announcement",
+            "/policy",
+            "/zcwj",
+            "/renshi",
+            "/rszc",
+            "/hr",
+            "/rczp",
+            "/zhaopin",
+            "/jobs",
+            "/dangjian",
+            "/party",
+            "/xsgz",
+            "/zsjy",
+        )
+        faculty_signal_tokens = (
+            "faculty",
+            "teacher",
+            "staff",
+            "professor",
+            "research",
+            "email",
+            "phone",
+            "导师",
+            "教师",
+            "师资",
+            "教授",
+            "副教授",
+            "讲师",
+            "研究员",
+            "邮箱",
+            "电话",
+            "研究方向",
+            "博导",
+            "硕导",
+        )
+        strong_faculty_evidence_tokens = (
+            "email",
+            "mail",
+            "phone",
+            "tel",
+            "professor",
+            "associate professor",
+            "assistant professor",
+            "lecturer",
+            "researcher",
+            "\u5bfc\u5e08",
+            "\u6559\u5e08",
+            "\u6559\u6388",
+            "\u526f\u6559\u6388",
+            "\u8bb2\u5e08",
+            "\u7814\u7a76\u5458",
+            "\u90ae\u7bb1",
+            "\u7535\u8bdd",
+            "\u535a\u5bfc",
+            "\u7855\u5bfc",
+        )
+        noise_text_tokens = (
+            "通知",
+            "公告",
+            "新闻",
+            "政策",
+            "招聘",
+            "人事",
+            "党建",
+            "招生",
+            "就业",
+            "notice",
+            "announcement",
+            "news",
+            "policy",
+            "recruit",
+            "personnel",
+            "hr",
+        )
+
+        has_faculty_signal = ("@" in (text or "")) or any(token in lowered_text for token in faculty_signal_tokens)
+        evidence_hits = sum(1 for token in strong_faculty_evidence_tokens if token in lowered_text)
+        has_strong_faculty_evidence = ("@" in (text or "")) or evidence_hits >= 2
+        if any(token in lowered_url for token in strong_noise_url_tokens) and not has_strong_faculty_evidence:
+            return True, "url_noise_token"
+
+        lines = [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
+        if not lines:
+            return False, ""
+        noise_hits = sum(1 for line in lines if any(token in line.lower() for token in noise_text_tokens))
+        noise_ratio = noise_hits / float(len(lines))
+        if noise_ratio >= 0.35 and not has_faculty_signal:
+            return True, f"text_noise_ratio={noise_ratio:.2f}"
+        return False, ""
+
     async def _extract_professors_from_page(
         self,
         current: _QueuedUrl,
@@ -1418,7 +1664,10 @@ class CrawlerAgent:
         source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
         if not source_url:
             return 0
-        snapshot = _truncate_middle(fetched.text or "", 24000 if detail_mode else 20000)
+        snapshot = self._compact_page_text(
+            fetched.text or "",
+            self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode),
+        )
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
         task = _ExtractionTaskItem(
             task_id=0,
@@ -1533,47 +1782,23 @@ class CrawlerAgent:
         skills_text: str,
     ) -> Any:
         prompt_max_tokens = min(int(self.model_max_tokens), 16000)
-        raw_links = list(fetched.links or [])
-        same_domain_links = self.fetcher.filter_same_domain(raw_links, self.start_url) if raw_links else []
-        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.EXTRACT_ORG_UNITS}:
-            candidate_links = _keyword_filter(same_domain_links, ORG_UNIT_PAGE_KEYWORDS) or same_domain_links
-        elif state in {CrawlerState.FIND_FACULTY_PAGES, CrawlerState.EXTRACT_PROFESSORS}:
-            candidate_links = _keyword_filter(same_domain_links, FACULTY_KEYWORDS) or same_domain_links
-        else:
-            candidate_links = same_domain_links
-        candidate_links = candidate_links[:250]
-
-        text_limits = {
-            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 8000,
-            CrawlerState.EXTRACT_ORG_UNITS: 20000,
-            CrawlerState.FIND_FACULTY_PAGES: 12000,
-            CrawlerState.EXTRACT_PROFESSORS: 20000,
-        }
-        page_text = _truncate_middle(fetched.text or "", text_limits.get(state, 12000))
-
         allowed_tools: set[str] = set()
         if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.FIND_FACULTY_PAGES}:
             allowed_tools = {"extract_links"}
         elif state is CrawlerState.EXTRACT_PROFESSORS:
             allowed_tools = {"save_professors"}
-
-        user_content = json.dumps(
-            {
-                "university": self.university_name,
-                "location": self.location,
-                "state": state.value,
-                "url": fetched.url,
-                "instruction": instruction,
-                "visited_urls": sorted(self.visited_urls)[-15:],
-                "links": candidate_links,
-                "page_text": page_text,
-                "allowed_tools": sorted(allowed_tools),
-                "tool_call_policy": "Only call tools listed in allowed_tools. Do not invent tool names.",
-            },
-            ensure_ascii=False,
+        user_content, payload_meta = self._build_llm_payload(
+            state=state,
+            instruction=instruction,
+            url=fetched.url,
+            page_text=fetched.text or "",
+            links=list(fetched.links or []),
+            allowed_tools=allowed_tools,
         )
+        self._record_llm_payload(int(payload_meta.get("payload_bytes", 0)))
         tool_defs = get_crawler_tool_definitions()
         tool_defs = [tool for tool in tool_defs if tool.get("name") in allowed_tools] if allowed_tools else []
+        dynamic_system_content = "Tool call policy: " + self._build_tool_call_policy(allowed_tools)
 
         batches = self.context_manager.build_messages(
             "You are a cautious university faculty crawler. Stay on the same university domain.",
@@ -1581,21 +1806,25 @@ class CrawlerAgent:
             skills_text,
             user_content,
             prompt_max_tokens,
+            dynamic_system_content=dynamic_system_content,
         )
         handlers = get_crawler_tools(self.db, self.skill_manager)
         final_result = None
-        if len(candidate_links) == 0 and len(page_text) == 0:
+        if int(payload_meta.get("links_kept", 0)) == 0 and int(payload_meta.get("compacted_chars", 0)) == 0:
             self.logger.debug(
                 "LLM prompt has empty links/page_text state=%s url=%s; output may rely on URL heuristics",
                 state.value,
                 fetched.url,
             )
         self.logger.debug(
-            "LLM request state=%s url=%s candidate_links=%s page_text_chars=%s tools=%s",
+            "LLM request state=%s url=%s links_raw=%s links_kept=%s raw_chars=%s compacted_chars=%s payload_bytes=%s tools=%s",
             state.value,
             fetched.url,
-            len(candidate_links),
-            len(page_text),
+            payload_meta.get("links_raw", 0),
+            payload_meta.get("links_kept", 0),
+            payload_meta.get("raw_chars", 0),
+            payload_meta.get("compacted_chars", 0),
+            payload_meta.get("payload_bytes", 0),
             [tool.get("name") for tool in tool_defs],
         )
         for batch in batches:
@@ -1843,6 +2072,8 @@ def _dedupe_queue(items: list[_QueuedUrl]) -> list[_QueuedUrl]:
         seen.add(item.url)
         result.append(item)
     return result
+
+
 
 
 
