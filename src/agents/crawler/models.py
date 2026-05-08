@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from runtime.database import Base
@@ -195,3 +195,36 @@ class CrawlExtractionFailure(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     task: Mapped[CrawlTask | None] = relationship(back_populates="failures")
+
+
+class StewardRun(Base):
+    __tablename__ = "steward_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(32), default="dry_run")
+    target_db: Mapped[str] = mapped_column(String(255), default="")
+    target_selectors: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="running", index=True)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class DataQualityAudit(Base):
+    __tablename__ = "data_quality_audits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("steward_runs.id"), nullable=True, index=True)
+    db_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    entity_type: Mapped[str] = mapped_column(String(32), default="", index=True)
+    entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    issue_type: Mapped[str] = mapped_column(String(64), default="", index=True)
+    field_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    reason: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str] = mapped_column(String(64), default="report_only")
+    before_snapshot: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    run: Mapped[StewardRun | None] = relationship()

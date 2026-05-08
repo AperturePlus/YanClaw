@@ -10,6 +10,15 @@ from agents.crawler.db.professors import (
     upsert_professor,
 )
 from agents.crawler.db.schema import ensure_runtime_schema
+from agents.crawler.db.steward import (
+    add_data_quality_audit,
+    create_steward_run,
+    finish_steward_run,
+    hard_delete_professor,
+    list_professor_academician_duplicates,
+    match_academician_for_professor,
+    merge_into_academician_from_professor,
+)
 from agents.crawler.db.tasks import (
     list_recoverable_crawl_tasks,
     log_extraction_failure,
@@ -33,6 +42,9 @@ from agents.crawler.db.university import (
 __all__ = [
     "count_academicians",
     "count_professors",
+    "create_steward_run",
+    "finish_steward_run",
+    "add_data_quality_audit",
     "ensure_professor_affiliation",
     "ensure_runtime_schema",
     "ensure_university_meta",
@@ -40,10 +52,14 @@ __all__ = [
     "get_university_status",
     "is_url_crawled",
     "list_org_units",
+    "list_professor_academician_duplicates",
     "list_recoverable_crawl_tasks",
     "load_university_targets_from_csv",
     "log_crawl",
     "log_extraction_failure",
+    "match_academician_for_professor",
+    "merge_into_academician_from_professor",
+    "hard_delete_professor",
     "set_crawl_task_status",
     "set_university_status",
     "summarize_crawl_task_status",
