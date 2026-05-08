@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from aiohttp import web
 
 from agents.crawler.fetchers.httpx_fetcher import FetchResult, Fetcher
+from agents.crawler.fetchers.link_signals import FetchResultWithSignals, extract_links_with_signals
 from agents.crawler.fetchers.human_models import (
     DecisionRequest,
     FetchJob,
@@ -45,7 +46,7 @@ class HumanFetcherBridge:
         self._helper = Fetcher()  # for html_to_text / extract_links
         self.logger = get_logger("crawler.human_bridge")
 
-    # -- async context manager (matches Fetcher / HybridFetcher) --
+    # -- async context manager (matches fetcher interface) --
 
     async def __aenter__(self) -> "HumanFetcherBridge":
         app = create_app(self.queue, agent_status_fn=lambda: self._agent_status_fn() if self._agent_status_fn else None)
@@ -84,16 +85,24 @@ class HumanFetcherBridge:
 
         if job.status == FetchJobStatus.COMPLETED and job.result_html:
             text = self._helper._html_to_text(job.result_html)
-            links = self._helper._extract_links(job.result_html, job.result_url or url)
-            return FetchResult(
+            links, link_signals = extract_links_with_signals(job.result_html, job.result_url or url)
+            return FetchResultWithSignals(
                 url=job.result_url or url,
                 text=text,
                 links=links,
                 status_code=200,
+                link_signals=link_signals,
             )
 
         reason = "human_skip" if job.status == FetchJobStatus.SKIPPED else (job.error_message or "human_failed")
-        return FetchResult(url=url, text="", links=[], status_code=0, block_reason=reason)
+        return FetchResultWithSignals(
+            url=url,
+            text="",
+            links=[],
+            status_code=0,
+            block_reason=reason,
+            link_signals=(),
+        )
 
     def set_context(self, context: JobContext) -> None:
         """Update the context attached to subsequent jobs."""
