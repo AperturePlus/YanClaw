@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from agents.crawler.agent import _is_category_name, _url_found_on_page
 from agents.crawler.url_heuristics import (
+    _allow_faculty_candidate_for_org_unit,
     _is_non_faculty_noise_url,
+    _is_faculty_platform,
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
+    _rank_faculty_page_candidates,
 )
 
 
@@ -102,3 +105,44 @@ def test_non_faculty_noise_url_matches_rszc_variants():
 def test_non_faculty_noise_url_does_not_block_regular_faculty_paths():
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/jsdw.htm")
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/faculty/teacher_list.htm")
+
+
+def test_faculty_platform_detects_teacher_and_faculty_subdomains():
+    assert _is_faculty_platform("https://teacher.buaa.edu.cn/")
+    assert _is_faculty_platform("https://faculty.buaa.edu.cn/")
+    assert not _is_faculty_platform("https://scse.buaa.edu.cn/")
+
+
+def test_allow_faculty_candidate_for_org_unit_strict_host_gate():
+    start_url = "https://www.buaa.edu.cn/"
+    org_unit_url = "https://soft.buaa.edu.cn/"
+
+    assert _allow_faculty_candidate_for_org_unit(
+        "https://soft.buaa.edu.cn/szdw/jsdw.htm",
+        org_unit_url=org_unit_url,
+        start_url=start_url,
+    )
+    assert _allow_faculty_candidate_for_org_unit(
+        "https://www.buaa.edu.cn/szdw/jsdw.htm",
+        org_unit_url=org_unit_url,
+        start_url=start_url,
+    )
+    assert not _allow_faculty_candidate_for_org_unit(
+        "https://teacher.buaa.edu.cn/",
+        org_unit_url=org_unit_url,
+        start_url=start_url,
+    )
+    assert not _allow_faculty_candidate_for_org_unit(
+        "https://scse.buaa.edu.cn/szdw/jsdw.htm",
+        org_unit_url=org_unit_url,
+        start_url=start_url,
+    )
+
+
+def test_rank_faculty_page_candidates_tie_break_is_stable():
+    a = "https://www.example.edu.cn/cs/teacher/list.htm"
+    b = "https://www.example.edu.cn/cs/teacher/index.htm"
+    c = "https://www.example.edu.cn/cs/teacher/overview.htm"
+    ranked_one = _rank_faculty_page_candidates([c, a, b])
+    ranked_two = _rank_faculty_page_candidates([b, c, a])
+    assert ranked_one == ranked_two

@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler.url_heuristics import (
+    _allow_faculty_candidate_for_org_unit,
     _contains_cjk,
     _dedupe_query_terms,
     _extract_urls_from_text,
@@ -43,6 +44,8 @@ def extract_followup_faculty_links(self: Any, links: list[str], current_url: str
     candidates: list[str] = []
     for link in same_domain:
         if link == current_url:
+            continue
+        if not _allow_faculty_candidate_for_org_unit(link, org_unit_url=current_url, start_url=self.start_url):
             continue
         if _is_faculty_platform(link) or _looks_like_retired_url(link):
             continue

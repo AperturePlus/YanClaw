@@ -437,6 +437,147 @@ async def test_agent_skips_noise_page_llm_but_keeps_followups(tmp_path):
     await db.close()
 
 
+async def test_agent_rejects_teacher_platform_and_sibling_faculty_domains(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            [
+                "https://teacher.example.edu.cn/",
+                "https://www.example.edu.cn/cs/faculty",
+                "https://math.example.edu.cn/faculty",
+            ],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty list",
+            [],
+            200,
+        ),
+    }
+
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages=pages)
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert "https://teacher.example.edu.cn/" not in fetcher.calls
+    assert "https://math.example.edu.cn/faculty" not in fetcher.calls
+    assert "https://www.example.edu.cn/cs/faculty" in fetcher.calls
+    await db.close()
+
+
+async def test_agent_rejects_sibling_subdomain_links_for_subdomain_org_unit(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://soft.example.edu.cn/"],
+            200,
+        ),
+        "https://soft.example.edu.cn/": FetchResult(
+            "https://soft.example.edu.cn/",
+            "soft",
+            [
+                "https://soft.example.edu.cn/faculty",
+                "https://scse.example.edu.cn/faculty",
+            ],
+            200,
+        ),
+        "https://soft.example.edu.cn": FetchResult(
+            "https://soft.example.edu.cn/",
+            "soft",
+            [
+                "https://soft.example.edu.cn/faculty",
+                "https://scse.example.edu.cn/faculty",
+            ],
+            200,
+        ),
+        "https://soft.example.edu.cn/faculty": FetchResult(
+            "https://soft.example.edu.cn/faculty",
+            "faculty list",
+            [],
+            200,
+        ),
+    }
+
+    class SubdomainOrgUnitLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "软件学院", "url": "https://soft.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, fetcher, db = await _agent(tmp_path, SubdomainOrgUnitLLM(), pages=pages)
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://soft.example.edu.cn/faculty" in fetcher.calls
+    assert "https://scse.example.edu.cn/faculty" not in fetcher.calls
+    await db.close()
+
+
+async def test_agent_skips_find_faculty_llm_on_low_info_page(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home faculty",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "x",
+            [],
+            200,
+        ),
+    }
+
+    class TrackStatesLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.states: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            self.states.append(payload.get("state", ""))
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    llm = TrackStatesLLM()
+    agent, _fetcher, db = await _agent(tmp_path, llm, pages=pages)
+    await agent.run()
+
+    assert "FIND_FACULTY_PAGES" not in llm.states
+    await db.close()
+
+
 async def test_agent_can_reuse_homepage_when_org_unit_page_is_home(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLMHomeAsOrgList())
     result = await agent.run()

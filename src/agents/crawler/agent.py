@@ -20,6 +20,8 @@ from agents.crawler.url_heuristics import (
     ORG_UNIT_PAGE_KEYWORDS,
     _COMMON_FACULTY_PATHS,
     _INTERMEDIATE_ORG_PATHS,
+    _allow_faculty_candidate_for_host_set,
+    _allow_faculty_candidate_for_org_unit,
     _contains_cjk,
     _dedupe_query_terms,
     _extract_urls_from_text,
@@ -580,23 +582,14 @@ class CrawlerAgent:
 
             # --- Find faculty links for this org unit ---
             links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = [
-                l
-                for l in self.fetcher.filter_same_domain(links, self.start_url)
-                if not _is_faculty_platform(l)
-                and not _looks_like_retired_url(l)
-                and not _is_non_faculty_noise_url(l)
-            ]
-            links = _rank_faculty_page_candidates(links)
-            non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
-            if non_showcase:
-                links = non_showcase
+            links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            low_info, low_info_reason = self._should_skip_faculty_discovery_llm(fetched)
 
             if not links and _is_college_subdomain(fetched.url, self.start_url):
-                links.extend(await self._probe_faculty_paths(fetched.url))
+                links = self._filter_faculty_candidates(await self._probe_faculty_paths(fetched.url), org_unit_url=fetched.url)
             if not links and _looks_like_faculty_page(fetched.url):
-                links = [fetched.url]
-            if not links and llm_fallback_budget > 0:
+                links = self._filter_faculty_candidates([fetched.url], org_unit_url=fetched.url)
+            if not links and llm_fallback_budget > 0 and not low_info:
                 llm_fallback_budget -= 1
                 result = await self._ask_llm(
                     CrawlerState.FIND_FACULTY_PAGES,
@@ -606,17 +599,14 @@ class CrawlerAgent:
                 links = self._links_from_result(result.content)
                 if not links:
                     links = self._links_from_tool_call_log(result, tool_name="extract_links")
-                links = [
-                    l
-                    for l in self.fetcher.filter_same_domain(links, self.start_url)
-                    if not _is_faculty_platform(l)
-                    and not _looks_like_retired_url(l)
-                    and not _is_non_faculty_noise_url(l)
-                ]
-                links = _rank_faculty_page_candidates(links)
-                non_showcase = [l for l in links if not _is_academician_showcase_page(l)]
-                if non_showcase:
-                    links = non_showcase
+                links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            elif not links and low_info:
+                self.logger.debug(
+                    "Skip faculty-page LLM fallback by gate org_unit=%s url=%s reason=%s",
+                    org_unit.name,
+                    fetched.url,
+                    low_info_reason,
+                )
 
             # --- Immediately extract professors from found links ---
             faculty_for_unit: list[_QueuedUrl] = []
@@ -680,25 +670,16 @@ class CrawlerAgent:
                 continue
 
             links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = [
-                l
-                for l in self.fetcher.filter_same_domain(links, self.start_url)
-                if not _is_faculty_platform(l)
-                and not _looks_like_retired_url(l)
-                and not _is_non_faculty_noise_url(l)
-            ]
-            links = _rank_faculty_page_candidates(links)
-            non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
-            if non_showcase_links:
-                links = non_showcase_links
+            links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            low_info, low_info_reason = self._should_skip_faculty_discovery_llm(fetched)
 
             if not links and _is_college_subdomain(fetched.url, self.start_url):
-                links.extend(await self._probe_faculty_paths(fetched.url))
+                links = self._filter_faculty_candidates(await self._probe_faculty_paths(fetched.url), org_unit_url=fetched.url)
 
             if not links and _looks_like_faculty_page(fetched.url):
-                links = [fetched.url]
+                links = self._filter_faculty_candidates([fetched.url], org_unit_url=fetched.url)
 
-            if not links and llm_fallback_budget > 0:
+            if not links and llm_fallback_budget > 0 and not low_info:
                 llm_fallback_budget -= 1
                 result = await self._ask_llm(
                     CrawlerState.FIND_FACULTY_PAGES,
@@ -715,17 +696,14 @@ class CrawlerAgent:
                             item.label,
                             links[:5],
                         )
-                links = [
-                    l
-                    for l in self.fetcher.filter_same_domain(links, self.start_url)
-                    if not _is_faculty_platform(l)
-                    and not _looks_like_retired_url(l)
-                    and not _is_non_faculty_noise_url(l)
-                ]
-                links = _rank_faculty_page_candidates(links)
-                non_showcase_links = [l for l in links if not _is_academician_showcase_page(l)]
-                if non_showcase_links:
-                    links = non_showcase_links
+                links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            elif not links and low_info:
+                self.logger.debug(
+                    "Skip faculty-page LLM fallback by gate org_unit=%s url=%s reason=%s",
+                    org_unit.name,
+                    fetched.url,
+                    low_info_reason,
+                )
 
             for link in links[:max_links_per_org_unit]:
                 depth = item.depth + (0 if link == fetched.url else 1)
@@ -742,12 +720,15 @@ class CrawlerAgent:
         if not faculty_links:
             self.logger.info("No faculty links from org units, trying search engine fallback")
             search_links = await self._search_engine_fallback("faculty teachers professors list szdw jsdw")
-            search_links = [
-                l
-                for l in search_links
-                if not _is_faculty_platform(l) and not _is_non_faculty_noise_url(l)
-            ]
-            search_links = _rank_faculty_page_candidates(search_links)
+            allowed_hosts = {
+                (urlparse(unit.url).hostname or "").lower()
+                for unit in candidates
+                if (urlparse(unit.url).hostname or "").lower()
+            }
+            search_links = self._filter_faculty_candidates(
+                search_links,
+                org_unit_hosts=allowed_hosts,
+            )
             for link in search_links:
                 if self._within_depth(2):
                     faculty_links.append(_QueuedUrl(url=link, depth=2, label="Unknown"))
@@ -1538,6 +1519,46 @@ class CrawlerAgent:
             "payload_bytes": payload_bytes,
         }
         return user_content, metadata
+
+    def _filter_faculty_candidates(
+        self,
+        links: list[str],
+        *,
+        org_unit_url: str | None = None,
+        org_unit_hosts: set[str] | None = None,
+    ) -> list[str]:
+        same_domain = self.fetcher.filter_same_domain(links, self.start_url)
+        use_host_set_gate = org_unit_hosts is not None
+        allowed_hosts = {(host or "").strip().lower() for host in (org_unit_hosts or set()) if (host or "").strip()}
+        filtered: list[str] = []
+        for link in same_domain:
+            if org_unit_url:
+                if not _allow_faculty_candidate_for_org_unit(link, org_unit_url=org_unit_url, start_url=self.start_url):
+                    continue
+            elif use_host_set_gate:
+                if not _allow_faculty_candidate_for_host_set(link, start_url=self.start_url, org_unit_hosts=allowed_hosts):
+                    continue
+            elif _is_faculty_platform(link):
+                continue
+
+            if _looks_like_retired_url(link) or _is_non_faculty_noise_url(link):
+                continue
+            filtered.append(link)
+
+        ranked = _rank_faculty_page_candidates(filtered)
+        non_showcase = [link for link in ranked if not _is_academician_showcase_page(link)]
+        if non_showcase:
+            return non_showcase
+        return ranked
+
+    @staticmethod
+    def _should_skip_faculty_discovery_llm(fetched: FetchResult) -> tuple[bool, str]:
+        text_len = len((fetched.text or "").strip())
+        if fetched.block_reason:
+            return True, f"blocked={fetched.block_reason}"
+        if not fetched.links and text_len < 200:
+            return True, f"low_info links=0 text_len={text_len}"
+        return False, ""
 
     def _should_skip_professor_llm(self, *, url: str, text: str) -> tuple[bool, str]:
         lowered_url = (url or "").lower()

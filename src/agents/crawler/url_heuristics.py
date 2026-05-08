@@ -161,6 +161,8 @@ _EXPLICIT_FACULTY_DIR_HINTS = (
     "/teacherlist",
     "/staff/",
     "/people/",
+    "/szdw/",
+    "/szdw.htm",
     "/jsdw/",
     "/szll",
     "/qzjs",
@@ -298,7 +300,7 @@ def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
             score -= 3
         return score
 
-    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    ranked = sorted(links, key=lambda link: (-_score(link), -len(link), link.lower()))
     deduped: list[str] = []
     seen: set[str] = set()
     for link in ranked:
@@ -470,7 +472,7 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
             score += 1
         return score
 
-    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    ranked = sorted(links, key=lambda link: (-_score(link), -len(link), link.lower()))
     deduped: list[str] = []
     seen: set[str] = set()
     for link in ranked:
@@ -626,10 +628,51 @@ def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int
 
 
 def _is_faculty_platform(url: str) -> bool:
-    """Return True if URL belongs to a faculty.xxx.edu.cn homepage platform (not a real faculty list)."""
+    """Return True if URL belongs to a shared faculty/teacher platform subdomain."""
     host = (urlparse(url).hostname or "").lower()
     first = host.split(".")[0] if host else ""
-    return first.startswith("faculty")
+    return first.startswith("faculty") or first.startswith("teacher")
+
+
+def _allow_faculty_candidate_for_org_unit(url: str, *, org_unit_url: str, start_url: str) -> bool:
+    """
+    Strict host gate for faculty discovery:
+    - Allow org-unit host itself.
+    - Allow start_host only for explicit faculty directory paths.
+    - Reject sibling subdomains and shared teacher/faculty platforms.
+    """
+    candidate_host = (urlparse(url).hostname or "").lower()
+    org_host = (urlparse(org_unit_url).hostname or "").lower()
+    start_host = (urlparse(start_url).hostname or "").lower()
+    if not candidate_host:
+        return False
+    if _is_faculty_platform(url):
+        return False
+    if candidate_host == org_host:
+        return True
+    if candidate_host == start_host and _is_explicit_faculty_directory_url(url):
+        return True
+    return False
+
+
+def _allow_faculty_candidate_for_host_set(url: str, *, start_url: str, org_unit_hosts: set[str]) -> bool:
+    """
+    Strict host gate when no single org unit is bound (e.g. search fallback):
+    - Allow any known org-unit host.
+    - Allow start_host only for explicit faculty directory paths.
+    - Reject sibling subdomains and shared teacher/faculty platforms.
+    """
+    candidate_host = (urlparse(url).hostname or "").lower()
+    start_host = (urlparse(start_url).hostname or "").lower()
+    if not candidate_host:
+        return False
+    if _is_faculty_platform(url):
+        return False
+    if candidate_host in org_unit_hosts:
+        return True
+    if candidate_host == start_host and _is_explicit_faculty_directory_url(url):
+        return True
+    return False
 
 
 def _is_college_subdomain(url: str, start_url: str) -> bool:
