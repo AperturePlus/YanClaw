@@ -15,6 +15,7 @@ from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError, _university_db_path
 from agents.crawler.models import CrawlStatus
 from runtime.database import DatabaseManager
+from runtime.cli import cli as runtime_cli
 
 
 def _sqlite_url(path: Path) -> str:
@@ -141,6 +142,15 @@ def test_cli_help_outputs_commands():
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
     assert "llm-check" in result.output
+    assert "steward" in result.output
+
+
+def test_runtime_cli_exposes_crawler_commands():
+    runner = CliRunner()
+    result = runner.invoke(runtime_cli, ["--help"])
+    assert result.exit_code == 0
+    assert "crawl" in result.output
+    assert "steward" in result.output
 
 
 async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monkeypatch):
@@ -218,6 +228,8 @@ def test_crawl_cli_auto_installs_chromium_for_playwright_backend(tmp_path, monke
         skip_llm_check=False,
         run_timeout_seconds=None,
         resume=False,
+        run_steward_after_crawl=False,
+        steward_after_crawl_mode="dry_run",
     ):
         called["crawl_async"] += 1
 
@@ -262,6 +274,58 @@ def test_crawl_cli_wraps_chromium_prepare_error(tmp_path, monkeypatch):
 
     assert result.exit_code != 0
     assert "Failed to prepare Playwright Chromium" in result.output
+
+
+def test_steward_run_cli_passes_university_selectors(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def _fake_steward_run_async(
+        *,
+        settings,
+        universities,
+        universities_file,
+        db_roots,
+        apply,
+        llm_enabled,
+        max_context_tokens,
+        include_backup_audit,
+    ):
+        captured["universities"] = universities
+        captured["db_roots"] = db_roots
+        captured["apply"] = apply
+        return type(
+            "Summary",
+            (),
+            {
+                "mode": "dry_run",
+                "targets": ["x.db"],
+                "total_duplicates_detected": 1,
+                "total_duplicates_deleted": 0,
+                "total_missing_field_audits": 2,
+                "total_recrawl_tasks_upserted": 0,
+                "unmatched_universities": [],
+                "unmatched_db_roots": [],
+                "runs": [],
+            },
+        )()
+
+    monkeypatch.setattr(crawler_cli, "_steward_run_async", _fake_steward_run_async)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "steward",
+            "run",
+            "--universities",
+            "A,B",
+            "--db-roots",
+            "pku.edu.cn,tsinghua.edu.cn",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["universities"] == ["A", "B"]
+    assert captured["db_roots"] == ["pku.edu.cn", "tsinghua.edu.cn"]
+    assert captured["apply"] is False
 
 
 def test_dispatcher_factory_supports_hybrid_backend(tmp_path):

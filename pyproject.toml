@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-yanclaw = "agents.crawler.cli:cli"
+yanclaw = "runtime.cli:cli"
 yanclaw-install-chromium = "agents.crawler.playwright_setup:main"
 
 [dependency-groups]
