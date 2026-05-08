@@ -160,6 +160,9 @@ async def _check_llm(settings: CrawlerSettings) -> None:
         settings.openai_model,
         max_rounds=1,
         timeout_seconds=settings.llm_timeout_seconds,
+        temperature=settings.llm_temperature,
+        top_p=settings.llm_top_p,
+        seed=settings.llm_seed,
     )
     try:
         await client.chat(
@@ -189,6 +192,9 @@ def llm_check() -> None:
     click.echo(f"model={settings.openai_model}")
     click.echo(f"api_key_set={bool(settings.openai_api_key)}")
     click.echo(f"timeout_seconds={settings.llm_timeout_seconds}")
+    click.echo(f"temperature={settings.llm_temperature}")
+    click.echo(f"top_p={settings.llm_top_p}")
+    click.echo(f"seed={settings.llm_seed}")
     asyncio.run(_check_llm(settings))
     click.echo("ok")
 

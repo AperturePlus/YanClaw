@@ -62,6 +62,9 @@ class LLMClient:
         max_concurrent: int = 2,
         min_interval: float = 1.0,
         timeout_seconds: float = 120.0,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int | None = None,
         client: Any | None = None,
     ) -> None:
         self.base_url = base_url
@@ -71,6 +74,9 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self.timeout_seconds = timeout_seconds
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = int(seed) if seed is not None else None
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._min_interval = min_interval
         self._last_call_time: float = 0
@@ -99,6 +105,10 @@ class LLMClient:
             self.logger.debug("LLM call round=%s model=%s", round_index, self.model)
             chat_tools = self._as_chat_tools(tools) if tools else None
             request: dict[str, Any] = {"model": self.model, "messages": working_messages}
+            request["temperature"] = self.temperature
+            request["top_p"] = self.top_p
+            if self.seed is not None:
+                request["seed"] = self.seed
             if chat_tools:
                 request["tools"] = chat_tools
             if max_tokens is not None:

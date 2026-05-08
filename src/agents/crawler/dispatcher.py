@@ -84,6 +84,9 @@ class CrawlDispatcher:
                 settings.openai_api_key,
                 settings.openai_model,
                 timeout_seconds=settings.llm_timeout_seconds,
+                temperature=settings.llm_temperature,
+                top_p=settings.llm_top_p,
+                seed=settings.llm_seed,
             )
         )
         self.fetcher_factory = fetcher_factory or self._default_fetcher_factory(settings)

@@ -20,6 +20,9 @@ class CrawlerSettings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    llm_temperature: float = Field(default=0.0, ge=0.0)
+    llm_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    llm_seed: int | None = None
     max_concurrency: int = Field(default=3, ge=1)
     request_interval_seconds: float = Field(default=2.0, ge=0)
     max_retries: int = Field(default=3, ge=0)
