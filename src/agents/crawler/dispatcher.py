@@ -5,13 +5,12 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from agents.crawler import db as crawler_db
 from agents.crawler.agent import AgentResult, CrawlerAgent
 from agents.crawler.config import CrawlerSettings
-from agents.crawler.cookies import cookies_to_httpx, load_cookies
 from agents.crawler.fetchers import Fetcher, _site_root
 from agents.crawler.models import CrawlLogStatus, CrawlStatus
 from runtime.context import ContextManager
@@ -46,7 +45,7 @@ class _UniversityProgress:
 
 AgentFactory = Callable[..., CrawlerAgent]
 LLMClientFactory = Callable[[], LLMClient]
-FetcherFactory = Callable[[], Fetcher]
+FetcherFactory = Callable[[], Any]
 
 
 def _sqlite_url(path: Path) -> str:
@@ -92,55 +91,12 @@ class CrawlDispatcher:
 
     @staticmethod
     def _default_fetcher_factory(settings: CrawlerSettings) -> FetcherFactory:
-        if settings.fetcher_backend == "playwright":
-            from agents.crawler.fetchers.playwright_fetcher import PlaywrightFetcher
+        from agents.crawler.fetchers.human_bridge import HumanFetcherBridge
 
-            return lambda: PlaywrightFetcher(
-                request_interval_seconds=settings.request_interval_seconds,
-                max_retries=settings.max_retries,
-                timeout_seconds=settings.request_timeout_seconds,
-            )
-        if settings.fetcher_backend == "curl_cffi":
-            from agents.crawler.fetchers.curl_cffi_fetcher import CurlCffiFetcher
-
-            return lambda: CurlCffiFetcher(
-                request_interval_seconds=settings.request_interval_seconds,
-                max_retries=settings.max_retries,
-                timeout_seconds=settings.request_timeout_seconds,
-            )
-        if settings.fetcher_backend == "crawl4ai":
-            from agents.crawler.fetchers.crawl4ai_fetcher import Crawl4aiFetcher
-
-            return lambda: Crawl4aiFetcher(
-                base_url=settings.crawl4ai_base_url,
-                api_token=settings.crawl4ai_api_token,
-                request_interval_seconds=settings.request_interval_seconds,
-                max_retries=settings.max_retries,
-                timeout_seconds=settings.crawl4ai_timeout_seconds,
-            )
-        if settings.fetcher_backend == "hybrid":
-            from agents.crawler.fetchers.hybrid_fetcher import HybridFetcher
-
-            return lambda: HybridFetcher(
-                request_interval_seconds=settings.request_interval_seconds,
-                max_retries=settings.max_retries,
-                timeout_seconds=settings.request_timeout_seconds,
-                crawl4ai_base_url=settings.crawl4ai_base_url,
-                crawl4ai_api_token=settings.crawl4ai_api_token,
-                crawl4ai_timeout_seconds=settings.crawl4ai_timeout_seconds,
-            )
-        if settings.fetcher_backend == "human":
-            from agents.crawler.fetchers.human_bridge import HumanFetcherBridge
-
-            return lambda: HumanFetcherBridge(
-                host=settings.human_server_host,
-                port=settings.human_server_port,
-                job_timeout_seconds=settings.human_job_timeout_seconds,
-            )
-        return lambda: Fetcher(
-            request_interval_seconds=settings.request_interval_seconds,
-            max_retries=settings.max_retries,
-            timeout_seconds=settings.request_timeout_seconds,
+        return lambda: HumanFetcherBridge(
+            host=settings.human_server_host,
+            port=settings.human_server_port,
+            job_timeout_seconds=settings.human_job_timeout_seconds,
         )
 
     async def run(self, universities: list[str] | None = None, *, resume: bool = False) -> DispatcherSummary:
@@ -252,60 +208,6 @@ class CrawlDispatcher:
                 university.db_path,
             )
 
-    def _make_cookie_fetcher(self, raw_cookies: list[dict]) -> Fetcher:
-        """Create a fetcher of the configured backend type with cookies injected."""
-        s = self.settings
-        httpx_cookies = cookies_to_httpx(raw_cookies)
-        backend = s.fetcher_backend
-
-        if backend == "playwright":
-            from agents.crawler.fetchers.playwright_fetcher import PlaywrightFetcher
-
-            return PlaywrightFetcher(
-                request_interval_seconds=s.request_interval_seconds,
-                max_retries=s.max_retries,
-                timeout_seconds=s.request_timeout_seconds,
-                cookies=raw_cookies,
-            )
-        if backend == "curl_cffi":
-            from agents.crawler.fetchers.curl_cffi_fetcher import CurlCffiFetcher
-
-            return CurlCffiFetcher(
-                request_interval_seconds=s.request_interval_seconds,
-                max_retries=s.max_retries,
-                timeout_seconds=s.request_timeout_seconds,
-                cookies=httpx_cookies,
-            )
-        if backend == "crawl4ai":
-            from agents.crawler.fetchers.crawl4ai_fetcher import Crawl4aiFetcher
-
-            return Crawl4aiFetcher(
-                base_url=s.crawl4ai_base_url,
-                api_token=s.crawl4ai_api_token,
-                request_interval_seconds=s.request_interval_seconds,
-                max_retries=s.max_retries,
-                timeout_seconds=s.crawl4ai_timeout_seconds,
-                cookies=raw_cookies,
-            )
-        if backend == "hybrid":
-            from agents.crawler.fetchers.hybrid_fetcher import HybridFetcher
-
-            return HybridFetcher(
-                request_interval_seconds=s.request_interval_seconds,
-                max_retries=s.max_retries,
-                timeout_seconds=s.request_timeout_seconds,
-                crawl4ai_base_url=s.crawl4ai_base_url,
-                crawl4ai_api_token=s.crawl4ai_api_token,
-                crawl4ai_timeout_seconds=s.crawl4ai_timeout_seconds,
-                cookies=raw_cookies,
-            )
-        return Fetcher(
-            request_interval_seconds=s.request_interval_seconds,
-            max_retries=s.max_retries,
-            timeout_seconds=s.request_timeout_seconds,
-            cookies=httpx_cookies,
-        )
-
     async def _should_skip(self, university: _UniversityTarget) -> bool:
         progress = await self._get_university_progress(university)
         if not progress.has_db:
@@ -365,17 +267,6 @@ class CrawlDispatcher:
                 self.settings.llm_timeout_seconds,
             )
 
-            # Load per-university cookies; create a dedicated fetcher if any exist.
-            raw_cookies = load_cookies(university.url)
-            cookie_fetcher = None
-            effective_fetcher = fetcher
-            if raw_cookies:
-                self.logger.info(
-                    "Injecting %d cookies for %s", len(raw_cookies), university.name,
-                )
-                cookie_fetcher = self._make_cookie_fetcher(raw_cookies)
-                effective_fetcher = await cookie_fetcher.__aenter__()
-
             db = DatabaseManager(_sqlite_url(university.db_path))
             try:
                 async def _crawl_one() -> AgentResult:
@@ -402,7 +293,7 @@ class CrawlDispatcher:
                         llm_client=self.llm_client_factory(),
                         skill_manager=skill_manager,
                         context_manager=ContextManager(self.settings.openai_model),
-                        fetcher=effective_fetcher,
+                        fetcher=fetcher,
                         model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
                         detail_enrich_enabled=self.settings.detail_enrich_enabled,
                         detail_fetch_backend=self.settings.detail_fetch_backend,
@@ -446,6 +337,4 @@ class CrawlDispatcher:
                         messages=[f"Timeout after {timeout_seconds}s"],
                     )
             finally:
-                if cookie_fetcher is not None:
-                    await cookie_fetcher.__aexit__(None, None, None)
                 await db.close()

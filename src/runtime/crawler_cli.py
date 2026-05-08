@@ -8,7 +8,6 @@ import click
 
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError
-from agents.crawler.playwright_setup import ensure_chromium_installed
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
 from runtime.logger import get_logger, setup_logging
@@ -24,12 +23,6 @@ def cli() -> None:
 @click.option("--universities", default="", help="Comma-separated university names to crawl.")
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency.")
 @click.option("--log-dir", default=None, type=click.Path(path_type=Path), help="Log directory.")
-@click.option(
-    "--fetcher-backend",
-    default=None,
-    type=click.Choice(["hybrid", "httpx", "playwright", "curl_cffi", "crawl4ai", "human"], case_sensitive=False),
-    help="Fetcher backend: hybrid (default), httpx, playwright, curl_cffi, crawl4ai, or human (browser-assisted).",
-)
 @click.option(
     "--university-timeout-seconds",
     default=None,
@@ -63,7 +56,6 @@ def crawl(
     universities: str,
     concurrency: int | None,
     log_dir: Path | None,
-    fetcher_backend: str | None,
     university_timeout_seconds: float | None,
     run_timeout_seconds: float | None,
     resume: bool,
@@ -78,8 +70,6 @@ def crawl(
         overrides["max_concurrency"] = concurrency
     if log_dir is not None:
         overrides["log_dir"] = log_dir
-    if fetcher_backend is not None:
-        overrides["fetcher_backend"] = fetcher_backend
     if university_timeout_seconds is not None:
         overrides["university_timeout_seconds"] = university_timeout_seconds
     settings = CrawlerSettings().model_copy(update=overrides) if overrides else CrawlerSettings()
@@ -96,13 +86,6 @@ def crawl(
         resume,
         ",".join(selected) if selected else "*",
     )
-    if str(settings.fetcher_backend).strip().lower() == "playwright":
-        try:
-            installed_now = ensure_chromium_installed()
-        except Exception as error:
-            raise click.ClickException(f"Failed to prepare Playwright Chromium: {error}") from error
-        if installed_now:
-            logger.info("Installed Playwright Chromium runtime")
     asyncio.run(
         _crawl_async(
             settings,
