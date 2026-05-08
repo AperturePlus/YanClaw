@@ -60,7 +60,7 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
         max_concurrency=1,
         request_interval_seconds=0,
         max_retries=0,
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     FakeAgent.active = 0
     FakeAgent.max_active = 0
@@ -105,7 +105,7 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
         request_interval_seconds=0,
         max_retries=0,
         university_timeout_seconds=0.5,
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     dispatcher = CrawlDispatcher(settings=settings, agent_factory=SlowAgent)
     summary = await dispatcher.run(universities=["A"])
@@ -163,15 +163,15 @@ async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monke
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
 
     async def _raise_import_error(self, universities, *, resume=False):
-        raise ImportError("playwright is required for PlaywrightFetcher")
+        raise ImportError("fetcher dependency missing")
 
     monkeypatch.setattr(CrawlDispatcher, "run", _raise_import_error)
 
-    with pytest.raises(click.ClickException, match="playwright is required for PlaywrightFetcher"):
+    with pytest.raises(click.ClickException, match="fetcher dependency missing"):
         await crawler_cli._crawl_async(
             settings,
             universities=["A"],
@@ -189,7 +189,7 @@ async def test_crawl_async_wraps_fresh_prepare_error_as_click_exception(tmp_path
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
 
     async def _raise_prepare_error(self, universities, *, resume=False):
@@ -203,78 +203,6 @@ async def test_crawl_async_wraps_fresh_prepare_error_as_click_exception(tmp_path
             universities=["A"],
             skip_llm_check=True,
         )
-
-
-def test_crawl_cli_auto_installs_chromium_for_playwright_backend(tmp_path, monkeypatch):
-    websites = tmp_path / "websites.csv"
-    websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("YANCLAW_WEBSITES_PATH", str(websites))
-    monkeypatch.setenv("YANCLAW_CRAWLER_SKILLS_DIR", str(tmp_path / "skills"))
-    monkeypatch.setenv("YANCLAW_UNIVERSITY_DB_DIR", str(tmp_path / "universities"))
-
-    called = {"install": 0, "crawl_async": 0}
-
-    def _install():
-        called["install"] += 1
-        return True
-
-    async def _noop_crawl_async(
-        settings,
-        universities,
-        *,
-        skip_llm_check=False,
-        run_timeout_seconds=None,
-        resume=False,
-        run_steward_after_crawl=False,
-        steward_after_crawl_mode="dry_run",
-    ):
-        called["crawl_async"] += 1
-
-    monkeypatch.setattr(crawler_cli, "ensure_chromium_installed", _install)
-    monkeypatch.setattr(crawler_cli, "_crawl_async", _noop_crawl_async)
-
-    runner = CliRunner()
-    result = runner.invoke(cli, [
-        "crawl",
-        "--fetcher-backend", "playwright",
-        "--universities", "A",
-        "--skip-llm-check",
-    ])
-
-    assert result.exit_code == 0, result.output
-    assert called["install"] == 1
-    assert called["crawl_async"] == 1
-
-
-def test_crawl_cli_wraps_chromium_prepare_error(tmp_path, monkeypatch):
-    websites = tmp_path / "websites.csv"
-    websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("YANCLAW_WEBSITES_PATH", str(websites))
-    monkeypatch.setenv("YANCLAW_CRAWLER_SKILLS_DIR", str(tmp_path / "skills"))
-    monkeypatch.setenv("YANCLAW_UNIVERSITY_DB_DIR", str(tmp_path / "universities"))
-
-    def _raise_prepare_error():
-        raise RuntimeError("network blocked")
-
-    monkeypatch.setattr(crawler_cli, "ensure_chromium_installed", _raise_prepare_error)
-
-    runner = CliRunner()
-    result = runner.invoke(cli, [
-        "crawl",
-        "--fetcher-backend", "playwright",
-        "--universities", "A",
-        "--skip-llm-check",
-    ])
-
-    assert result.exit_code != 0
-    assert "Failed to prepare Playwright Chromium" in result.output
-
 
 def test_steward_run_cli_passes_university_selectors(monkeypatch):
     captured: dict[str, object] = {}
@@ -328,7 +256,7 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
     assert captured["apply"] is False
 
 
-def test_dispatcher_factory_supports_hybrid_backend(tmp_path):
+def test_dispatcher_factory_uses_human_backend(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
         "name,url,location\nA,https://a.example.edu.cn/,X\n",
@@ -338,11 +266,11 @@ def test_dispatcher_factory_supports_hybrid_backend(tmp_path):
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
-        fetcher_backend="hybrid",
+        fetcher_backend="human",
     )
     factory = CrawlDispatcher._default_fetcher_factory(settings)
     fetcher = factory()
-    assert type(fetcher).__name__ == "HybridFetcher"
+    assert type(fetcher).__name__ == "HumanFetcherBridge"
 
 
 async def test_crawl_async_passes_resume_to_dispatcher(tmp_path, monkeypatch):
@@ -355,7 +283,7 @@ async def test_crawl_async_passes_resume_to_dispatcher(tmp_path, monkeypatch):
         websites_path=websites,
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     captured: dict[str, object] = {}
 
@@ -392,7 +320,7 @@ async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
         max_concurrency=1,
         request_interval_seconds=0,
         max_retries=0,
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     db_path_a = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db_path_b = _university_db_path(Path(settings.university_db_dir), "https://b.sample.edu.cn/")
@@ -431,7 +359,7 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
         max_concurrency=1,
         request_interval_seconds=0,
         max_retries=0,
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db = DatabaseManager(_sqlite_url(db_path))
@@ -479,7 +407,7 @@ async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypa
         max_concurrency=1,
         request_interval_seconds=0,
         max_retries=0,
-        fetcher_backend="httpx",
+        fetcher_backend="human",
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db_path.parent.mkdir(parents=True, exist_ok=True)

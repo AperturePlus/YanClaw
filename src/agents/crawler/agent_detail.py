@@ -17,13 +17,7 @@ from agents.crawler.url_heuristics import (
 async def enrich_profiles_with_detail_backend(self: Any, current: Any, fetched: Any, skills: str) -> None:
     if not self._is_interactive or not self.detail_enrich_enabled:
         return
-    if self.detail_fetch_backend == "human":
-        await self._enrich_profiles_with_human(current, fetched, skills)
-        return
-    if self.detail_fetch_backend == "httpx":
-        await self._enrich_profiles_with_httpx(current, fetched, skills)
-        return
-    self.logger.debug("Unsupported detail backend=%s; skip detail enrichment", self.detail_fetch_backend)
+    await self._enrich_profiles_with_human(current, fetched, skills)
 
 
 async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skills: str) -> None:
@@ -54,126 +48,6 @@ async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skil
         return
     self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
     await self._process_detail_urls_with_human(pending, current, skills)
-
-
-async def enrich_profiles_with_httpx(self: Any, current: Any, fetched: Any, skills: str) -> None:
-    if self._detail_fetcher is None:
-        return
-
-    org_unit_key = self._detail_org_unit_key(current)
-    processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
-    remaining = self.detail_profile_hard_cap_per_org_unit - processed
-    if remaining <= 0:
-        self.logger.debug(
-            "Detail enrichment cap reached org_unit=%s cap=%s",
-            current.label or "Unknown",
-            self.detail_profile_hard_cap_per_org_unit,
-        )
-        return
-
-    candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
-    if not candidates:
-        return
-
-    pending: list[str] = []
-    for link in candidates:
-        if len(pending) >= remaining:
-            break
-        if link in self._detail_visited_urls or link in self.visited_urls:
-            continue
-        self._detail_visited_urls.add(link)
-        pending.append(link)
-    if not pending:
-        return
-    self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
-
-    consecutive_failures = 0
-    failed_urls: list[str] = []
-    while pending:
-        link = pending.pop(0)
-        if _looks_like_retired_url(link):
-            continue
-        try:
-            detail_fetched = await self._detail_fetcher.fetch(link)
-        except Exception as error:
-            self.logger.debug("Detail httpx fetch failed url=%s error=%s", link, error)
-            consecutive_failures += 1
-            failed_urls.append(link)
-            if consecutive_failures >= self.detail_failure_threshold:
-                switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
-                if switched:
-                    self.logger.info(
-                        "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
-                        current.label or "Unknown",
-                        len(failed_urls),
-                        len(pending),
-                    )
-                consecutive_failures = 0
-                failed_urls = []
-            continue
-
-        if self._is_failed_detail_fetch(detail_fetched):
-            consecutive_failures += 1
-            failed_urls.append(link)
-            if consecutive_failures >= self.detail_failure_threshold:
-                switched = await self._handle_detail_failure_decision(current, failed_urls, skills)
-                if switched:
-                    self.logger.info(
-                        "Detail enrichment switched failed batch to human org_unit=%s failed=%s remaining_httpx=%s",
-                        current.label or "Unknown",
-                        len(failed_urls),
-                        len(pending),
-                    )
-                consecutive_failures = 0
-                failed_urls = []
-            continue
-
-        consecutive_failures = 0
-        failed_urls = []
-
-        clean_url = _sanitize_url(detail_fetched.url)
-        if clean_url:
-            self.visited_urls.add(clean_url)
-        if self._is_retired_page(detail_fetched):
-            self.logger.info("Skip retired detail page url=%s", detail_fetched.url)
-            continue
-
-        await self._extract_professors_from_page(
-            current,
-            detail_fetched,
-            skills,
-            detail_mode=True,
-        )
-
-
-async def handle_detail_failure_decision(
-    self: Any,
-    current: Any,
-    failed_urls: list[str],
-    skills: str,
-) -> bool:
-    if not hasattr(self.fetcher, "request_decision") or not hasattr(self.fetcher, "wait_decision"):
-        return False
-    urls = list(dict.fromkeys(failed_urls))
-    if not urls:
-        return False
-    decision = await self.fetcher.request_decision(  # type: ignore[attr-defined]
-        kind="detail_fetch_failure",
-        org_unit_name=current.label or "Unknown",
-        failure_count=len(failed_urls),
-        sample_urls=urls[:3],
-        suggested_action="switch_failed_to_human",
-    )
-    action = await self.fetcher.wait_decision(decision.id)  # type: ignore[attr-defined]
-    if action != "switch_failed_to_human":
-        return False
-    self.logger.info(
-        "Switching failed detail links to human for org_unit=%s urls=%s",
-        current.label or "Unknown",
-        len(urls),
-    )
-    await self._process_detail_urls_with_human(urls, current, skills)
-    return True
 
 
 async def process_detail_urls_with_human(self: Any, urls: list[str], current: Any, skills: str) -> None:

@@ -171,7 +171,6 @@ class CrawlerAgent:
         self._university_cache: UniversityMeta | None = None
         self._skip_cross_run_dedup = False
         self._blocked_hosts: set[str] = set()
-        self._detail_fetcher: Fetcher | None = None
         self._detail_visited_urls: set[str] = set()
         self._detail_processed_by_org_unit: dict[str, int] = {}
         self._pipeline_stats: dict[str, Any] = {
@@ -210,15 +209,6 @@ class CrawlerAgent:
                 self.fetcher.set_status_provider(self.status_snapshot)  # type: ignore[attr-defined]
             except Exception:
                 pass
-
-        detail_fetcher_cm: Fetcher | None = None
-        if self._is_interactive and self.detail_enrich_enabled and self.detail_fetch_backend == "httpx":
-            detail_fetcher_cm = Fetcher(
-                request_interval_seconds=self.fetcher.request_interval_seconds if hasattr(self.fetcher, "request_interval_seconds") else 2.0,
-                max_retries=self.fetcher.max_retries if hasattr(self.fetcher, "max_retries") else 3,
-                timeout_seconds=self.fetcher._timeout_seconds if hasattr(self.fetcher, "_timeout_seconds") else 30.0,
-            )
-            self._detail_fetcher = await detail_fetcher_cm.__aenter__()
 
         try:
             self.logger.info("Starting crawl for %s", self.university_name)
@@ -337,10 +327,6 @@ class CrawlerAgent:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
-        finally:
-            if detail_fetcher_cm is not None:
-                await detail_fetcher_cm.__aexit__(None, None, None)
-            self._detail_fetcher = None
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
         links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
@@ -1730,17 +1716,6 @@ class CrawlerAgent:
     async def _enrich_profiles_with_human(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
         await agent_detail.enrich_profiles_with_human(self, current, fetched, skills)
 
-    async def _enrich_profiles_with_httpx(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
-        await agent_detail.enrich_profiles_with_httpx(self, current, fetched, skills)
-
-    async def _handle_detail_failure_decision(
-        self,
-        current: _QueuedUrl,
-        failed_urls: list[str],
-        skills: str,
-    ) -> bool:
-        return await agent_detail.handle_detail_failure_decision(self, current, failed_urls, skills)
-
     async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
         await agent_detail.process_detail_urls_with_human(self, urls, current, skills)
 
@@ -1938,10 +1913,6 @@ class CrawlerAgent:
                 fetched.block_reason,
                 len(fetched.links),
             )
-            if type(self.fetcher).__name__ == "Fetcher":
-                self.logger.warning(
-                    "Detected anti-bot blocking on httpx backend; consider rerun with --fetcher-backend playwright"
-                )
             self.execution_log.append(
                 f"fetch blocked url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
             )
