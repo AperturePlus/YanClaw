@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from agents.crawler.models import Professor
+from agents.crawler.models import Academician, Professor
 from agents.crawler.tools import get_crawler_tools
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
@@ -81,5 +81,38 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
         ],
     )
     assert retired_filtered == {"saved": 0, "filtered_retired": 1}
+
+    seeded_academician = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/academicians",
+        professors=[{"name": "Dup A", "title": "Academician", "email": "dup@example.edu.cn"}],
+    )
+    assert seeded_academician == {"saved": 0, "academicians_saved": 1}
+    deduped = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/faculty",
+        professors=[
+            {
+                "name": "Dup A",
+                "title": "Professor",
+                "email": "dup@example.edu.cn",
+                "bio": "focus on systems",
+            }
+        ],
+    )
+    assert deduped["saved"] == 0
+    assert deduped.get("deduped_by_academician") == 1
+    assert deduped.get("academicians_enriched") == 1
+    async with db.session() as session:
+        dup_prof = (
+            await session.execute(select(Professor).where(Professor.name == "Dup A"))
+        ).scalars().all()
+        assert len(dup_prof) == 0
+        dup_academician = (
+            await session.execute(select(Academician).where(Academician.name == "Dup A"))
+        ).scalar_one()
+        assert dup_academician.bio == "focus on systems"
 
     await db.close()

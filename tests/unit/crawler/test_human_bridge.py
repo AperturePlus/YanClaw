@@ -6,7 +6,7 @@ import pytest
 
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.fetchers.human_bridge import HumanFetcherBridge
-from agents.crawler.fetchers.human_models import FetchJobStatus, JobContext
+from agents.crawler.fetchers.human_models import FetchJob, FetchJobStatus, JobContext
 
 
 async def test_fetch_returns_result_on_complete():
@@ -104,3 +104,25 @@ async def test_filter_same_domain():
     assert "https://cs.pku.edu.cn/a" in result
     assert "https://math.pku.edu.cn/c" in result
     assert "https://google.com/b" not in result
+
+
+async def test_queue_next_skips_stale_failed_job():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    job = FetchJob(url="https://example.edu.cn/", context=JobContext())
+    await bridge.queue.submit(job)
+    bridge.queue.fail(job.id, "timeout")
+
+    next_job = await bridge.queue.next(timeout=0.05)
+    assert next_job is None
+
+
+async def test_queue_complete_cannot_override_failed_job():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    job = FetchJob(url="https://example.edu.cn/", context=JobContext())
+    await bridge.queue.submit(job)
+    bridge.queue.fail(job.id, "timeout")
+    bridge.queue.complete(job.id, html="<html><body>late</body></html>", url="https://example.edu.cn/late")
+
+    stored = bridge.queue.get(job.id)
+    assert stored is not None
+    assert stored.status == FetchJobStatus.FAILED

@@ -36,6 +36,7 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
                         "email": {"type": "string"},
                         "phone": {"type": "string"},
                         "homepage": {"type": "string"},
+                        "external_link": {"type": "string"},
                         "bio": {"type": "string"},
                         "enrollment_pref": {"type": "string"},
                         "publications": {
@@ -129,6 +130,8 @@ def get_crawler_tools(
     ) -> dict[str, Any]:
         saved = 0
         academicians_saved = 0
+        deduped_by_academician = 0
+        academicians_enriched = 0
         filtered_retired = 0
         errors: list[str] = []
         for professor in professors:
@@ -155,6 +158,32 @@ def get_crawler_tools(
                         await crawler_db.upsert_academician(session, data)
                         academicians_saved += 1
                     else:
+                        matched_academician, _reason = await crawler_db.match_academician_for_professor(
+                            session,
+                            name=str(cleaned.get("name") or ""),
+                            org_unit_name=str(cleaned.get("org_unit_name") or org_unit_name or ""),
+                            email=cleaned.get("email"),
+                            homepage=cleaned.get("homepage"),
+                            external_link=cleaned.get("external_link"),
+                        )
+                        if matched_academician is not None:
+                            enriched = await crawler_db.merge_into_academician_from_professor(
+                                session,
+                                matched_academician,
+                                title=cleaned.get("title"),
+                                research_areas=cleaned.get("research_areas"),
+                                email=cleaned.get("email"),
+                                phone=cleaned.get("phone"),
+                                homepage=cleaned.get("homepage"),
+                                external_link=cleaned.get("external_link"),
+                                bio=cleaned.get("bio"),
+                                enrollment_pref=cleaned.get("enrollment_pref"),
+                                publications=cleaned.get("publications"),
+                            )
+                            deduped_by_academician += 1
+                            if enriched:
+                                academicians_enriched += 1
+                            continue
                         await crawler_db.upsert_professor(session, data)
                         saved += 1
             except Exception as exc:
@@ -162,6 +191,10 @@ def get_crawler_tools(
         result: dict[str, Any] = {"saved": saved}
         if academicians_saved:
             result["academicians_saved"] = academicians_saved
+        if deduped_by_academician:
+            result["deduped_by_academician"] = deduped_by_academician
+        if academicians_enriched:
+            result["academicians_enriched"] = academicians_enriched
         if filtered_retired:
             result["filtered_retired"] = filtered_retired
         if errors:

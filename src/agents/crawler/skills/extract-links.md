@@ -42,8 +42,15 @@ Prefer links containing:
 ## Exclusions
 
 - News, notices, events, admissions, student affairs, alumni pages.
+- HR/personnel/recruitment pages (e.g. `renshi`, `hr`, `rczp`, `zhaopin`, `jobs`).
+- Policy/rules/party pages (e.g. `policy`, `zcwj`, `dangjian`, `party`).
 - Login/SSO/mail/library/download pages.
 - External non-university domains.
+
+## Anti-Noise Rule (Important)
+
+- If a page is under a faculty-related path but is actually a notice/news/policy list, treat it as noise and skip it.
+- Prefer stable directory/profile patterns such as `szdw`, `jsdw`, `teacher`, `faculty`, `people`, `/info/...`.
 
 ## Tool Usage
 

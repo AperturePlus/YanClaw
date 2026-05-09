@@ -86,6 +86,127 @@ def _looks_like_faculty_page(url: str) -> bool:
     return bool(_keyword_filter([url], FACULTY_KEYWORDS))
 
 
+_FACULTY_NOISE_URL_HINTS = (
+    "/news/",
+    "/xwzx/",
+    "/notice/",
+    "/tzgg/",
+    "/gonggao/",
+    "/announcement/",
+    "/events/",
+    "/event/",
+    "/rczp/",
+    "/zhaopin/",
+    "/jobs/",
+    "/job/",
+    "/hr/",
+    "/renshi/",
+    "/rsrc/",
+    "/rsc/",
+    "/personnel/",
+    "/policy/",
+    "/zcwj/",
+    "/rule/",
+    "/rules/",
+    "/regulation/",
+    "/dangjian/",
+    "/party/",
+    "/student/",
+    "/xsgz/",
+    "/zsjy/",
+    "/download/",
+)
+
+_FACULTY_NOISE_TOKEN_HINTS = frozenset(
+    {
+        "news",
+        "xwzx",
+        "notice",
+        "tzgg",
+        "gonggao",
+        "announcement",
+        "events",
+        "event",
+        "rczp",
+        "zhaopin",
+        "jobs",
+        "job",
+        "hr",
+        "renshi",
+        "rsrc",
+        "rsc",
+        "rszc",
+        "personnel",
+        "policy",
+        "zcwj",
+        "rule",
+        "rules",
+        "regulation",
+        "dangjian",
+        "party",
+        "student",
+        "xsgz",
+        "zsjy",
+        "download",
+    }
+)
+
+_FACULTY_NOISE_STEM_HINTS = frozenset({"rszc", "tzgg", "xwzx", "rczp", "zcwj", "renshi", "policy"})
+
+_EXPLICIT_FACULTY_DIR_HINTS = (
+    "/faculty/",
+    "/facultylist",
+    "/teacher/",
+    "/teachers/",
+    "/teacherlist",
+    "/staff/",
+    "/people/",
+    "/szdw/",
+    "/szdw.htm",
+    "/jsdw/",
+    "/szll",
+    "/qzjs",
+    "/mentor",
+    "/supervisor",
+    "/jzg",
+)
+
+
+def _iter_url_noise_tokens(url: str) -> list[str]:
+    parsed = urlparse(url.lower())
+    text = " ".join((parsed.path or "", parsed.query or "", parsed.fragment or ""))
+    return [token for token in re.split(r"[^a-z0-9]+", text) if token]
+
+
+def _matches_noise_stem(token: str) -> bool:
+    for stem in _FACULTY_NOISE_STEM_HINTS:
+        if not token.startswith(stem):
+            continue
+        suffix = token[len(stem) :]
+        if not suffix or suffix.isdigit():
+            return True
+    return False
+
+
+def _is_non_faculty_noise_url(url: str) -> bool:
+    lowered = url.lower()
+    if any(token in lowered for token in _FACULTY_NOISE_URL_HINTS):
+        return True
+    for token in _iter_url_noise_tokens(lowered):
+        if token in _FACULTY_NOISE_TOKEN_HINTS or _matches_noise_stem(token):
+            return True
+    # Dated news/article URLs are usually irrelevant for faculty extraction.
+    path = urlparse(lowered).path
+    if re.search(r"/20\d{2}/\d{2}(/\d{2})?/", path):
+        return True
+    return False
+
+
+def _is_explicit_faculty_directory_url(url: str) -> bool:
+    lowered = (url or "").lower()
+    return any(token in lowered for token in _EXPLICIT_FACULTY_DIR_HINTS)
+
+
 _ORG_UNIT_LISTING_STRONG_HINTS = (
     "/yx.htm",
     "/yxsz",
@@ -179,7 +300,7 @@ def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
             score -= 3
         return score
 
-    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    ranked = sorted(links, key=lambda link: (-_score(link), -len(link), link.lower()))
     deduped: list[str] = []
     seen: set[str] = set()
     for link in ranked:
@@ -351,7 +472,7 @@ def _rank_org_unit_page_candidates(links: list[str], start_url: str) -> list[str
             score += 1
         return score
 
-    ranked = sorted(links, key=lambda link: (_score(link), -len(link)), reverse=True)
+    ranked = sorted(links, key=lambda link: (-_score(link), -len(link), link.lower()))
     deduped: list[str] = []
     seen: set[str] = set()
     for link in ranked:
@@ -373,24 +494,185 @@ def _is_core_academic_kind(kind: str | None) -> bool:
     return any(token in value for token in core_tokens)
 
 
-def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int]:
-    kind = (unit.kind or "").strip().lower()
-    parsed = urlparse(unit.url)
+_FOCUS_COMPUTER_HINTS = (
+    "computer",
+    "computing",
+    "computer science",
+    "\u8ba1\u7b97\u673a",  # 计算机
+    "\u8ba1\u7b97\u673a\u79d1\u5b66",  # 计算机科学
+)
+_FOCUS_COMPUTER_HOST_LABELS = {"cs", "cse", "computer", "computing"}
+_FOCUS_COMPUTER_ASCII_TERMS = {"cs", "cse"}
+
+_FOCUS_SOFTWARE_HINTS = (
+    "software",
+    "software engineering",
+    "\u8f6f\u4ef6",  # 软件
+    "\u8f6f\u4ef6\u5de5\u7a0b",  # 软件工程
+)
+_FOCUS_SOFTWARE_HOST_LABELS = {"software", "se", "sse"}
+_FOCUS_SOFTWARE_ASCII_TERMS = {"software"}
+
+_FOCUS_AI_HINTS = (
+    "artificial intelligence",
+    "machine intelligence",
+    "\u4eba\u5de5\u667a\u80fd",  # 人工智能
+    "\u667a\u80fd\u79d1\u5b66",  # 智能科学
+)
+_FOCUS_AI_HOST_LABELS = {"ai", "iai", "aai"}
+_FOCUS_AI_ASCII_TERMS = {"ai"}
+
+_FOCUS_ELECTRONICS_HINTS = (
+    "electronics",
+    "electronic",
+    "electrical",
+    "microelectronics",
+    "information engineering",
+    "information science",
+    "\u7535\u5b50\u4fe1\u606f",  # 电子信息
+    "\u7535\u6c14\u5de5\u7a0b",  # 电气工程
+    "\u5fae\u7535\u5b50",  # 微电子
+)
+_FOCUS_ELECTRONICS_HOST_LABELS = {
+    "ee",
+    "ece",
+    "eie",
+    "electronic",
+    "electronics",
+    "microelectronics",
+}
+_FOCUS_ELECTRONICS_ASCII_TERMS = {"ee", "ece", "eie"}
+
+
+def _ascii_terms(value: str) -> set[str]:
+    return {term for term in re.split(r"[^a-z0-9]+", value.lower()) if term}
+
+
+def _matches_focus_bucket(
+    *,
+    text: str,
+    host_labels: set[str],
+    ascii_terms: set[str],
+    hint_tokens: tuple[str, ...],
+    host_tokens: set[str],
+    ascii_tokens: set[str],
+) -> bool:
+    if host_labels & host_tokens:
+        return True
+    if ascii_terms & ascii_tokens:
+        return True
+    return any(token in text for token in hint_tokens)
+
+
+def _org_unit_focus_rank(unit: OrgUnit) -> int:
+    name = (getattr(unit, "name", "") or "").strip().lower()
+    kind = (getattr(unit, "kind", "") or "").strip().lower()
+    parsed = urlparse((getattr(unit, "url", "") or "").strip().lower())
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower()
+    text = f"{name} {kind} {host} {path}"
+
+    host_labels = {label for label in re.split(r"[.\-]+", host) if label}
+    ascii_terms = _ascii_terms(f"{name} {kind} {path}")
+
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_COMPUTER_HINTS,
+        host_tokens=_FOCUS_COMPUTER_HOST_LABELS,
+        ascii_tokens=_FOCUS_COMPUTER_ASCII_TERMS,
+    ):
+        return 0
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_SOFTWARE_HINTS,
+        host_tokens=_FOCUS_SOFTWARE_HOST_LABELS,
+        ascii_tokens=_FOCUS_SOFTWARE_ASCII_TERMS,
+    ):
+        return 1
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_AI_HINTS,
+        host_tokens=_FOCUS_AI_HOST_LABELS,
+        ascii_tokens=_FOCUS_AI_ASCII_TERMS,
+    ):
+        return 2
+    if _matches_focus_bucket(
+        text=text,
+        host_labels=host_labels,
+        ascii_terms=ascii_terms,
+        hint_tokens=_FOCUS_ELECTRONICS_HINTS,
+        host_tokens=_FOCUS_ELECTRONICS_HOST_LABELS,
+        ascii_tokens=_FOCUS_ELECTRONICS_ASCII_TERMS,
+    ):
+        return 3
+    return 4
+
+def _org_unit_faculty_priority(unit: OrgUnit, start_host: str) -> tuple[int, int, int, int, int]:
+    kind = (getattr(unit, "kind", "") or "").strip().lower()
+    parsed = urlparse(getattr(unit, "url", "") or "")
     host = (parsed.hostname or "").lower()
     path = parsed.path.lower()
 
+    focus_rank = _org_unit_focus_rank(unit)
     core_rank = 0 if _is_core_academic_kind(kind) else 1
     host_rank = 0 if host != start_host else 1
     detail_rank = 1 if ("/info/" in path or "/news/" in path or "/notice/" in path) else 0
     path_depth = max(0, path.count("/") - 1)
-    return (core_rank, detail_rank, host_rank, path_depth)
+    return (focus_rank, core_rank, detail_rank, host_rank, path_depth)
 
 
 def _is_faculty_platform(url: str) -> bool:
-    """Return True if URL belongs to a faculty.xxx.edu.cn homepage platform (not a real faculty list)."""
+    """Return True if URL belongs to a shared faculty/teacher platform subdomain."""
     host = (urlparse(url).hostname or "").lower()
     first = host.split(".")[0] if host else ""
-    return first.startswith("faculty")
+    return first.startswith("faculty") or first.startswith("teacher")
+
+
+def _allow_faculty_candidate_for_org_unit(url: str, *, org_unit_url: str, start_url: str) -> bool:
+    """
+    Strict host gate for faculty discovery:
+    - Allow org-unit host itself.
+    - Allow start_host only for explicit faculty directory paths.
+    - Reject sibling subdomains and shared teacher/faculty platforms.
+    """
+    candidate_host = (urlparse(url).hostname or "").lower()
+    org_host = (urlparse(org_unit_url).hostname or "").lower()
+    start_host = (urlparse(start_url).hostname or "").lower()
+    if not candidate_host:
+        return False
+    if _is_faculty_platform(url):
+        return False
+    if candidate_host == org_host:
+        return True
+    if candidate_host == start_host and _is_explicit_faculty_directory_url(url):
+        return True
+    return False
+
+
+def _allow_faculty_candidate_for_host_set(url: str, *, start_url: str, org_unit_hosts: set[str]) -> bool:
+    """
+    Strict host gate when no single org unit is bound (e.g. search fallback):
+    - Allow any known org-unit host.
+    - Allow start_host only for explicit faculty directory paths.
+    - Reject sibling subdomains and shared teacher/faculty platforms.
+    """
+    candidate_host = (urlparse(url).hostname or "").lower()
+    start_host = (urlparse(start_url).hostname or "").lower()
+    if not candidate_host:
+        return False
+    if _is_faculty_platform(url):
+        return False
+    if candidate_host in org_unit_hosts:
+        return True
+    if candidate_host == start_host and _is_explicit_faculty_directory_url(url):
+        return True
+    return False
 
 
 def _is_college_subdomain(url: str, start_url: str) -> bool:
@@ -550,4 +832,7 @@ def _dedupe_query_terms(query: str) -> str:
         seen.add(key)
         deduped.append(term)
     return " ".join(deduped)
+
+
+
 

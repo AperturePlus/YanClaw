@@ -4,11 +4,12 @@ import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
 import { isErrorPage, sameHost, urlMatches } from './utils';
 
-const POLL_INTERVAL = 1000;
-const FAST_POLL_INTERVAL = 250;
+const POLL_INTERVAL = 2500;
+const FAST_POLL_INTERVAL = 600;
 const FAST_POLL_ROUNDS = 4;
-const AUTO_CHECK_INTERVAL = 1000;
+const AUTO_CHECK_INTERVAL = 1500;
 const AUTO_SUBMIT_DELAY = 2000;
+const DECISION_POLL_INTERVAL = 5000;
 const ERROR_RETRY_DELAY = 5000;
 const MAX_ERROR_RETRIES = 3;
 const DEFAULT_DECISION_ACTION = 'switch_failed_to_human';
@@ -19,28 +20,56 @@ let submitting = false;
 let polling = false;
 let decisionPromptedId: string | null = null;
 let resolvingDecision = false;
+let lastDecisionCheckAt = 0;
 
 /** Sync persisted state with backend on page load. */
 export async function recoverState(): Promise<void> {
+  let changed = false;
   try {
     const status = await api.fetchStatus();
-    if (!status) return;
-    state.connected = true;
+    if (!status) {
+      if (state.connected) {
+        state.connected = false;
+        changed = true;
+      }
+      if (changed) notify();
+      return;
+    }
+    if (!state.connected) {
+      state.connected = true;
+      changed = true;
+    }
+    const pendingId = status.pending_decision?.id ?? null;
+    if ((state.pendingDecision?.id ?? null) !== pendingId) {
+      changed = true;
+    }
     state.pendingDecision = status.pending_decision ?? null;
     if (status.current_job) {
-      setJob(status.current_job);
-    } else if (state.currentJob) {
-      clearJob();
+      if ((state.currentJob?.id ?? null) !== status.current_job.id) {
+        state.currentJob = status.current_job;
+        changed = true;
+      }
+    } else if (state.currentJob !== null) {
+      state.currentJob = null;
+      changed = true;
     }
   } catch {
-    state.connected = false;
+    if (state.connected) {
+      state.connected = false;
+      changed = true;
+    }
   }
-  notify();
+  if (changed) {
+    notify();
+  }
 }
 
 export function startPolling(): void {
+  if (pollTimer !== null) return;
   void pollNext();
-  pollTimer = setInterval(pollNext, POLL_INTERVAL);
+  pollTimer = setInterval(() => {
+    void pollNext();
+  }, POLL_INTERVAL);
 }
 
 export function stopPolling(): void {
@@ -52,7 +81,7 @@ export function stopPolling(): void {
 
 /**
  * Start a persistent watcher that auto-submits when the current page
- * matches the job URL. Runs every second so it survives redirects,
+ * matches the job URL. Runs periodically so it survives redirects,
  * late JS rendering, and page load timing issues.
  */
 export function startAutoWatcher(): void {
@@ -60,10 +89,18 @@ export function startAutoWatcher(): void {
   autoCheckTimer = setInterval(autoCheck, AUTO_CHECK_INTERVAL);
 }
 
+export function stopAutoWatcher(): void {
+  if (autoCheckTimer !== null) {
+    clearInterval(autoCheckTimer);
+    autoCheckTimer = null;
+  }
+}
+
 let matchedSince: number | null = null;
 let errorRetries = 0;
 
 function autoCheck(): void {
+  if (state.instanceRole !== 'owner') return;
   const job = state.currentJob;
   if (!job || !state.autoMode || state.paused || submitting) {
     matchedSince = null;
@@ -90,7 +127,7 @@ function autoCheck(): void {
       matchedSince = Date.now();
     } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
       matchedSince = null;
-      submitCurrent();
+      void submitCurrent();
     }
   } else {
     matchedSince = null;
@@ -98,19 +135,34 @@ function autoCheck(): void {
 }
 
 async function pollNext(): Promise<void> {
-  await checkPendingDecision();
+  if (state.instanceRole !== 'owner') return;
+  const now = Date.now();
+  if (now - lastDecisionCheckAt >= DECISION_POLL_INTERVAL) {
+    lastDecisionCheckAt = now;
+    await checkPendingDecision();
+  }
+
+  if (document.visibilityState === 'hidden' && !state.currentJob) return;
   if (state.paused || state.currentJob || polling) return;
+
+  const connectedBefore = state.connected;
+  let jobAssigned = false;
   polling = true;
   try {
     const job = await api.fetchNextJob();
     state.connected = true;
-    if (job) assignJob(job);
+    if (job) {
+      assignJob(job);
+      jobAssigned = true;
+    }
   } catch {
     state.connected = false;
   } finally {
     polling = false;
   }
-  notify();
+  if (!jobAssigned && state.connected !== connectedBefore) {
+    notify();
+  }
 }
 
 function assignJob(job: import('./types').FetchJob): void {
@@ -132,6 +184,7 @@ function triggerFastPollBurst(): void {
 }
 
 async function checkPendingDecision(): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   if (resolvingDecision) return;
   const previousId = state.pendingDecision?.id ?? null;
   try {
@@ -179,12 +232,14 @@ async function resolvePendingDecision(decision: PendingDecision, action: string)
 }
 
 export async function switchPendingDecisionToHuman(): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   const decision = state.pendingDecision;
   if (!decision) return;
   await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
 }
 
 export async function submitCurrent(): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   const job = state.currentJob;
   if (!job || submitting) return;
   if (isErrorPage()) {
@@ -211,6 +266,7 @@ export async function submitCurrent(): Promise<void> {
 }
 
 export async function skipCurrent(): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   const job = state.currentJob;
   if (!job) return;
   try {
@@ -222,6 +278,7 @@ export async function skipCurrent(): Promise<void> {
 }
 
 export async function failCurrent(msg?: string): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   const job = state.currentJob;
   if (!job) return;
   try {
@@ -233,6 +290,7 @@ export async function failCurrent(msg?: string): Promise<void> {
 }
 
 export async function overrideUrl(): Promise<void> {
+  if (state.instanceRole !== 'owner') return;
   const job = state.currentJob;
   if (!job) return;
   const url = prompt('输入正确的 URL:', job.url);

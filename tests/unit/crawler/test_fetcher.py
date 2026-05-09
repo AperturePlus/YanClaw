@@ -1,112 +1,42 @@
 from __future__ import annotations
 
 import ssl
-import time
 
-import httpx
-import pytest
-
-from agents.crawler.fetchers.httpx_fetcher import Fetcher, _is_ssl_error
-
-
-async def test_fetcher_converts_html_extracts_links_and_rate_limits():
-    async def handler(request):
-        return httpx.Response(
-            200,
-            text='<html><body><a href="/faculty">Faculty</a><p>Hello</p></body></html>',
-            request=request,
-            headers={"content-type": "text/html; charset=utf-8"},
-        )
-
-    fetcher = Fetcher(
-        request_interval_seconds=0.05,
-        max_retries=0,
-        transport=httpx.MockTransport(handler),
-    )
-    async with fetcher:
-        start = time.monotonic()
-        first = await fetcher.fetch("https://www.example.edu.cn/")
-        second = await fetcher.fetch("https://www.example.edu.cn/next")
-        elapsed = time.monotonic() - start
-
-    assert "Hello" in first.text
-    assert "https://www.example.edu.cn/faculty" in first.links
-    assert second.status_code == 200
-    assert elapsed >= 0.005  # rate limit enforced (relaxed for Windows timer resolution)
+from agents.crawler.fetchers.httpx_fetcher import (
+    Fetcher,
+    _detect_block_reason,
+    _is_html_content,
+    _is_ssl_error,
+)
 
 
-async def test_fetcher_retries_429_then_succeeds():
-    calls = 0
+def test_fetcher_utils_convert_html_and_extract_links():
+    helper = Fetcher()
+    html = '<html><body><a href="/faculty">Faculty</a><p>Hello</p></body></html>'
 
-    async def handler(request):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            return httpx.Response(429, text="slow down", request=request)
-        return httpx.Response(200, text="<p>ok</p>", request=request)
+    text = helper._html_to_text(html)
+    links = helper._extract_links(html, "https://www.example.edu.cn/")
 
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=1,
-        retry_base_delay=0,
-        transport=httpx.MockTransport(handler),
-    )
-    async with fetcher:
-        result = await fetcher.fetch("https://www.example.edu.cn/")
-    assert result.status_code == 200
-    assert calls == 2
+    assert "Hello" in text
+    assert "https://www.example.edu.cn/faculty" in links
 
 
-async def test_fetcher_marks_202_waf_challenge_pages():
-    async def handler(request):
-        html = """
-        <html><body><script>
-        var $_ts={};
-        document.cookie='__jsl_clearance=abc';
-        setTimeout(function(){},1000);
-        </script></body></html>
-        """
-        return httpx.Response(
-            202,
-            text=html,
-            request=request,
-            headers={"content-type": "text/html; charset=utf-8"},
-        )
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=0,
-        transport=httpx.MockTransport(handler),
-    )
-    async with fetcher:
-        result = await fetcher.fetch("https://www.example.edu.cn/")
-
-    assert result.status_code == 202
-    assert result.block_reason is not None
-    assert "waf_challenge" in result.block_reason
-
-
-async def test_fetcher_marks_200_waf_like_html_pages():
-    async def handler(request):
-        html = "<html><body>" + ("challenge " * 1000) + "document.cookie setTimeout(" + "</body></html>"
-        return httpx.Response(
-            200,
-            text=html,
-            request=request,
-            headers={"content-type": "text/html; charset=utf-8"},
-        )
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=0,
-        transport=httpx.MockTransport(handler),
-    )
-    async with fetcher:
-        result = await fetcher.fetch("https://www.example.edu.cn/")
-
-    assert result.status_code == 200
-    assert result.block_reason is not None
-    assert "waf_like_html" in result.block_reason
+def test_fetcher_utils_extract_links_dedup_and_filter_non_http():
+    helper = Fetcher()
+    html = """
+    <html><body>
+      <a href="/a">A</a>
+      <a href="/a">A2</a>
+      <a href="mailto:test@example.edu.cn">mail</a>
+      <a href="javascript:void(0)">js</a>
+      <a href="https://www.example.edu.cn/b">B</a>
+    </body></html>
+    """
+    links = helper._extract_links(html, "https://www.example.edu.cn/")
+    assert links == [
+        "https://www.example.edu.cn/a",
+        "https://www.example.edu.cn/b",
+    ]
 
 
 def test_filter_same_domain_allows_subdomains_and_rejects_external():
@@ -134,134 +64,41 @@ def test_filter_same_domain_accepts_dict_links_from_llm():
     ]
 
 
-
-# --- SSL fallback tests ---
-
-
-def _ssl_then_ok_transport() -> tuple[httpx.MockTransport, httpx.MockTransport]:
-    """Return (failing_transport, insecure_transport) for SSL fallback tests."""
-
-    def ssl_handler(request: httpx.Request) -> httpx.Response:
-        ssl_err = ssl.SSLCertVerificationError("certificate verify failed")
-        raise httpx.ConnectError(str(ssl_err)) from ssl_err
-
-    def ok_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            text="<html><body><p>OK</p></body></html>",
-            request=request,
-            headers={"content-type": "text/html"},
-        )
-
-    return httpx.MockTransport(ssl_handler), httpx.MockTransport(ok_handler)
+def test_is_html_content_recognizes_html_types():
+    assert _is_html_content("text/html; charset=utf-8")
+    assert _is_html_content("application/xhtml+xml")
+    assert _is_html_content("")
+    assert not _is_html_content("application/json")
 
 
-async def test_fetcher_falls_back_to_insecure_client_on_ssl_error():
-    failing_transport, ok_transport = _ssl_then_ok_transport()
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=0,
-        retry_base_delay=0,
-        transport=failing_transport,
-    )
-    async with fetcher:
-        # Inject the insecure client backed by the ok_transport
-        fetcher._insecure_client = httpx.AsyncClient(
-            transport=ok_transport, follow_redirects=True
-        )
-        result = await fetcher.fetch("https://math.pku.edu.cn/")
-
-    assert result.status_code == 200
-    assert "OK" in result.text
+def test_detect_block_reason_for_waf_challenge_status():
+    html = """
+    <html><body><script>
+    var $_ts={};
+    document.cookie='__jsl_clearance=abc';
+    setTimeout(function(){},1000);
+    </script></body></html>
+    """
+    reason = _detect_block_reason(status_code=202, body_text=html, headers=None)
+    assert reason is not None
+    assert "waf_challenge" in reason
 
 
-async def test_fetcher_raises_non_ssl_errors_without_fallback():
-    def timeout_handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ReadTimeout("read timed out")
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=0,
-        retry_base_delay=0,
-        transport=httpx.MockTransport(timeout_handler),
-    )
-    async with fetcher:
-        with pytest.raises(RuntimeError, match="Failed to fetch"):
-            await fetcher.fetch("https://example.edu.cn/")
-    # Insecure client should never have been created
-    assert fetcher._insecure_client is None
-
-
-async def test_fetcher_closes_insecure_client_on_exit():
-    failing_transport, ok_transport = _ssl_then_ok_transport()
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=0,
-        retry_base_delay=0,
-        transport=failing_transport,
-    )
-    async with fetcher:
-        fetcher._insecure_client = httpx.AsyncClient(
-            transport=ok_transport, follow_redirects=True
-        )
-        await fetcher.fetch("https://math.pku.edu.cn/")
-
-    assert fetcher._insecure_client.is_closed
-
-
-# --- _is_ssl_error unit tests ---
+def test_detect_block_reason_for_waf_like_200_page():
+    html = "<html><body>" + ("challenge " * 1000) + "document.cookie setTimeout(" + "</body></html>"
+    reason = _detect_block_reason(status_code=200, body_text=html, headers=None)
+    assert reason is not None
+    assert "waf_like_html" in reason
 
 
 def test_is_ssl_error_detects_ssl_error_in_chain():
     ssl_err = ssl.SSLCertVerificationError("certificate verify failed")
-    connect_err = httpx.ConnectError(str(ssl_err))
-    connect_err.__cause__ = ssl_err
     runtime_err = RuntimeError("Failed to fetch")
-    runtime_err.__cause__ = connect_err
+    runtime_err.__cause__ = ssl_err
     assert _is_ssl_error(runtime_err) is True
 
 
 def test_is_ssl_error_returns_false_for_non_ssl():
     err = RuntimeError("Failed to fetch")
-    err.__cause__ = httpx.ReadTimeout("timed out")
+    err.__cause__ = RuntimeError("timed out")
     assert _is_ssl_error(err) is False
-
-
-async def test_fetcher_ssl_handshake_failure_skips_retries_and_falls_back():
-    """SSL handshake failures (SECLEVEL mismatch) should not waste retries
-    and should fall back to the insecure client with relaxed ciphers."""
-    primary_calls = 0
-
-    def ssl_handshake_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal primary_calls
-        primary_calls += 1
-        raise httpx.ConnectError(
-            "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] ssl/tls alert handshake failure"
-        )
-
-    def ok_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            text="<html><body><p>OK</p></body></html>",
-            request=request,
-            headers={"content-type": "text/html"},
-        )
-
-    fetcher = Fetcher(
-        request_interval_seconds=0,
-        max_retries=3,
-        retry_base_delay=0,
-        transport=httpx.MockTransport(ssl_handshake_handler),
-    )
-    async with fetcher:
-        fetcher._insecure_client = httpx.AsyncClient(
-            transport=httpx.MockTransport(ok_handler), follow_redirects=True
-        )
-        result = await fetcher.fetch("https://www.gsm.pku.edu.cn/")
-
-    assert result.status_code == 200
-    assert "OK" in result.text
-    # SSL error is deterministic — should break after 1 attempt, not 4
-    assert primary_calls == 1

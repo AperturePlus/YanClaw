@@ -1,4 +1,4 @@
-"""Fetcher backends for the crawler agent.
+"""Fetcher utilities and human bridge for the crawler agent.
 
 Public API re-exports so consumers can write::
 

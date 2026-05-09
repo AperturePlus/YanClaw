@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import httpx
 from sqlalchemy import select
 
 from functools import partial
@@ -11,7 +10,7 @@ from functools import partial
 from agents.crawler.agent import CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher
-from agents.crawler.fetchers import Fetcher, _site_root
+from agents.crawler.fetchers import FetchResult, Fetcher, _site_root
 from agents.crawler.models import CrawlLog, OrgUnit, Professor, UniversityMeta
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallRecord
@@ -56,6 +55,31 @@ def _sqlite_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path.as_posix()}"
 
 
+class _InMemoryFetcher:
+    def __init__(self, pages: dict[str, str]) -> None:
+        self._pages = pages
+        self._helper = Fetcher()
+
+    async def __aenter__(self) -> "_InMemoryFetcher":
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+    async def fetch(self, url: str) -> FetchResult:
+        html = self._pages[url]
+        return FetchResult(
+            url=url,
+            text=self._helper._html_to_text(html),
+            links=self._helper._extract_links(html, url),
+            status_code=200,
+        )
+
+    @staticmethod
+    def filter_same_domain(links, base_url):
+        return Fetcher.filter_same_domain(links, base_url)
+
+
 async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -81,14 +105,6 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         "https://www.example.edu.cn/cs/faculty": "<html><body><h1>Faculty</h1><p>Ada Professor Systems ada@example.edu.cn. Our faculty members are leaders in their fields.</p></body></html>",
     }
 
-    async def handler(request):
-        return httpx.Response(
-            200,
-            text=pages[str(request.url)],
-            request=request,
-            headers={"content-type": "text/html; charset=utf-8"},
-        )
-
     settings = CrawlerSettings(
         websites_path=websites,
         crawler_skills_dir=skills_dir,
@@ -101,11 +117,7 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         settings=settings,
         agent_factory=partial(CrawlerAgent, min_org_units=1),
         llm_client_factory=lambda: IntegrationLLM(),
-        fetcher_factory=lambda: Fetcher(
-            request_interval_seconds=0,
-            max_retries=0,
-            transport=httpx.MockTransport(handler),
-        ),
+        fetcher_factory=lambda: _InMemoryFetcher(pages),
     )
 
     summary = await dispatcher.run()
@@ -126,7 +138,7 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         assert [u.name for u in units] == ["CS"]
         assert len(logs) == 4
 
-    second = await dispatcher.run()
+    second = await dispatcher.run(resume=True)
     assert second.skipped == 1
 
     await db.close()

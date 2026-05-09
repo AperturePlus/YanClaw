@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -124,19 +125,40 @@ class JobQueue:
 
     async def next(self, timeout: float = 0) -> FetchJob | None:
         """Return the next pending job, or None if queue is empty."""
-        try:
-            job = await asyncio.wait_for(self._pending.get(), timeout=timeout)
-        except (asyncio.TimeoutError, TimeoutError):
-            return None
-        job.status = FetchJobStatus.ASSIGNED
-        job.assigned_at = datetime.now(timezone.utc)
-        return job
+        if timeout <= 0:
+            while True:
+                try:
+                    job = self._pending.get_nowait()
+                except asyncio.QueueEmpty:
+                    return None
+                if job.status != FetchJobStatus.PENDING:
+                    continue
+                job.status = FetchJobStatus.ASSIGNED
+                job.assigned_at = datetime.now(timezone.utc)
+                return job
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                job = await asyncio.wait_for(self._pending.get(), timeout=remaining)
+            except (asyncio.TimeoutError, TimeoutError):
+                return None
+            if job.status != FetchJobStatus.PENDING:
+                continue
+            job.status = FetchJobStatus.ASSIGNED
+            job.assigned_at = datetime.now(timezone.utc)
+            return job
 
     def get(self, job_id: str) -> FetchJob | None:
         return self._jobs.get(job_id)
 
     def complete(self, job_id: str, *, html: str, url: str | None = None, title: str | None = None) -> FetchJob:
         job = self._require(job_id)
+        if job.status in {FetchJobStatus.COMPLETED, FetchJobStatus.FAILED, FetchJobStatus.SKIPPED}:
+            return job
         job.status = FetchJobStatus.COMPLETED
         job.completed_at = datetime.now(timezone.utc)
         job.result_html = html
@@ -147,6 +169,8 @@ class JobQueue:
 
     def fail(self, job_id: str, message: str = "") -> FetchJob:
         job = self._require(job_id)
+        if job.status in {FetchJobStatus.COMPLETED, FetchJobStatus.FAILED, FetchJobStatus.SKIPPED}:
+            return job
         job.status = FetchJobStatus.FAILED
         job.completed_at = datetime.now(timezone.utc)
         job.error_message = message
@@ -155,6 +179,8 @@ class JobQueue:
 
     def skip(self, job_id: str) -> FetchJob:
         job = self._require(job_id)
+        if job.status in {FetchJobStatus.COMPLETED, FetchJobStatus.FAILED, FetchJobStatus.SKIPPED}:
+            return job
         job.status = FetchJobStatus.SKIPPED
         job.completed_at = datetime.now(timezone.utc)
         job.done_event.set()

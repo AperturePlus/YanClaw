@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -23,9 +24,17 @@ class ToolCallRecord:
 
 
 @dataclass
+class ToolCallErrorRecord:
+    name: str
+    raw_args_preview: str
+    error_type: str
+
+
+@dataclass
 class LLMResult:
     content: str
     tool_call_log: list[ToolCallRecord] = field(default_factory=list)
+    invalid_tool_calls: list[ToolCallErrorRecord] = field(default_factory=list)
 
 
 class LLMResponseError(RuntimeError):
@@ -53,6 +62,9 @@ class LLMClient:
         max_concurrent: int = 2,
         min_interval: float = 1.0,
         timeout_seconds: float = 120.0,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int | None = None,
         client: Any | None = None,
     ) -> None:
         self.base_url = base_url
@@ -62,6 +74,9 @@ class LLMClient:
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
         self.timeout_seconds = timeout_seconds
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = int(seed) if seed is not None else None
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._min_interval = min_interval
         self._last_call_time: float = 0
@@ -83,12 +98,17 @@ class LLMClient:
         working_messages: list[dict[str, Any]] = list(messages)
         handlers = tool_handlers or {}
         records: list[ToolCallRecord] = []
+        invalid_calls: list[ToolCallErrorRecord] = []
         last_content = ""
 
         for round_index in range(1, self.max_rounds + 1):
             self.logger.debug("LLM call round=%s model=%s", round_index, self.model)
             chat_tools = self._as_chat_tools(tools) if tools else None
             request: dict[str, Any] = {"model": self.model, "messages": working_messages}
+            request["temperature"] = self.temperature
+            request["top_p"] = self.top_p
+            if self.seed is not None:
+                request["seed"] = self.seed
             if chat_tools:
                 request["tools"] = chat_tools
             if max_tokens is not None:
@@ -114,7 +134,11 @@ class LLMClient:
             if content:
                 self.logger.debug("LLM response preview: %s", self._preview_text(content))
             if not tool_calls:
-                return LLMResult(content=last_content, tool_call_log=records)
+                return LLMResult(
+                    content=last_content,
+                    tool_call_log=records,
+                    invalid_tool_calls=invalid_calls,
+                )
 
             # Append assistant message (including provider-specific fields such as reasoning_content).
             working_messages.append(message)
@@ -124,10 +148,16 @@ class LLMClient:
                 function = tool_call.get("function") or {}
                 name = function.get("name") or ""
                 raw_args = function.get("arguments") or "{}"
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-                except json.JSONDecodeError:
+                args = self._parse_tool_arguments(raw_args)
+                if args is None:
                     self.logger.warning("Invalid JSON in tool arguments for %s: %s", name, str(raw_args)[:200])
+                    invalid_calls.append(
+                        ToolCallErrorRecord(
+                            name=name,
+                            raw_args_preview=str(raw_args)[:500],
+                            error_type="invalid_json",
+                        )
+                    )
                     working_messages.append(
                         {
                             "role": "tool",
@@ -166,10 +196,18 @@ class LLMClient:
             # Most crawler tools are "fire-and-forget" (persisting results). Avoid a second
             # LLM round to reduce latency and to prevent provider-specific requirements
             # (e.g. DeepSeek thinking mode requiring reasoning_content passback).
-            return LLMResult(content=last_content, tool_call_log=records)
+            return LLMResult(
+                content=last_content,
+                tool_call_log=records,
+                invalid_tool_calls=invalid_calls,
+            )
 
         self.logger.warning("LLM tool loop stopped after max_rounds=%s", self.max_rounds)
-        return LLMResult(content=last_content, tool_call_log=records)
+        return LLMResult(
+            content=last_content,
+            tool_call_log=records,
+            invalid_tool_calls=invalid_calls,
+        )
 
     async def _call_with_retry(self, **request: Any) -> Any:
         _RETRYABLE_CODES = {429, 500, 502, 503, 529}
@@ -277,3 +315,170 @@ class LLMClient:
         if isinstance(value, dict):
             return value.get(key)
         return getattr(value, key, None)
+
+    def _parse_tool_arguments(self, raw_args: Any) -> dict[str, Any] | None:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if raw_args is None:
+            return {}
+        if not isinstance(raw_args, str):
+            try:
+                return dict(raw_args)
+            except Exception:
+                return None
+
+        text = raw_args.strip()
+        if not text:
+            return {}
+
+        # Some providers wrap JSON in markdown fences.
+        if text.startswith("```"):
+            fenced = self._strip_json_fence(text)
+            if fenced:
+                text = fenced
+
+        candidates = [text]
+
+        escaped = self._escape_unescaped_string_controls(text)
+        if escaped != text:
+            candidates.append(escaped)
+
+        for candidate in list(candidates):
+            stripped_commas = re.sub(r",(\s*[}\]])", r"\1", candidate)
+            if stripped_commas != candidate:
+                candidates.append(stripped_commas)
+
+            sliced = self._slice_to_json_object(candidate)
+            if sliced and sliced != candidate:
+                candidates.append(sliced)
+
+            repaired = self._repair_truncated_json_object(candidate)
+            if repaired and repaired != candidate:
+                candidates.append(repaired)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            try:
+                parsed = json.loads(normalized)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+            return {"value": parsed}
+        return None
+
+    def _strip_json_fence(self, text: str) -> str:
+        lines = text.splitlines()
+        if len(lines) < 2:
+            return text
+        if not lines[0].lstrip().startswith("```"):
+            return text
+        if not lines[-1].strip().startswith("```"):
+            return text
+        return "\n".join(lines[1:-1]).strip()
+
+    def _slice_to_json_object(self, text: str) -> str:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return text
+        return text[start : end + 1]
+
+    def _escape_unescaped_string_controls(self, text: str) -> str:
+        out: list[str] = []
+        in_string = False
+        escaped = False
+        for ch in text:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_string = not in_string
+                continue
+            if in_string and ch in {"\n", "\r", "\t"}:
+                if ch == "\n":
+                    out.append("\\n")
+                elif ch == "\r":
+                    out.append("\\r")
+                else:
+                    out.append("\\t")
+                continue
+            out.append(ch)
+        return "".join(out)
+
+    def _repair_truncated_json_object(self, text: str) -> str | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+        candidate = text[start:].strip()
+        if not candidate:
+            return None
+
+        out: list[str] = []
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        closer_map = {"{": "}", "[": "]"}
+        opener_for = {"}": "{", "]": "["}
+
+        for ch in candidate:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                continue
+
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                continue
+
+            if ch == '"':
+                out.append(ch)
+                in_string = not in_string
+                continue
+
+            if in_string:
+                if ch in {"\n", "\r", "\t"}:
+                    if ch == "\n":
+                        out.append("\\n")
+                    elif ch == "\r":
+                        out.append("\\r")
+                    else:
+                        out.append("\\t")
+                else:
+                    out.append(ch)
+                continue
+
+            if ch in closer_map:
+                stack.append(ch)
+                out.append(ch)
+                continue
+            if ch in opener_for:
+                if stack and stack[-1] == opener_for[ch]:
+                    stack.pop()
+                    out.append(ch)
+                # Drop unmatched closers in malformed outputs.
+                continue
+
+            out.append(ch)
+
+        if escaped:
+            out.append("\\")
+        if in_string:
+            out.append('"')
+
+        while stack:
+            opener = stack.pop()
+            out.append(closer_map[opener])
+
+        return "".join(out).strip()

@@ -77,5 +77,5 @@ def list_cookie_files(cookies_dir: Path = _DEFAULT_DIR) -> list[tuple[str, int]]
 
 
 def cookies_to_httpx(cookies: CookieList) -> dict[str, str]:
-    """Convert Playwright-format cookies to a simple ``{name: value}`` dict for httpx/curl_cffi."""
+    """Convert browser-exported cookies to a simple ``{name: value}`` dictionary."""
     return {c["name"]: c["value"] for c in cookies if "name" in c and "value" in c}

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -19,12 +20,15 @@ class CrawlerSettings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    llm_temperature: float = Field(default=0.0, ge=0.0)
+    llm_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    llm_seed: int | None = None
     max_concurrency: int = Field(default=3, ge=1)
     request_interval_seconds: float = Field(default=2.0, ge=0)
     max_retries: int = Field(default=3, ge=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
-    university_timeout_seconds: float = Field(default=3600.0, gt=0)
+    university_timeout_seconds: float = Field(default=36000.0, gt=0)
     model_max_tokens: int = Field(default=128000, gt=0)
     response_reserved_tokens: int = Field(default=2000, ge=0)
     log_dir: Path = Path("logs")
@@ -32,14 +36,18 @@ class CrawlerSettings(BaseSettings):
     crawler_skills_dir: Path = Path("src/agents/crawler/skills")
     websites_path: Path = Path("assets/websites.md")
     university_db_dir: Path = Path("data/universities")
-    fetcher_backend: str = "human"  # "human" (default), "hybrid", "httpx", "playwright", "curl_cffi", or "crawl4ai"
+    fetcher_backend: Literal["human"] = "human"
     human_server_host: str = "127.0.0.1"
     human_server_port: int = 21520
     human_job_timeout_seconds: float = 60.0
     detail_enrich_enabled: bool = True
-    detail_fetch_backend: str = "httpx"
+    detail_fetch_backend: Literal["human"] = "human"
     detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
     detail_failure_threshold: int = Field(default=10, ge=1)
-    crawl4ai_base_url: str = "http://localhost:10086"
-    crawl4ai_api_token: str = ""
-    crawl4ai_timeout_seconds: float = Field(default=120.0, gt=0)
+    pipeline_enabled: bool = True
+    pipeline_fetch_workers: int = Field(default=1, ge=1)
+    pipeline_llm_workers: int = Field(default=1, ge=1)
+    pipeline_db_workers: int = Field(default=1, ge=1)
+    pipeline_queue_cap: int = Field(default=64, ge=1)
+    invalid_json_max_retry: int = Field(default=1, ge=0)
+    task_recovery_enabled: bool = True

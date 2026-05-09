@@ -36,3 +36,16 @@ def test_sanitize_professor_payload_detects_academician_and_infers_enrollment():
     assert is_academician is True
     assert cleaned["title"] == "院士"
     assert cleaned["enrollment_pref"] == "博士生导师"
+
+
+def test_sanitize_professor_payload_does_not_copy_homepage_into_external_link():
+    cleaned, _ = sanitize_professor_payload(
+        {
+            "name": "Ada",
+            "homepage": "https://cs.testu.edu.cn/info/1001/1.htm",
+        },
+        org_unit_name="Computer Science",
+    )
+
+    assert cleaned["homepage"] == "https://cs.testu.edu.cn/info/1001/1.htm"
+    assert cleaned["external_link"] is None
