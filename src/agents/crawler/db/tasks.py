@@ -50,7 +50,17 @@ async def upsert_crawl_task(
         if allowed_tools and existing.allowed_tools != allowed_tools:
             existing.allowed_tools = allowed_tools
             changed = True
-        if status_value and existing.status != status_value:
+        protected_from_pending = {
+            CrawlTaskStatus.DONE.value,
+            CrawlTaskStatus.FAILED.value,
+            CrawlTaskStatus.IN_PROGRESS.value,
+            CrawlTaskStatus.RETRY.value,
+        }
+        status_would_reset_active_or_terminal = (
+            status_value == CrawlTaskStatus.PENDING.value
+            and existing.status in protected_from_pending
+        )
+        if status_value and existing.status != status_value and not status_would_reset_active_or_terminal:
             existing.status = status_value
             changed = True
         if attempt > int(existing.attempt or 0):

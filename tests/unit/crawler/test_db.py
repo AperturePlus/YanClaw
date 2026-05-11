@@ -11,6 +11,7 @@ from agents.crawler.models import (
     CrawlStatus,
     CrawlTask,
     CrawlTaskStatus,
+    OrgUnit,
     Professor,
     ProfessorAffiliation,
 )
@@ -293,6 +294,77 @@ async def test_get_or_create_org_unit_dedupes_same_name_with_different_urls(tmp_
             kind="college",
         )
         assert first.id == second.id
+
+    await db.close()
+
+
+async def test_org_unit_homepage_is_not_overwritten_by_deep_faculty_page(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "org_unit_url.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="计算机学院",
+            url="https://scse.buaa.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "计算机学院",
+                "org_unit_url": "https://scse.buaa.edu.cn/szdw/qtjs/5.htm",
+                "source_url": "https://scse.buaa.edu.cn/info/1078/2627.htm",
+                "title": "Professor",
+            },
+        )
+
+    async with db.session() as session:
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == "计算机学院"))).scalar_one()
+        assert org_unit.url == "https://scse.buaa.edu.cn"
+
+    await db.close()
+
+
+async def test_upsert_crawl_task_does_not_reset_active_or_terminal_statuses(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "task_status_reset.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        for status in (
+            CrawlTaskStatus.DONE,
+            CrawlTaskStatus.FAILED,
+            CrawlTaskStatus.IN_PROGRESS,
+            CrawlTaskStatus.RETRY,
+        ):
+            source_url = f"https://soft.buaa.edu.cn/{status.value}.htm"
+            created = await crawler_db.upsert_crawl_task(
+                session,
+                university="北京航空航天大学",
+                org_unit_name="软件学院",
+                org_unit_url="https://soft.buaa.edu.cn/",
+                source_url=source_url,
+                page_url=source_url,
+                page_hash=f"hash-{status.value}",
+                page_text_snapshot="师资队伍",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+            await crawler_db.set_crawl_task_status(session, created.id, status=status)
+            updated = await crawler_db.upsert_crawl_task(
+                session,
+                university="北京航空航天大学",
+                org_unit_name="软件学院",
+                org_unit_url="https://soft.buaa.edu.cn/",
+                source_url=source_url,
+                page_url=source_url,
+                page_hash=f"hash-{status.value}",
+                page_text_snapshot="师资队伍 教授 副教授",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+            assert updated.status == status.value
 
     await db.close()
 

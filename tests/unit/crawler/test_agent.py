@@ -20,7 +20,7 @@ from agents.crawler.agent import (
     ORG_UNIT_PAGE_KEYWORDS,
 )
 from agents.crawler.fetchers import FetchResult, Fetcher
-from agents.crawler.models import CrawlExtractionFailure, CrawlLogStatus, CrawlStatus, OrgUnit, UniversityMeta
+from agents.crawler.models import CrawlExtractionFailure, CrawlLogStatus, CrawlStatus, CrawlTask, CrawlTaskStatus, OrgUnit, UniversityMeta
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallErrorRecord, ToolCallRecord
@@ -1492,6 +1492,190 @@ async def test_followup_faculty_links_filter_noise_sections(tmp_path):
     assert "https://www.example.edu.cn/szdw/tzgg/list.htm" not in out
     assert "https://www.example.edu.cn/faculty/renshi/recruitment.htm" not in out
     assert int(agent._pipeline_stats.get("followup_dropped_noise", 0)) >= 1
+    await db.close()
+
+
+async def test_buaa_computer_category_pages_are_followup_faculty_links(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    agent.start_url = "https://www.buaa.edu.cn/"
+    links = [
+        "https://scse.buaa.edu.cn/szdw/qtjs/js.htm",
+        "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm",
+        "https://scse.buaa.edu.cn/szdw/qtjs/js1.htm",
+        "https://scse.buaa.edu.cn/szdw/qtjs/sys.htm",
+        "https://scse.buaa.edu.cn/info/1078/2627.htm",
+    ]
+    out = agent._extract_followup_faculty_links(links, "https://scse.buaa.edu.cn/szdw/qtjs.htm")
+
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/js.htm" in out
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm" in out
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/js1.htm" in out
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/sys.htm" in out
+    await db.close()
+
+
+async def test_buaa_computer_subcategory_pages_enter_crawl_task_queue(tmp_path):
+    pages = {
+        "https://www.buaa.edu.cn/": FetchResult(
+            "https://www.buaa.edu.cn/",
+            "home",
+            ["https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"],
+            200,
+        ),
+        "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm": FetchResult(
+            "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm",
+            "机构设置 计算机学院",
+            ["https://scse.buaa.edu.cn/"],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/": FetchResult(
+            "https://scse.buaa.edu.cn/",
+            "计算机学院 师资队伍 全体教师",
+            ["https://scse.buaa.edu.cn/szdw/qtjs.htm"],
+            200,
+        ),
+        "https://scse.buaa.edu.cn": FetchResult(
+            "https://scse.buaa.edu.cn/",
+            "计算机学院 师资队伍 全体教师",
+            ["https://scse.buaa.edu.cn/szdw/qtjs.htm"],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/szdw/qtjs.htm": FetchResult(
+            "https://scse.buaa.edu.cn/szdw/qtjs.htm",
+            "全体教师 faculty 教授 副教授",
+            [
+                "https://scse.buaa.edu.cn/szdw/qtjs/js.htm",
+                "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm",
+                "https://scse.buaa.edu.cn/szdw/qtjs/6.htm",
+                "https://scse.buaa.edu.cn/info/1078/2627.htm",
+            ],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/szdw/qtjs/js.htm": FetchResult(
+            "https://scse.buaa.edu.cn/szdw/qtjs/js.htm",
+            "教授 faculty 邮箱 a@buaa.edu.cn",
+            [],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm": FetchResult(
+            "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm",
+            "副教授 faculty 邮箱 b@buaa.edu.cn",
+            [],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/szdw/qtjs/6.htm": FetchResult(
+            "https://scse.buaa.edu.cn/szdw/qtjs/6.htm",
+            "教师列表 faculty 邮箱 c@buaa.edu.cn",
+            [],
+            200,
+        ),
+        "https://scse.buaa.edu.cn/info/1078/2627.htm": FetchResult(
+            "https://scse.buaa.edu.cn/info/1078/2627.htm",
+            "个人主页 faculty 邮箱 d@buaa.edu.cn",
+            [],
+            200,
+        ),
+    }
+
+    class BuaaComputerLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_urls: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload.get("state")
+            if state == "DISCOVER_ORG_UNIT_PAGES":
+                return LLMResult('{"links": ["https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"]}')
+            if state == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "计算机学院", "url": "https://scse.buaa.edu.cn/", "kind": "college"}]}'
+                )
+            if state == "FIND_FACULTY_PAGES":
+                return LLMResult('{"links": ["https://scse.buaa.edu.cn/szdw/qtjs.htm"]}')
+            if state == "EXTRACT_PROFESSORS":
+                self.extract_urls.append(payload["url"])
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="计算机学院",
+                    org_unit_url=payload["url"],
+                    source_url=payload["url"],
+                    professors=[{"name": f"教师{len(self.extract_urls)}", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return LLMResult("{}")
+
+    db = DatabaseManager(sqlite_url(tmp_path / "buaa_computer.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    llm = BuaaComputerLLM()
+    agent = CrawlerAgent(
+        university_name="北京航空航天大学",
+        start_url="https://www.buaa.edu.cn/",
+        location="北京",
+        db=db,
+        llm_client=llm,
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=FakeHumanFetcher(pages),
+        max_depth=5,
+        min_org_units=1,
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        task_urls = {task.page_url for task in tasks}
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == "计算机学院"))).scalar_one()
+
+    assert "https://scse.buaa.edu.cn/szdw/qtjs.htm" in task_urls
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/js.htm" in task_urls
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm" in task_urls
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/6.htm" in task_urls
+    assert len(task_urls) >= 4
+    assert org_unit.url == "https://scse.buaa.edu.cn"
+    await db.close()
+
+
+async def test_software_sidebar_followups_do_not_repeat_failed_tasks(tmp_path):
+    a_url = "https://soft.buaa.edu.cn/tu-list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1323"
+    b_url = "https://soft.buaa.edu.cn/tu-list-bodao.jsp?urltype=tree.TreeTempUrl&wbtreeid=1329"
+    c_url = "https://soft.buaa.edu.cn/tu-list-1.jsp?urltype=tree.TreeTempUrl&wbtreeid=1224"
+    pages = {
+        a_url: FetchResult(a_url, "师资队伍 教授 副教授", [b_url, c_url, b_url], 200),
+        b_url: FetchResult(b_url, "师资队伍 博导 硕导", [a_url, c_url], 200),
+        c_url: FetchResult(c_url, "师资队伍 教师列表", [a_url, b_url], 200),
+    }
+
+    class EmptyExtractionLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                return LLMResult("{}")
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(tmp_path, EmptyExtractionLLM(), pages=pages)
+    agent.start_url = "https://www.buaa.edu.cn/"
+
+    await agent._extract_professors([_QueuedUrl(url=a_url, depth=1, label="软件学院")])
+
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+
+    task_urls = [task.page_url for task in tasks]
+    assert sorted(task_urls) == sorted([a_url, b_url, c_url])
+    assert all(task.status == CrawlTaskStatus.FAILED.value for task in tasks)
+    assert all(task.status != CrawlTaskStatus.IN_PROGRESS.value for task in tasks)
+
+    failure_counts: dict[str, int] = {}
+    for failure in failures:
+        failure_counts[failure.source_url] = failure_counts.get(failure.source_url, 0) + 1
+    assert failure_counts == {a_url: 1, b_url: 1, c_url: 1}
     await db.close()
 
 
