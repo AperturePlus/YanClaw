@@ -14,7 +14,7 @@ from typing import Any, Iterable
 from aiohttp import web
 
 from agents.crawler.fetchers.httpx_fetcher import FetchResult, Fetcher
-from agents.crawler.fetchers.link_signals import FetchResultWithSignals, extract_links_with_signals
+from agents.crawler.fetchers.link_signals import extract_links_with_signals
 from agents.crawler.fetchers.human_models import (
     DecisionRequest,
     FetchJob,
@@ -86,7 +86,7 @@ class HumanFetcherBridge:
         if job.status == FetchJobStatus.COMPLETED and job.result_html:
             text = self._helper._html_to_text(job.result_html)
             links, link_signals = extract_links_with_signals(job.result_html, job.result_url or url)
-            return FetchResultWithSignals(
+            return FetchResult(
                 url=job.result_url or url,
                 text=text,
                 links=links,
@@ -95,7 +95,7 @@ class HumanFetcherBridge:
             )
 
         reason = "human_skip" if job.status == FetchJobStatus.SKIPPED else (job.error_message or "human_failed")
-        return FetchResultWithSignals(
+        return FetchResult(
             url=url,
             text="",
             links=[],

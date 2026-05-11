@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import urldefrag, urljoin, urlparse
 
-from agents.crawler.fetchers.httpx_fetcher import FetchResult
-
 
 _SPACE_RE = re.compile(r"\s+")
 _NAV_HINTS = ("nav", "menu", "tab", "tree", "list", "catalog", "channel", "column")
@@ -19,11 +17,6 @@ class LinkSignal:
     heading_text: str = ""
     parent_tags_or_classes: tuple[str, ...] = ()
     link_order: int = 0
-
-
-@dataclass(frozen=True)
-class FetchResultWithSignals(FetchResult):
-    link_signals: tuple[LinkSignal, ...] = ()
 
 
 def extract_links_with_signals(html: str, base_url: str) -> tuple[list[str], tuple[LinkSignal, ...]]:
