@@ -16,12 +16,16 @@ from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus, OrgUnit, UniversityMeta
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
+    FACULTY_PAGE_TYPE_NOISE,
+    FacultyCandidateAssessment,
     FACULTY_KEYWORDS,
     ORG_UNIT_PAGE_KEYWORDS,
     _COMMON_FACULTY_PATHS,
     _INTERMEDIATE_ORG_PATHS,
     _allow_faculty_candidate_for_host_set,
     _allow_faculty_candidate_for_org_unit,
+    _assess_faculty_candidate,
+    _assess_structural_faculty_candidates,
     _contains_cjk,
     _dedupe_query_terms,
     _extract_urls_from_text,
@@ -42,6 +46,7 @@ from agents.crawler.url_heuristics import (
     _rank_org_unit_page_candidates,
     _same_site,
     _sanitize_url,
+    _select_balanced_faculty_candidates,
     _truncate_middle,
     _url_found_on_page,
 )
@@ -175,6 +180,7 @@ class CrawlerAgent:
         self._blocked_hosts: set[str] = set()
         self._detail_visited_urls: set[str] = set()
         self._detail_processed_by_org_unit: dict[str, int] = {}
+        self._enriched_names_by_org_unit: dict[str, set[str]] = {}
         self._pipeline_stats: dict[str, Any] = {
             "enabled": self.pipeline_enabled,
             "pending": 0,
@@ -195,7 +201,14 @@ class CrawlerAgent:
             "llm_payload_bytes_total": 0,
             "avg_payload_bytes": 0.0,
             "followup_dropped_noise": 0,
+            "followups_scheduled": 0,
+            "pagination_scheduled": 0,
+            "duplicate_tasks_skipped": 0,
+            "duplicate_followups_skipped": 0,
             "detail_links_dropped_noise": 0,
+            "detail_links_dropped_directory": 0,
+            "detail_links_dropped_already_enriched": 0,
+            "detail_pending_empty_with_candidates": 0,
         }
 
     @property
@@ -547,7 +560,7 @@ class CrawlerAgent:
     async def _find_and_extract_streaming(self, org_units: list[OrgUnit]) -> None:
         """Interactive mode: for each org unit, find faculty pages then immediately extract professors."""
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
-        max_links_per_org_unit = 8
+        max_links_per_org_unit = 4
         skills_find = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
         llm_fallback_budget = 3
 
@@ -581,14 +594,38 @@ class CrawlerAgent:
                 continue
 
             # --- Find faculty links for this org unit ---
-            links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            links, used_budget = await self._select_faculty_candidates(
+                links=list(fetched.links or []),
+                fetched=fetched,
+                org_unit_name=org_unit.name,
+                org_unit_url=fetched.url,
+                llm_budget=llm_fallback_budget,
+                max_candidates=max_links_per_org_unit,
+                link_signals=getattr(fetched, "link_signals", ()),
+            )
+            llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             low_info, low_info_reason = self._should_skip_faculty_discovery_llm(fetched)
 
             if not links and _is_college_subdomain(fetched.url, self.start_url):
-                links = self._filter_faculty_candidates(await self._probe_faculty_paths(fetched.url), org_unit_url=fetched.url)
+                links, used_budget = await self._select_faculty_candidates(
+                    links=await self._probe_faculty_paths(fetched.url),
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             if not links and _looks_like_faculty_page(fetched.url):
-                links = self._filter_faculty_candidates([fetched.url], org_unit_url=fetched.url)
+                links, used_budget = await self._select_faculty_candidates(
+                    links=[fetched.url],
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             if not links and llm_fallback_budget > 0 and not low_info:
                 llm_fallback_budget -= 1
                 result = await self._ask_llm(
@@ -596,10 +633,18 @@ class CrawlerAgent:
                     "Find links that lead to faculty list pages for this org unit.",
                     fetched, skills_find,
                 )
-                links = self._links_from_result(result.content)
-                if not links:
-                    links = self._links_from_tool_call_log(result, tool_name="extract_links")
-                links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+                llm_links = self._links_from_result(result.content)
+                if not llm_links:
+                    llm_links = self._links_from_tool_call_log(result, tool_name="extract_links")
+                links, used_budget = await self._select_faculty_candidates(
+                    links=llm_links,
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             elif not links and low_info:
                 self.logger.debug(
                     "Skip faculty-page LLM fallback by gate org_unit=%s url=%s reason=%s",
@@ -626,7 +671,7 @@ class CrawlerAgent:
     async def _find_faculty_pages(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
         faculty_links: list[_QueuedUrl] = []
-        max_links_per_org_unit = 8
+        max_links_per_org_unit = 4
         skills = await self._select_skills(CrawlerState.FIND_FACULTY_PAGES)
         llm_fallback_budget = 3
 
@@ -669,15 +714,39 @@ class CrawlerAgent:
             if fetched is None:
                 continue
 
-            links = _keyword_filter(fetched.links, FACULTY_KEYWORDS)
-            links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+            links, used_budget = await self._select_faculty_candidates(
+                links=list(fetched.links or []),
+                fetched=fetched,
+                org_unit_name=org_unit.name,
+                org_unit_url=fetched.url,
+                llm_budget=llm_fallback_budget,
+                max_candidates=max_links_per_org_unit,
+                link_signals=getattr(fetched, "link_signals", ()),
+            )
+            llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             low_info, low_info_reason = self._should_skip_faculty_discovery_llm(fetched)
 
             if not links and _is_college_subdomain(fetched.url, self.start_url):
-                links = self._filter_faculty_candidates(await self._probe_faculty_paths(fetched.url), org_unit_url=fetched.url)
+                links, used_budget = await self._select_faculty_candidates(
+                    links=await self._probe_faculty_paths(fetched.url),
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
 
             if not links and _looks_like_faculty_page(fetched.url):
-                links = self._filter_faculty_candidates([fetched.url], org_unit_url=fetched.url)
+                links, used_budget = await self._select_faculty_candidates(
+                    links=[fetched.url],
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
 
             if not links and llm_fallback_budget > 0 and not low_info:
                 llm_fallback_budget -= 1
@@ -687,16 +756,24 @@ class CrawlerAgent:
                     fetched,
                     skills,
                 )
-                links = self._links_from_result(result.content)
-                if not links:
-                    links = self._links_from_tool_call_log(result, tool_name="extract_links")
-                    if links:
+                llm_links = self._links_from_result(result.content)
+                if not llm_links:
+                    llm_links = self._links_from_tool_call_log(result, tool_name="extract_links")
+                    if llm_links:
                         self.logger.debug(
                             "Faculty discovery consumed extract_links tool output org_unit=%s sample=%s",
                             item.label,
-                            links[:5],
+                            llm_links[:5],
                         )
-                links = self._filter_faculty_candidates(links, org_unit_url=fetched.url)
+                links, used_budget = await self._select_faculty_candidates(
+                    links=llm_links,
+                    fetched=fetched,
+                    org_unit_name=org_unit.name,
+                    org_unit_url=fetched.url,
+                    llm_budget=llm_fallback_budget,
+                    max_candidates=max_links_per_org_unit,
+                )
+                llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             elif not links and low_info:
                 self.logger.debug(
                     "Skip faculty-page LLM fallback by gate org_unit=%s url=%s reason=%s",
@@ -725,10 +802,20 @@ class CrawlerAgent:
                 for unit in candidates
                 if (urlparse(unit.url).hostname or "").lower()
             }
-            search_links = self._filter_faculty_candidates(
-                search_links,
+            search_links, used_budget = await self._select_faculty_candidates(
+                links=search_links,
+                fetched=FetchResult(
+                    url=self.start_url,
+                    text="",
+                    links=search_links,
+                    status_code=200,
+                ),
+                org_unit_name="Unknown",
                 org_unit_hosts=allowed_hosts,
+                llm_budget=llm_fallback_budget,
+                max_candidates=max_links_per_org_unit,
             )
+            llm_fallback_budget = max(0, llm_fallback_budget - used_budget)
             for link in search_links:
                 if self._within_depth(2):
                     faculty_links.append(_QueuedUrl(url=link, depth=2, label="Unknown"))
@@ -835,13 +922,116 @@ class CrawlerAgent:
             self.pipeline_queue_cap,
             self.invalid_json_max_retry,
         )
+
+        scheduled_urls: set[str] = set()
+        processed_urls: set[str] = set()
+
+        def _queue_key(url: str) -> str:
+            return _sanitize_url(url) or (url or "").strip()
+
+        def _mark_scheduled(url: str) -> bool:
+            key = _queue_key(url)
+            if not key:
+                return False
+            if key in scheduled_urls or key in processed_urls:
+                self._pipeline_stats["duplicate_tasks_skipped"] = int(
+                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
+                ) + 1
+                return False
+            scheduled_urls.add(key)
+            return True
+
+        def _mark_processing(url: str) -> bool:
+            key = _queue_key(url)
+            if not key:
+                return False
+            if key in processed_urls:
+                self._pipeline_stats["duplicate_tasks_skipped"] = int(
+                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
+                ) + 1
+                return False
+            processed_urls.add(key)
+            return True
+
+        def _schedule_related_pages(current: _QueuedUrl, fetched: FetchResult, pages_to_process: list[_QueuedUrl]) -> None:
+            added_followups: list[str] = []
+            skipped_duplicates = 0
+            followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
+            for link in followups[:10]:
+                next_depth = current.depth + 1
+                if not self._within_depth(next_depth):
+                    continue
+                if not _mark_scheduled(link):
+                    skipped_duplicates += 1
+                    continue
+                pages_to_process.append(
+                    _QueuedUrl(
+                        url=link,
+                        depth=next_depth,
+                        label=current.label,
+                        org_unit_id=current.org_unit_id,
+                    )
+                )
+                added_followups.append(link)
+
+            added_pagination: list[str] = []
+            pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
+            for plink in pagination_links:
+                if not self._within_depth(current.depth):
+                    continue
+                if not _mark_scheduled(plink):
+                    skipped_duplicates += 1
+                    continue
+                pages_to_process.append(
+                    _QueuedUrl(
+                        url=plink,
+                        depth=current.depth,
+                        label=current.label,
+                        org_unit_id=current.org_unit_id,
+                    )
+                )
+                added_pagination.append(plink)
+
+            if added_followups:
+                self._pipeline_stats["followups_scheduled"] = int(
+                    self._pipeline_stats.get("followups_scheduled", 0)
+                ) + len(added_followups)
+            if added_pagination:
+                self._pipeline_stats["pagination_scheduled"] = int(
+                    self._pipeline_stats.get("pagination_scheduled", 0)
+                ) + len(added_pagination)
+            if skipped_duplicates:
+                self._pipeline_stats["duplicate_followups_skipped"] = int(
+                    self._pipeline_stats.get("duplicate_followups_skipped", 0)
+                ) + skipped_duplicates
+            if added_followups or added_pagination or skipped_duplicates:
+                sample = (added_followups + added_pagination)[:5]
+                self.logger.debug(
+                    "Queued faculty followups current=%s added_followups=%s added_pagination=%s skipped_duplicates=%s sample=%s",
+                    fetched.url,
+                    len(added_followups),
+                    len(added_pagination),
+                    skipped_duplicates,
+                    sample,
+                )
+
         if not self.pipeline_enabled:
             for item in faculty_links[:max_pages]:
+                if not _mark_scheduled(item.url):
+                    continue
                 pages_to_process = [item]
                 while pages_to_process:
                     current = pages_to_process.pop(0)
+                    if not _mark_processing(current.url):
+                        continue
+                    if self._is_noise_or_login_candidate(current.url):
+                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
+                        continue
                     fetched = await self._fetch_url(current.url, current.depth)
                     if fetched is None:
+                        continue
+                    if self._is_noise_or_login_candidate(fetched.url):
+                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
                         continue
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
@@ -863,33 +1053,8 @@ class CrawlerAgent:
                             skills,
                             detail_mode=False,
                         )
+                    _schedule_related_pages(current, fetched, pages_to_process)
                     await self._enrich_profiles_with_detail_backend(current, fetched, skills)
-                    followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-                    for link in followups[:10]:
-                        if link in self.visited_urls:
-                            continue
-                        next_depth = current.depth + 1
-                        if not self._within_depth(next_depth):
-                            continue
-                        pages_to_process.append(
-                            _QueuedUrl(
-                                url=link,
-                                depth=next_depth,
-                                label=current.label,
-                                org_unit_id=current.org_unit_id,
-                            )
-                        )
-                    pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
-                    for plink in pagination_links:
-                        if plink not in self.visited_urls and self._within_depth(current.depth):
-                            pages_to_process.append(
-                                _QueuedUrl(
-                                    url=plink,
-                                    depth=current.depth,
-                                    label=current.label,
-                                    org_unit_id=current.org_unit_id,
-                                )
-                            )
             return
 
         llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
@@ -913,11 +1078,21 @@ class CrawlerAgent:
 
         try:
             for item in faculty_links[:max_pages]:
+                if not _mark_scheduled(item.url):
+                    continue
                 pages_to_process = [item]
                 while pages_to_process:
                     current = pages_to_process.pop(0)
+                    if not _mark_processing(current.url):
+                        continue
+                    if self._is_noise_or_login_candidate(current.url):
+                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
+                        continue
                     fetched = await self._fetch_url(current.url, current.depth)
                     if fetched is None:
+                        continue
+                    if self._is_noise_or_login_candidate(fetched.url):
+                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
                         continue
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
@@ -940,35 +1115,8 @@ class CrawlerAgent:
                             detail_mode=False,
                             priority=0,
                         )
+                    _schedule_related_pages(current, fetched, pages_to_process)
                     await self._enrich_profiles_with_detail_backend(current, fetched, skills)
-
-                    followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-                    for link in followups[:10]:
-                        if link in self.visited_urls:
-                            continue
-                        next_depth = current.depth + 1
-                        if not self._within_depth(next_depth):
-                            continue
-                        pages_to_process.append(
-                            _QueuedUrl(
-                                url=link,
-                                depth=next_depth,
-                                label=current.label,
-                                org_unit_id=current.org_unit_id,
-                            )
-                        )
-
-                    pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
-                    for plink in pagination_links:
-                        if plink not in self.visited_urls and self._within_depth(current.depth):
-                            pages_to_process.append(
-                                _QueuedUrl(
-                                    url=plink,
-                                    depth=current.depth,
-                                    label=current.label,
-                                    org_unit_id=current.org_unit_id,
-                                )
-                            )
         finally:
             await llm_queue.join()
             for _ in llm_workers:
@@ -981,7 +1129,7 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s avg_payload_bytes=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
@@ -989,6 +1137,10 @@ class CrawlerAgent:
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
                 self._pipeline_stats.get("llm_calls_total", 0),
                 self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
+                self._pipeline_stats.get("followups_scheduled", 0),
+                self._pipeline_stats.get("pagination_scheduled", 0),
+                self._pipeline_stats.get("duplicate_tasks_skipped", 0),
+                self._pipeline_stats.get("detail_links_dropped_directory", 0),
                 float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
             )
 
@@ -1023,7 +1175,16 @@ class CrawlerAgent:
                 priority=priority,
                 status=CrawlTaskStatus.PENDING,
             )
-            if row.status == CrawlTaskStatus.DONE.value:
+            if row.status != CrawlTaskStatus.PENDING.value:
+                self._pipeline_stats["duplicate_tasks_skipped"] = int(
+                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
+                ) + 1
+                self.logger.debug(
+                    "Skip existing extraction task source=%s status=%s task_id=%s",
+                    source_url,
+                    row.status,
+                    row.id,
+                )
                 return
             task = _ExtractionTaskItem(
                 task_id=int(row.id),
@@ -1520,27 +1681,66 @@ class CrawlerAgent:
         }
         return user_content, metadata
 
-    def _filter_faculty_candidates(
+    def _host_gate_allows_faculty_candidate(
+        self,
+        url: str,
+        *,
+        org_unit_url: str | None = None,
+        org_unit_hosts: set[str] | None = None,
+    ) -> bool:
+        use_host_set_gate = org_unit_hosts is not None
+        allowed_hosts = {(host or "").strip().lower() for host in (org_unit_hosts or set()) if (host or "").strip()}
+        if org_unit_url:
+            return _allow_faculty_candidate_for_org_unit(
+                url,
+                org_unit_url=org_unit_url,
+                start_url=self.start_url,
+            )
+        if use_host_set_gate:
+            return _allow_faculty_candidate_for_host_set(
+                url,
+                start_url=self.start_url,
+                org_unit_hosts=allowed_hosts,
+            )
+        return not _is_faculty_platform(url)
+
+    def _assess_faculty_candidates(
         self,
         links: list[str],
         *,
         org_unit_url: str | None = None,
         org_unit_hosts: set[str] | None = None,
-    ) -> list[str]:
+        link_signals: tuple[Any, ...] | list[Any] | None = None,
+        max_candidates: int = 4,
+    ) -> tuple[list[FacultyCandidateAssessment], list[FacultyCandidateAssessment]]:
         same_domain = self.fetcher.filter_same_domain(links, self.start_url)
-        use_host_set_gate = org_unit_hosts is not None
-        allowed_hosts = {(host or "").strip().lower() for host in (org_unit_hosts or set()) if (host or "").strip()}
-        filtered: list[str] = []
-        for link in same_domain:
-            if org_unit_url:
-                if not _allow_faculty_candidate_for_org_unit(link, org_unit_url=org_unit_url, start_url=self.start_url):
-                    continue
-            elif use_host_set_gate:
-                if not _allow_faculty_candidate_for_host_set(link, start_url=self.start_url, org_unit_hosts=allowed_hosts):
-                    continue
-            elif _is_faculty_platform(link):
-                continue
+        structured = _assess_structural_faculty_candidates(
+            same_domain,
+            link_signals=link_signals,
+        )
+        gated_structured = [
+            item
+            for item in structured
+            if self._host_gate_allows_faculty_candidate(
+                item.url,
+                org_unit_url=org_unit_url,
+                org_unit_hosts=org_unit_hosts,
+            )
+            and not _looks_like_retired_url(item.url)
+        ]
+        selected = _select_balanced_faculty_candidates(gated_structured, limit=max_candidates)
+        if selected:
+            return gated_structured, selected
 
+        legacy_candidates = _keyword_filter(same_domain, FACULTY_KEYWORDS) or same_domain
+        filtered: list[str] = []
+        for link in legacy_candidates:
+            if not self._host_gate_allows_faculty_candidate(
+                link,
+                org_unit_url=org_unit_url,
+                org_unit_hosts=org_unit_hosts,
+            ):
+                continue
             if _looks_like_retired_url(link) or _is_non_faculty_noise_url(link):
                 continue
             filtered.append(link)
@@ -1548,8 +1748,153 @@ class CrawlerAgent:
         ranked = _rank_faculty_page_candidates(filtered)
         non_showcase = [link for link in ranked if not _is_academician_showcase_page(link)]
         if non_showcase:
-            return non_showcase
-        return ranked
+            ranked = non_showcase
+        legacy_assessments = [_assess_faculty_candidate(link) for link in ranked]
+        selected_legacy = _select_balanced_faculty_candidates(legacy_assessments, limit=max_candidates)
+        if selected_legacy:
+            return legacy_assessments, selected_legacy
+        return legacy_assessments, legacy_assessments[:max_candidates]
+
+    async def _select_faculty_candidates(
+        self,
+        *,
+        links: list[str],
+        fetched: FetchResult,
+        org_unit_name: str,
+        org_unit_url: str | None = None,
+        org_unit_hosts: set[str] | None = None,
+        llm_budget: int = 0,
+        max_candidates: int = 4,
+        link_signals: tuple[Any, ...] | list[Any] | None = None,
+    ) -> tuple[list[str], int]:
+        assessments, selected = self._assess_faculty_candidates(
+            links,
+            org_unit_url=org_unit_url,
+            org_unit_hosts=org_unit_hosts,
+            link_signals=link_signals,
+            max_candidates=max_candidates,
+        )
+        if assessments:
+            preview_items = assessments[:8]
+            preview = " | ".join(
+                f"{item.page_type}:{item.score}:{'H' if item.hard_reject else 'N'}:{item.url}"
+                for item in preview_items
+            )
+            self.logger.debug(
+                "Faculty assessment details org_unit=%s url=%s candidates=%s preview=%s",
+                org_unit_name,
+                fetched.url,
+                len(assessments),
+                preview,
+            )
+        selected_urls = [item.url for item in selected]
+        uncertain = [item for item in selected if item.uncertain]
+        llm_adopted = 0
+        budget_used = 0
+
+        if uncertain and llm_budget > 0:
+            budget_used = 1
+            adopted_urls = await self._resolve_uncertain_faculty_candidates_with_llm(
+                fetched=fetched,
+                org_unit_name=org_unit_name,
+                uncertain_candidates=uncertain,
+            )
+            if adopted_urls is not None:
+                stable_uncertain = [item.url for item in uncertain]
+                adopted_set = set(adopted_urls)
+                definite_urls = [item.url for item in selected if not item.uncertain]
+                selected_urls = definite_urls + [url for url in stable_uncertain if url in adopted_set]
+                if not selected_urls:
+                    selected_urls = [item.url for item in selected]
+                llm_adopted = len([url for url in stable_uncertain if url in adopted_set])
+
+        self.logger.debug(
+            "Faculty candidates org_unit=%s url=%s total=%s selected=%s uncertain=%s llm_adopted=%s selected_urls=%s",
+            org_unit_name,
+            fetched.url,
+            len(assessments),
+            len(selected_urls),
+            len(uncertain),
+            llm_adopted,
+            selected_urls,
+        )
+        return selected_urls[:max_candidates], budget_used
+
+    async def _resolve_uncertain_faculty_candidates_with_llm(
+        self,
+        *,
+        fetched: FetchResult,
+        org_unit_name: str,
+        uncertain_candidates: list[FacultyCandidateAssessment],
+    ) -> list[str] | None:
+        if not uncertain_candidates:
+            return []
+
+        candidate_payload = [
+            {
+                "url": item.url,
+                "anchor_text": item.anchor_text,
+                "heading_text": item.heading_text,
+                "rule_score": item.score,
+                "rule_type": item.page_type,
+            }
+            for item in uncertain_candidates
+        ]
+        payload = {
+            "state": CrawlerState.FIND_FACULTY_PAGES.value,
+            "org_unit": org_unit_name,
+            "page_url": fetched.url,
+            "candidates": candidate_payload,
+            "instruction": (
+                "Select faculty list pages only from candidates. "
+                "Return JSON {\"links\": [...]} and do not output URLs outside the candidate set."
+            ),
+        }
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a deterministic URL selector. "
+                    "Only choose from the provided candidates and return strict JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        try:
+            result = await self.llm_client.chat(messages, tools=None, tool_handlers={}, max_tokens=256)
+        except Exception as error:
+            self.logger.warning(
+                "Uncertain faculty candidate adjudication failed org_unit=%s url=%s error=%s",
+                org_unit_name,
+                fetched.url,
+                error,
+            )
+            return None
+
+        allowed = {item.url for item in uncertain_candidates}
+        links = self._links_from_result(result.content)
+        if not links:
+            parsed = self._parse_json_from_text(result.content)
+            if isinstance(parsed, dict):
+                values = parsed.get("links") or parsed.get("selected") or parsed.get("urls") or []
+                if isinstance(values, list):
+                    links = [_sanitize_url(str(value)) for value in values if _sanitize_url(str(value))]
+        if not links:
+            links = _extract_urls_from_text(result.content)
+
+        adopted = [url for url in links if url in allowed]
+        return adopted
+
+    @staticmethod
+    def _is_noise_or_login_candidate(url: str) -> bool:
+        assessment = _assess_faculty_candidate(url)
+        return assessment.page_type == FACULTY_PAGE_TYPE_NOISE and (
+            assessment.hard_reject or assessment.score <= 0
+        )
 
     @staticmethod
     def _should_skip_faculty_discovery_llm(fetched: FetchResult) -> tuple[bool, str]:
@@ -1868,16 +2213,21 @@ class CrawlerAgent:
             self.logger.info("Skipping external URL: %s", url)
             return None
 
+        if url in self.visited_urls and not self._skip_cross_run_dedup:
+            cached = self._fetch_cache.get(url)
+            if cached is not None and url == _sanitize_url(self.start_url):
+                self.execution_log.append(f"fetch cache url={url} depth={depth}")
+                self.logger.debug("Using cached start URL: %s", url)
+                return cached
+            self.execution_log.append(f"skip visited url={url}")
+            self.logger.info("Skipping already visited URL: %s", url)
+            return None
+
         cached = self._fetch_cache.get(url)
         if cached is not None:
             self.execution_log.append(f"fetch cache url={url} depth={depth}")
             self.logger.debug("Using cached URL: %s", url)
             return cached
-
-        if url in self.visited_urls and not self._skip_cross_run_dedup:
-            self.execution_log.append(f"skip visited url={url}")
-            self.logger.info("Skipping already visited URL: %s", url)
-            return None
 
         if url != self.start_url and not self._skip_cross_run_dedup:
             async with self.db.session() as session:
