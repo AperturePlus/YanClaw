@@ -41,6 +41,14 @@ class FakeFetcher:
         return Fetcher.filter_same_domain(links, base_url)
 
 
+class FakeHumanFetcher(FakeFetcher):
+    def set_context(self, *args, **kwargs):
+        return None
+
+    def set_status_provider(self, *args, **kwargs):
+        return None
+
+
 class FakeLLM:
     def __init__(self, empty_links: bool = False):
         self.empty_links = empty_links
@@ -575,6 +583,101 @@ async def test_agent_skips_find_faculty_llm_on_low_info_page(tmp_path):
     await agent.run()
 
     assert "FIND_FACULTY_PAGES" not in llm.states
+    await db.close()
+
+
+async def test_agent_rejects_login_and_news_candidates_and_drops_elite_subset(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://scse.example.edu.cn/"],
+            200,
+        ),
+        "https://scse.example.edu.cn/": FetchResult(
+            "https://scse.example.edu.cn/",
+            "cs",
+            [
+                "https://scse.example.edu.cn/xw_list_new.jsp?urltype=tree.TreeTempUrl&wbtreeid=1396",
+                "https://scse.example.edu.cn/system/resource/tplloginaccount.jsp?owner=1756449315",
+                "https://scse.example.edu.cn/szdw/teacher_list.htm",
+                "https://scse.example.edu.cn/szdw/professor.htm",
+                "https://scse.example.edu.cn/szdw/distinguished.htm",
+            ],
+            200,
+        ),
+        "https://scse.example.edu.cn": FetchResult(
+            "https://scse.example.edu.cn/",
+            "cs",
+            [
+                "https://scse.example.edu.cn/xw_list_new.jsp?urltype=tree.TreeTempUrl&wbtreeid=1396",
+                "https://scse.example.edu.cn/system/resource/tplloginaccount.jsp?owner=1756449315",
+                "https://scse.example.edu.cn/szdw/teacher_list.htm",
+                "https://scse.example.edu.cn/szdw/professor.htm",
+                "https://scse.example.edu.cn/szdw/distinguished.htm",
+            ],
+            200,
+        ),
+        "https://scse.example.edu.cn/szdw/teacher_list.htm": FetchResult(
+            "https://scse.example.edu.cn/szdw/teacher_list.htm",
+            "faculty list",
+            [],
+            200,
+        ),
+        "https://scse.example.edu.cn/szdw/professor.htm": FetchResult(
+            "https://scse.example.edu.cn/szdw/professor.htm",
+            "faculty profile list",
+            [],
+            200,
+        ),
+    }
+
+    class BuaaLikeOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "计算机学院", "url": "https://scse.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, fetcher, db = await _agent(tmp_path, BuaaLikeOrgLLM(), pages=pages)
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://scse.example.edu.cn/xw_list_new.jsp?urltype=tree.TreeTempUrl&wbtreeid=1396" not in fetcher.calls
+    assert "https://scse.example.edu.cn/system/resource/tplloginaccount.jsp?owner=1756449315" not in fetcher.calls
+    assert "https://scse.example.edu.cn/szdw/teacher_list.htm" in fetcher.calls
+    assert "https://scse.example.edu.cn/szdw/professor.htm" in fetcher.calls
+    assert "https://scse.example.edu.cn/szdw/distinguished.htm" not in fetcher.calls
+    await db.close()
+
+
+async def test_agent_select_faculty_candidates_falls_back_when_structure_is_weak(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    fetched = FetchResult(
+        "https://scse.example.edu.cn/",
+        "x",
+        [],
+        200,
+    )
+    links, budget = await agent._select_faculty_candidates(
+        links=["https://scse.example.edu.cn/szdw/jsdw/list_2.htm"],
+        fetched=fetched,
+        org_unit_name="计算机学院",
+        org_unit_url="https://scse.example.edu.cn/",
+        llm_budget=0,
+        max_candidates=4,
+        link_signals=(),
+    )
+    assert budget == 0
+    assert links == ["https://scse.example.edu.cn/szdw/jsdw/list_2.htm"]
     await db.close()
 
 
@@ -1177,6 +1280,193 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
     assert "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml" not in out
     assert "https://www.example.edu.cn/szdw/rszc/4.htm" not in out
     assert int(agent._pipeline_stats.get("detail_links_dropped_noise", 0)) >= 1
+    await db.close()
+
+
+async def test_buaa_computer_category_pages_are_not_detail_profile_links(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    agent.start_url = "https://www.buaa.edu.cn/"
+    links = [
+        "https://scse.buaa.edu.cn/szdw/qtjs/js.htm",
+        "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm",
+        "https://scse.buaa.edu.cn/szdw/qtjs/6.htm",
+        "https://scse.buaa.edu.cn/info/1078/2627.htm",
+        "https://scse.buaa.edu.cn/teachershouw.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078",
+    ]
+    out = agent._extract_detail_profile_links(links, "https://scse.buaa.edu.cn/szdw/qtjs.htm")
+
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/js.htm" not in out
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/fjs.htm" not in out
+    assert "https://scse.buaa.edu.cn/szdw/qtjs/6.htm" not in out
+    assert "https://scse.buaa.edu.cn/info/1078/2627.htm" in out
+    assert "https://scse.buaa.edu.cn/teachershouw.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078" in out
+    assert int(agent._pipeline_stats.get("detail_links_dropped_directory", 0)) >= 3
+    await db.close()
+
+
+async def test_buaa_software_teachershouw_news_query_links_are_kept(tmp_path):
+    """`teachershouw.jsp?urltype=news.NewsContentUrl&...` is the BUAA software
+    school's per-teacher detail URL; the literal `news` token in the query
+    string used to flag it as noise and drop the entire 41-teacher cohort."""
+
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    agent.start_url = "https://www.buaa.edu.cn/"
+    list_url = "https://soft.buaa.edu.cn/tu-list-1.jsp?urltype=tree.TreeTempUrl&wbtreeid=1262"
+    detail_a = "https://soft.buaa.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=9633"
+    detail_b = "https://soft.buaa.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=10079"
+    news_listing = "https://soft.buaa.edu.cn/news_list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078"
+    links = [detail_a, detail_b, news_listing, list_url]
+
+    out = agent._extract_detail_profile_links(links, list_url)
+
+    assert detail_a in out
+    assert detail_b in out
+    assert news_listing not in out
+    assert list_url not in out
+    await db.close()
+
+
+async def test_enrich_skips_detail_urls_when_anchor_matches_enriched_professor(tmp_path):
+    """Detail enrichment should drop links whose anchor text references a
+    professor that already has full details, so the same person is not
+    re-fetched via different per-channel URLs (BUAA CMS quirk that surfaced
+    on the 空间与地球科学学院 run)."""
+
+    from agents.crawler.fetchers.link_signals import LinkSignal
+
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/", "home", [], 200,
+        ),
+    }
+    fetcher = FakeHumanFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    agent = CrawlerAgent(
+        university_name="TestU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=FakeLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        max_depth=4,
+        max_backtracks=3,
+        min_org_units=1,
+    )
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "张三",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "research_areas": "软件工程",
+                "title": "教授",
+            },
+        )
+
+    list_url = "https://soft.example.edu.cn/tu-list-1.jsp?wbtreeid=1262"
+    detail_enriched = "https://soft.example.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=1"
+    detail_new = "https://soft.example.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=2"
+    fetched = FetchResult(
+        url=list_url,
+        text="软件学院教师",
+        links=[detail_enriched, detail_new],
+        status_code=200,
+        link_signals=(
+            LinkSignal(url=detail_enriched, anchor_text="张三 教授"),
+            LinkSignal(url=detail_new, anchor_text="李四 副教授"),
+        ),
+    )
+
+    processed_urls: list[str] = []
+
+    async def _capture(self, urls, current, skills):
+        processed_urls.extend(urls)
+
+    import agents.crawler.agent_detail as _agent_detail
+    original = _agent_detail.process_detail_urls_with_human
+    _agent_detail.process_detail_urls_with_human = _capture
+    try:
+        current = _QueuedUrl(url=list_url, depth=2, label="软件学院", org_unit_id=None)
+        await agent._enrich_profiles_with_detail_backend(current, fetched, "")
+    finally:
+        _agent_detail.process_detail_urls_with_human = original
+
+    assert processed_urls == [detail_new]
+    assert int(agent._pipeline_stats.get("detail_links_dropped_already_enriched", 0)) == 1
+    await db.close()
+
+
+async def test_enrich_warns_when_pending_empty_with_candidates(tmp_path):
+    """When every detail candidate was already attempted in an earlier list
+    page, enrich must emit a WARNING so future debugging can spot the
+    pagination-subpage stall pattern observed in the 计算机学院 fjs/N.htm
+    pages."""
+
+    import logging
+
+    from agents.crawler.fetchers.link_signals import LinkSignal
+
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/", "home", [], 200,
+        ),
+    }
+    fetcher = FakeHumanFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    agent = CrawlerAgent(
+        university_name="TestU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=FakeLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        max_depth=4,
+        max_backtracks=3,
+        min_org_units=1,
+    )
+
+    detail_a = "https://soft.example.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1&wbnewsid=1"
+    agent._detail_visited_urls.add(detail_a)
+    agent.visited_urls.add(detail_a)
+    list_url = "https://soft.example.edu.cn/tu-list-1.jsp?wbtreeid=1"
+    fetched = FetchResult(
+        url=list_url,
+        text="师资",
+        links=[detail_a],
+        status_code=200,
+        link_signals=(LinkSignal(url=detail_a, anchor_text="王某 教授"),),
+    )
+    current = _QueuedUrl(url=list_url, depth=2, label="软件学院", org_unit_id=None)
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    agent.logger.addHandler(handler)
+    try:
+        await agent._enrich_profiles_with_detail_backend(current, fetched, "")
+    finally:
+        agent.logger.removeHandler(handler)
+
+    assert int(agent._pipeline_stats.get("detail_pending_empty_with_candidates", 0)) == 1
+    assert any("0 pending" in r.getMessage() for r in records)
     await db.close()
 
 
