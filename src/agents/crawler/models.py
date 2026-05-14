@@ -35,6 +35,7 @@ class OrgUnitStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    NO_FACULTY_PAGE = "no_faculty_page"
 
 
 class UniversityMeta(Base):

@@ -51,3 +51,5 @@ class CrawlerSettings(BaseSettings):
     pipeline_queue_cap: int = Field(default=64, ge=1)
     invalid_json_max_retry: int = Field(default=1, ge=0)
     task_recovery_enabled: bool = True
+    target_org_units: list[str] = Field(default_factory=list)
+    org_unit_match_threshold: float = Field(default=0.60, ge=0.0, le=1.0)

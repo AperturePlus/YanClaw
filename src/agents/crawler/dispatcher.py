@@ -309,6 +309,8 @@ class CrawlDispatcher:
                         pipeline_queue_cap=self.settings.pipeline_queue_cap,
                         invalid_json_max_retry=self.settings.invalid_json_max_retry,
                         task_recovery_enabled=self.settings.task_recovery_enabled,
+                        target_org_units=list(self.settings.target_org_units or []),
+                        org_unit_match_threshold=self.settings.org_unit_match_threshold,
                     )
                     return await agent.run()
 

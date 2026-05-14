@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import re
@@ -13,7 +14,14 @@ from urllib.parse import quote, urljoin, urlparse
 from agents.crawler import db as crawler_db
 from agents.crawler import agent_detail, agent_parsing
 from agents.crawler.fetchers import FetchResult, Fetcher
-from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus, OrgUnit, UniversityMeta
+from agents.crawler.models import (
+    CrawlLogStatus,
+    CrawlStatus,
+    CrawlTaskStatus,
+    OrgUnit,
+    OrgUnitStatus,
+    UniversityMeta,
+)
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_NOISE,
@@ -143,6 +151,8 @@ class CrawlerAgent:
         pipeline_queue_cap: int = 64,
         invalid_json_max_retry: int = 1,
         task_recovery_enabled: bool = True,
+        target_org_units: list[str] | None = None,
+        org_unit_match_threshold: float = 0.60,
     ) -> None:
         self.university_name = university_name
         self.start_url = start_url
@@ -169,6 +179,8 @@ class CrawlerAgent:
         self.pipeline_queue_cap = max(1, int(pipeline_queue_cap))
         self.invalid_json_max_retry = max(0, int(invalid_json_max_retry))
         self.task_recovery_enabled = bool(task_recovery_enabled)
+        self.target_org_units = [str(item).strip() for item in (target_org_units or []) if str(item).strip()]
+        self.org_unit_match_threshold = min(1.0, max(0.0, float(org_unit_match_threshold)))
         self.visited_urls: set[str] = set()
         self._fetch_cache: dict[str, FetchResult] = {}
         self.backtrack_count = 0
@@ -181,6 +193,8 @@ class CrawlerAgent:
         self._detail_visited_urls: set[str] = set()
         self._detail_processed_by_org_unit: dict[str, int] = {}
         self._enriched_names_by_org_unit: dict[str, set[str]] = {}
+        self._target_org_unit_ids: set[int] = set()
+        self._org_units_marked_no_faculty: set[int] = set()
         self._pipeline_stats: dict[str, Any] = {
             "enabled": self.pipeline_enabled,
             "pending": 0,
@@ -215,6 +229,11 @@ class CrawlerAgent:
     def _is_interactive(self) -> bool:
         """True when using a human-assisted fetcher (streaming per-org-unit is preferred)."""
         return hasattr(self.fetcher, 'set_context')
+
+    def _all_target_org_units_marked_no_faculty(self) -> bool:
+        return bool(self._target_org_unit_ids) and self._target_org_unit_ids.issubset(
+            self._org_units_marked_no_faculty
+        )
 
     async def run(self) -> AgentResult:
         await self._ensure_university()
@@ -275,7 +294,30 @@ class CrawlerAgent:
                     org_unit_pages = []
                     self._skip_cross_run_dedup = True
                     continue
-                if len(org_units) < self.min_org_units:
+                if self.target_org_units:
+                    org_units, unmatched = self._filter_target_org_units(org_units)
+                    if unmatched:
+                        await self._set_status(CrawlStatus.FAILED)
+                        self.logger.warning(
+                            "Target org units unmatched university=%s requested=%s unmatched=%s threshold=%.2f",
+                            self.university_name,
+                            self.target_org_units,
+                            unmatched,
+                            self.org_unit_match_threshold,
+                        )
+                        return self._result(
+                            CrawlStatus.FAILED,
+                            [f"Target org units unmatched: {', '.join(unmatched)}"],
+                        )
+                    self._target_org_unit_ids = {int(unit.id) for unit in org_units if unit.id is not None}
+                    self.logger.info(
+                        "Target org units matched university=%s requested=%s matched=%s threshold=%.2f",
+                        self.university_name,
+                        self.target_org_units,
+                        [unit.name for unit in org_units],
+                        self.org_unit_match_threshold,
+                    )
+                if (not self.target_org_units) and len(org_units) < self.min_org_units:
                     self.logger.info(
                         "Only %s org units found (min=%s), likely category pages; retrying",
                         len(org_units),
@@ -299,6 +341,11 @@ class CrawlerAgent:
                 if not faculty_links:
                     faculty_links = await self._find_faculty_pages(org_units)
                 if not faculty_links:
+                    if self._all_target_org_units_marked_no_faculty():
+                        self.logger.info(
+                            "No faculty links found, but all targeted org units are marked no_faculty_page; stop backtracking"
+                        )
+                        break
                     if self._too_many_backtracks("no faculty links found"):
                         break
                     org_units = []
@@ -309,13 +356,30 @@ class CrawlerAgent:
 
             if not self._is_interactive:
                 if not faculty_links:
-                    faculty_links = [_QueuedUrl(home.url, 0, label="Unknown")]
-                await self._extract_professors(faculty_links)
+                    if self._all_target_org_units_marked_no_faculty():
+                        self.logger.info(
+                            "Skip fallback extraction from homepage because all targeted org units are marked no_faculty_page"
+                        )
+                    else:
+                        faculty_links = [_QueuedUrl(home.url, 0, label="Unknown")]
+                if faculty_links:
+                    await self._extract_professors(faculty_links)
 
 
             total_professor_count = await self._professor_count()
             newly_saved_count = max(0, total_professor_count - initial_professor_count)
             if total_professor_count <= 0:
+                if (
+                    self._all_target_org_units_marked_no_faculty()
+                ):
+                    message = "No professors saved: all targeted org units are marked no_faculty_page"
+                    await self._set_status(CrawlStatus.COMPLETED)
+                    self.logger.warning(
+                        "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
+                        self.university_name,
+                        sorted(self._target_org_unit_ids),
+                    )
+                    return self._result(CrawlStatus.COMPLETED, [message])
                 await self._set_status(CrawlStatus.FAILED)
                 self.logger.warning(
                     "Crawler did not save any professors for %s; marking failed",
@@ -557,6 +621,86 @@ class CrawlerAgent:
 
         async with self.db.session() as session:
             return await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
+
+    @staticmethod
+    def _normalize_org_unit_match_text(value: str) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        return re.sub(r"[\s\-_·,，、/\\|:：;；\(\)（）\[\]【】{}<>《》]+", "", text)
+
+    @classmethod
+    def _org_unit_match_score(cls, query: str, candidate: str) -> float:
+        q = cls._normalize_org_unit_match_text(query)
+        c = cls._normalize_org_unit_match_text(candidate)
+        if not q or not c:
+            return 0.0
+        if q == c:
+            return 1.0
+        if q in c:
+            coverage = float(len(q)) / float(max(1, len(c)))
+            return min(0.99, max(0.90, 0.85 + coverage * 0.15))
+        if c in q:
+            coverage = float(len(c)) / float(max(1, len(q)))
+            return min(0.89, max(0.75, 0.68 + coverage * 0.21))
+        return float(difflib.SequenceMatcher(None, q, c).ratio())
+
+    def _filter_target_org_units(
+        self,
+        org_units: list[OrgUnit],
+    ) -> tuple[list[OrgUnit], list[str]]:
+        if not self.target_org_units:
+            return org_units, []
+        selected: dict[str, OrgUnit] = {}
+        unmatched: list[str] = []
+        for raw_target in self.target_org_units:
+            target = str(raw_target or "").strip()
+            if not target:
+                continue
+            best_unit: OrgUnit | None = None
+            best_score = 0.0
+            for unit in org_units:
+                score = self._org_unit_match_score(target, unit.name)
+                if score > best_score:
+                    best_unit = unit
+                    best_score = score
+            if best_unit is None or best_score < self.org_unit_match_threshold:
+                unmatched.append(target)
+                continue
+            key = (
+                f"id:{int(best_unit.id)}"
+                if best_unit.id is not None
+                else f"url:{_sanitize_url(best_unit.url) or best_unit.url}"
+            )
+            selected[key] = best_unit
+        return list(selected.values()), unmatched
+
+    async def _set_org_unit_status(self, org_unit_id: int | None, status: OrgUnitStatus) -> None:
+        if org_unit_id is None:
+            return
+        async with self.db.session() as session:
+            await crawler_db.set_org_unit_status(session, int(org_unit_id), status)
+
+    async def _mark_org_unit_no_faculty(self, org_unit: OrgUnit, page_url: str) -> None:
+        if org_unit.id is None:
+            return
+        org_unit_id = int(org_unit.id)
+        self._org_units_marked_no_faculty.add(org_unit_id)
+        await self._set_org_unit_status(org_unit_id, OrgUnitStatus.NO_FACULTY_PAGE)
+        self.logger.info(
+            "Org unit marked no_faculty_page university=%s org_unit=%s page=%s",
+            self.university_name,
+            org_unit.name,
+            page_url,
+        )
+
+    async def _mark_org_unit_has_faculty(self, org_unit: OrgUnit) -> None:
+        if org_unit.id is None:
+            return
+        org_unit_id = int(org_unit.id)
+        self._org_units_marked_no_faculty.discard(org_unit_id)
+        await self._set_org_unit_status(org_unit_id, OrgUnitStatus.IN_PROGRESS)
+
     async def _find_and_extract_streaming(self, org_units: list[OrgUnit]) -> None:
         """Interactive mode: for each org unit, find faculty pages then immediately extract professors."""
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
@@ -652,6 +796,11 @@ class CrawlerAgent:
                     fetched.url,
                     low_info_reason,
                 )
+
+            if not links:
+                await self._mark_org_unit_no_faculty(org_unit, fetched.url)
+                continue
+            await self._mark_org_unit_has_faculty(org_unit)
 
             # --- Immediately extract professors from found links ---
             faculty_for_unit: list[_QueuedUrl] = []
@@ -781,6 +930,11 @@ class CrawlerAgent:
                     fetched.url,
                     low_info_reason,
                 )
+
+            if not links:
+                await self._mark_org_unit_no_faculty(org_unit, fetched.url)
+                continue
+            await self._mark_org_unit_has_faculty(org_unit)
 
             for link in links[:max_links_per_org_unit]:
                 depth = item.depth + (0 if link == fetched.url else 1)

@@ -13,6 +13,7 @@ from agents.crawler.db.schema import ensure_runtime_schema
 from agents.crawler.db.steward import (
     add_data_quality_audit,
     create_steward_run,
+    delete_professor_duplicates_for_academician,
     finish_steward_run,
     hard_delete_professor,
     list_professor_academician_duplicates,
@@ -36,6 +37,7 @@ from agents.crawler.db.university import (
     list_org_units,
     load_university_targets_from_csv,
     log_crawl,
+    set_org_unit_status,
     set_university_status,
 )
 
@@ -43,6 +45,7 @@ __all__ = [
     "count_academicians",
     "count_professors",
     "create_steward_run",
+    "delete_professor_duplicates_for_academician",
     "finish_steward_run",
     "add_data_quality_audit",
     "ensure_professor_affiliation",
@@ -61,6 +64,7 @@ __all__ = [
     "merge_into_academician_from_professor",
     "hard_delete_professor",
     "set_crawl_task_status",
+    "set_org_unit_status",
     "set_university_status",
     "summarize_crawl_task_status",
     "upsert_academician",

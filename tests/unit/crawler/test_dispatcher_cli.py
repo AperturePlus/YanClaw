@@ -91,6 +91,27 @@ class SlowAgent:
         )()
 
 
+class CaptureAgent:
+    last_kwargs: dict[str, object] | None = None
+
+    def __init__(self, **kwargs):
+        CaptureAgent.last_kwargs = kwargs
+        self.university_name = kwargs["university_name"]
+
+    async def run(self):
+        return type(
+            "Result",
+            (),
+            {
+                "university_name": self.university_name,
+                "status": CrawlStatus.COMPLETED.value,
+                "visited_count": 1,
+                "saved_professors": 0,
+                "messages": [],
+            },
+        )()
+
+
 async def test_dispatcher_enforces_university_timeout(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -115,6 +136,33 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
     assert any("Timeout after" in message for message in summary.results[0].messages)
 
 
+async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        request_interval_seconds=0,
+        max_retries=0,
+        fetcher_backend="human",
+        target_org_units=["计算机学院", "软件学院"],
+        org_unit_match_threshold=0.7,
+    )
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent)
+    summary = await dispatcher.run(universities=["A"])
+
+    assert summary.success == 1
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("target_org_units") == ["计算机学院", "软件学院"]
+    assert CaptureAgent.last_kwargs.get("org_unit_match_threshold") == 0.7
+
+
 def test_university_db_path_differs_per_school(tmp_path):
     from agents.crawler.dispatcher import _university_db_path
 
@@ -133,6 +181,8 @@ def test_cli_help_outputs_commands():
     result = runner.invoke(cli, ["crawl", "--help"])
     assert result.exit_code == 0
     assert "--universities" in result.output
+    assert "--org-units" in result.output
+    assert "--org-unit-match-threshold" in result.output
     assert "--resume" in result.output
 
     result = runner.invoke(cli, ["skills", "--help"])
@@ -151,6 +201,37 @@ def test_runtime_cli_exposes_crawler_commands():
     assert result.exit_code == 0
     assert "crawl" in result.output
     assert "steward" in result.output
+
+
+def test_crawl_cli_passes_org_unit_filters(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def _fake_crawl_async(settings, universities, **kwargs):
+        captured["settings_target_org_units"] = list(settings.target_org_units)
+        captured["settings_org_unit_match_threshold"] = float(settings.org_unit_match_threshold)
+        captured["universities"] = universities
+        captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(crawler_cli, "_crawl_async", _fake_crawl_async)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "crawl",
+            "--universities",
+            "A",
+            "--org-units",
+            "计算机学院,软件学院",
+            "--org-unit-match-threshold",
+            "0.7",
+            "--skip-llm-check",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["universities"] == ["A"]
+    assert captured["settings_target_org_units"] == ["计算机学院", "软件学院"]
+    assert captured["settings_org_unit_match_threshold"] == 0.7
 
 
 async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monkeypatch):

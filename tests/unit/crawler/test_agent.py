@@ -20,7 +20,16 @@ from agents.crawler.agent import (
     ORG_UNIT_PAGE_KEYWORDS,
 )
 from agents.crawler.fetchers import FetchResult, Fetcher
-from agents.crawler.models import CrawlExtractionFailure, CrawlLogStatus, CrawlStatus, CrawlTask, CrawlTaskStatus, OrgUnit, UniversityMeta
+from agents.crawler.models import (
+    CrawlExtractionFailure,
+    CrawlLogStatus,
+    CrawlStatus,
+    CrawlTask,
+    CrawlTaskStatus,
+    OrgUnit,
+    OrgUnitStatus,
+    UniversityMeta,
+)
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallErrorRecord, ToolCallRecord
@@ -121,7 +130,16 @@ class FakeLLMDiscoverViaToolLog(FakeLLM):
         return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
 
 
-async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3, pages=None):
+async def _agent(
+    tmp_path,
+    fake_llm,
+    max_depth=4,
+    max_backtracks=3,
+    pages=None,
+    *,
+    fetcher_cls=FakeFetcher,
+    **agent_kwargs,
+):
     db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
     await db.init_db()
     skills_dir = tmp_path / "skills"
@@ -156,7 +174,7 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3, pages=None):
                 200,
             ),
         }
-    fetcher = FakeFetcher(pages)
+    fetcher = fetcher_cls(pages)
     agent = CrawlerAgent(
         university_name="TestU",
         start_url="https://www.example.edu.cn/",
@@ -169,6 +187,7 @@ async def _agent(tmp_path, fake_llm, max_depth=4, max_backtracks=3, pages=None):
         max_depth=max_depth,
         max_backtracks=max_backtracks,
         min_org_units=1,
+        **agent_kwargs,
     )
     return agent, fetcher, db
 
@@ -227,6 +246,255 @@ async def test_agent_marks_failed_when_backtrack_limit_exceeded(tmp_path):
     result = await agent.run()
 
     assert result.status == CrawlStatus.FAILED.value
+    await db.close()
+
+
+async def test_agent_target_org_units_fuzzy_match_selects_best_single_org_unit(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://scse.example.edu.cn/", "https://ee.example.edu.cn/"],
+            200,
+        ),
+        "https://scse.example.edu.cn/": FetchResult(
+            "https://scse.example.edu.cn/",
+            "计算机学院 软件学院",
+            ["https://scse.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://scse.example.edu.cn": FetchResult(
+            "https://scse.example.edu.cn/",
+            "计算机学院 软件学院",
+            ["https://scse.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://ee.example.edu.cn/": FetchResult(
+            "https://ee.example.edu.cn/",
+            "电子信息学院",
+            ["https://ee.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://ee.example.edu.cn": FetchResult(
+            "https://ee.example.edu.cn/",
+            "电子信息学院",
+            ["https://ee.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://scse.example.edu.cn/faculty": FetchResult(
+            "https://scse.example.edu.cn/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+        "https://ee.example.edu.cn/faculty": FetchResult(
+            "https://ee.example.edu.cn/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+    }
+
+    class TargetOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload["state"]
+            if state == "DISCOVER_ORG_UNIT_PAGES":
+                return LLMResult('{"links": ["https://www.example.edu.cn/orgs"]}')
+            if state == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": ['
+                    '{"name": "计算机学院（软件学院）", "url": "https://scse.example.edu.cn/", "kind": "college"},'
+                    '{"name": "电子信息学院", "url": "https://ee.example.edu.cn/", "kind": "college"}'
+                    "]}",
+                )
+            if state == "EXTRACT_PROFESSORS":
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="计算机学院（软件学院）",
+                    org_unit_url="https://scse.example.edu.cn/",
+                    source_url=payload["url"],
+                    professors=[{"name": "Ada", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return LLMResult("{}")
+
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        TargetOrgLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        target_org_units=["计算机学院"],
+        org_unit_match_threshold=0.6,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert "https://scse.example.edu.cn/faculty" in fetcher.calls
+    assert "https://ee.example.edu.cn/faculty" not in fetcher.calls
+    await db.close()
+
+
+async def test_agent_target_org_units_unmatched_fails_early(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://scse.example.edu.cn/"],
+            200,
+        ),
+        "https://scse.example.edu.cn/": FetchResult(
+            "https://scse.example.edu.cn/",
+            "计算机学院",
+            [],
+            200,
+        ),
+    }
+
+    class SingleOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "计算机学院", "url": "https://scse.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        SingleOrgLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        target_org_units=["土木学院"],
+        org_unit_match_threshold=0.6,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.FAILED.value
+    assert any("Target org units unmatched" in message for message in result.messages)
+    await db.close()
+
+
+async def test_agent_marks_org_unit_status_no_faculty_page_when_no_faculty_links(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://ai.example.edu.cn/"],
+            200,
+        ),
+        "https://ai.example.edu.cn/": FetchResult(
+            "https://ai.example.edu.cn/",
+            "x",
+            [],
+            200,
+        ),
+        "https://ai.example.edu.cn": FetchResult(
+            "https://ai.example.edu.cn/",
+            "x",
+            [],
+            200,
+        ),
+    }
+
+    class AiOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "人工智能学院", "url": "https://ai.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        AiOrgLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.FAILED.value
+    async with db.session() as session:
+        org_unit = (
+            await session.execute(select(OrgUnit).where(OrgUnit.name == "人工智能学院"))
+        ).scalar_one()
+        assert org_unit.status == OrgUnitStatus.NO_FACULTY_PAGE.value
+    await db.close()
+
+
+async def test_agent_target_org_units_all_no_faculty_completes_with_warning(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://ai.example.edu.cn/"],
+            200,
+        ),
+        "https://ai.example.edu.cn/": FetchResult(
+            "https://ai.example.edu.cn/",
+            "x",
+            [],
+            200,
+        ),
+        "https://ai.example.edu.cn": FetchResult(
+            "https://ai.example.edu.cn/",
+            "x",
+            [],
+            200,
+        ),
+    }
+
+    class AiOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "人工智能学院", "url": "https://ai.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        AiOrgLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        target_org_units=["人工智能学院"],
+        org_unit_match_threshold=0.6,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert any("no_faculty_page" in message for message in result.messages)
+    async with db.session() as session:
+        org_unit = (
+            await session.execute(select(OrgUnit).where(OrgUnit.name == "人工智能学院"))
+        ).scalar_one()
+        assert org_unit.status == OrgUnitStatus.NO_FACULTY_PAGE.value
     await db.close()
 
 

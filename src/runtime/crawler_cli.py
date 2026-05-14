@@ -21,6 +21,13 @@ def cli() -> None:
 
 @cli.command()
 @click.option("--universities", default="", help="Comma-separated university names to crawl.")
+@click.option("--org-units", default="", help="Comma-separated org-unit names to target with fuzzy matching.")
+@click.option(
+    "--org-unit-match-threshold",
+    default=None,
+    type=float,
+    help="Fuzzy-match threshold in [0,1] for --org-units.",
+)
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency.")
 @click.option("--log-dir", default=None, type=click.Path(path_type=Path), help="Log directory.")
 @click.option(
@@ -54,6 +61,8 @@ def cli() -> None:
 )
 def crawl(
     universities: str,
+    org_units: str,
+    org_unit_match_threshold: float | None,
     concurrency: int | None,
     log_dir: Path | None,
     university_timeout_seconds: float | None,
@@ -66,6 +75,11 @@ def crawl(
     """Start crawler agents."""
 
     overrides: dict[str, object] = {}
+    target_org_units = [item.strip() for item in org_units.split(",") if item.strip()]
+    if target_org_units:
+        overrides["target_org_units"] = target_org_units
+    if org_unit_match_threshold is not None:
+        overrides["org_unit_match_threshold"] = org_unit_match_threshold
     if concurrency is not None:
         overrides["max_concurrency"] = concurrency
     if log_dir is not None:
@@ -77,7 +91,7 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s fetcher_backend=%s university_timeout_seconds=%s request_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s",
+        "Crawler config concurrency=%s fetcher_backend=%s university_timeout_seconds=%s request_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s",
         settings.max_concurrency,
         settings.fetcher_backend,
         settings.university_timeout_seconds,
@@ -85,6 +99,8 @@ def crawl(
         settings.llm_timeout_seconds,
         resume,
         ",".join(selected) if selected else "*",
+        ",".join(settings.target_org_units) if settings.target_org_units else "*",
+        settings.org_unit_match_threshold,
     )
     asyncio.run(
         _crawl_async(
