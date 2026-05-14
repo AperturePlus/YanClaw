@@ -132,6 +132,7 @@ def get_crawler_tools(
         academicians_saved = 0
         deduped_by_academician = 0
         academicians_enriched = 0
+        professors_deleted_as_academician_duplicates = 0
         filtered_retired = 0
         errors: list[str] = []
         for professor in professors:
@@ -155,7 +156,12 @@ def get_crawler_tools(
                         "source_url": source_url,
                     }
                     if is_academician:
-                        await crawler_db.upsert_academician(session, data)
+                        academician = await crawler_db.upsert_academician(session, data)
+                        removed = await crawler_db.delete_professor_duplicates_for_academician(
+                            session,
+                            academician,
+                        )
+                        professors_deleted_as_academician_duplicates += int(removed or 0)
                         academicians_saved += 1
                     else:
                         matched_academician, _reason = await crawler_db.match_academician_for_professor(
@@ -183,6 +189,11 @@ def get_crawler_tools(
                             deduped_by_academician += 1
                             if enriched:
                                 academicians_enriched += 1
+                            removed = await crawler_db.delete_professor_duplicates_for_academician(
+                                session,
+                                matched_academician,
+                            )
+                            professors_deleted_as_academician_duplicates += int(removed or 0)
                             continue
                         await crawler_db.upsert_professor(session, data)
                         saved += 1
@@ -195,6 +206,8 @@ def get_crawler_tools(
             result["deduped_by_academician"] = deduped_by_academician
         if academicians_enriched:
             result["academicians_enriched"] = academicians_enriched
+        if professors_deleted_as_academician_duplicates:
+            result["professors_deleted_as_academician_duplicates"] = professors_deleted_as_academician_duplicates
         if filtered_retired:
             result["filtered_retired"] = filtered_retired
         if errors:

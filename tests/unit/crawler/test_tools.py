@@ -82,6 +82,33 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
     )
     assert retired_filtered == {"saved": 0, "filtered_retired": 1}
 
+    promoted_professor = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/faculty",
+        professors=[{"name": "Promote A", "title": "Professor", "email": "promote@example.edu.cn"}],
+    )
+    assert promoted_professor == {"saved": 1}
+    promoted_to_academician = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/detail",
+        professors=[{"name": "Promote A", "title": "Academician", "email": "promote@example.edu.cn"}],
+    )
+    assert promoted_to_academician["saved"] == 0
+    assert promoted_to_academician.get("academicians_saved") == 1
+    assert promoted_to_academician.get("professors_deleted_as_academician_duplicates") == 1
+
+    async with db.session() as session:
+        promoted_professors = (
+            await session.execute(select(Professor).where(Professor.name == "Promote A"))
+        ).scalars().all()
+        assert len(promoted_professors) == 0
+        promoted_academician = (
+            await session.execute(select(Academician).where(Academician.name == "Promote A"))
+        ).scalar_one()
+        assert promoted_academician.email == "promote@example.edu.cn"
+
     seeded_academician = await tools["save_professors"](
         org_unit_name="CS",
         org_unit_url="https://www.example.edu.cn/cs",

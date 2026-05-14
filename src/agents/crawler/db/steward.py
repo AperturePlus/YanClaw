@@ -212,6 +212,30 @@ async def hard_delete_professor(session: AsyncSession, professor: Professor) -> 
     await session.flush()
 
 
+async def delete_professor_duplicates_for_academician(
+    session: AsyncSession,
+    academician: Academician,
+) -> int:
+    if academician is None:
+        return 0
+    professors = (await session.execute(select(Professor).order_by(Professor.id.asc()))).scalars().all()
+    deleted = 0
+    for professor in professors:
+        match, _reason = await match_academician_for_professor(
+            session,
+            name=professor.name,
+            org_unit_name=professor.org_unit_name,
+            email=professor.email,
+            homepage=professor.homepage,
+            external_link=professor.external_link,
+        )
+        if match is None or int(match.id) != int(academician.id):
+            continue
+        await hard_delete_professor(session, professor)
+        deleted += 1
+    return deleted
+
+
 async def list_professor_academician_duplicates(
     session: AsyncSession,
 ) -> list[tuple[Professor, Academician, str]]:
