@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -209,6 +210,23 @@ async def test_agent_state_machine_discovers_org_units_and_saves_professors(tmp_
     await db.close()
 
 
+async def test_fetch_url_skips_malformed_cms_link_before_fetch(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM())
+    bad_url = (
+        "https://www.example.edu.cn/szdw/zzjs1/"
+        "%3Cspan%20style='color:red;font-size:9pt'%3E"
+        "%E8%BD%AC%E6%8D%A2%E9%93%BE%E6%8E%A5%E9%94%99%E8%AF%AF%3C/span"
+    )
+
+    fetched = await agent._fetch_url(bad_url, 1)
+
+    assert fetched is None
+    assert fetcher.calls == []
+    assert agent._pipeline_stats["invalid_urls_skipped"] == 1
+    assert any("skip invalid_url" in entry for entry in agent.execution_log)
+    await db.close()
+
+
 async def test_agent_bypasses_cross_run_dedup_when_all_org_pages_are_history(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     async with db.session() as session:
@@ -278,6 +296,87 @@ async def test_resume_mode_recovers_tasks_without_refetching_historical_start_ur
     assert result.saved_professors == 1
     assert fetcher.calls == []
     assert "skip already_crawled url=https://www.example.edu.cn/" in agent.execution_log
+    await db.close()
+
+
+async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_path):
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        for index in range(5):
+            await crawler_db.upsert_crawl_task(
+                session,
+                university="TestU",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_hash=f"resume-task-{index}",
+                page_text_snapshot=f"faculty list Ada {index}",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
+
+    async with db.session() as session:
+        summary = await crawler_db.summarize_crawl_task_status(session)
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    assert summary[CrawlTaskStatus.DONE.value] == 5
+    assert all(task.status == CrawlTaskStatus.DONE.value for task in tasks)
+    assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
+    assert int(agent._pipeline_stats.get("records_created", 0)) == 1
+    await db.close()
+
+
+async def test_strict_resume_recovers_more_tasks_than_queue_cap_without_fetching(tmp_path):
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={},
+        resume_mode=True,
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/",
+            CrawlLogStatus.SUCCESS,
+            "seeded-history",
+        )
+        for index in range(5):
+            await crawler_db.upsert_crawl_task(
+                session,
+                university="TestU",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_hash=f"strict-resume-task-{index}",
+                page_text_snapshot=f"faculty list Ada {index}",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+
+    result = await asyncio.wait_for(agent.run(), timeout=10)
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert fetcher.calls == []
+    assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
+    async with db.session() as session:
+        summary = await crawler_db.summarize_crawl_task_status(session)
+    assert summary[CrawlTaskStatus.PENDING.value] == 0
+    assert summary[CrawlTaskStatus.RETRY.value] == 0
+    assert summary[CrawlTaskStatus.IN_PROGRESS.value] == 0
+    assert summary[CrawlTaskStatus.DONE.value] == 5
     await db.close()
 
 

@@ -408,11 +408,7 @@ class CrawlerAgent:
             org_units = await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
             task_summary = await crawler_db.summarize_crawl_task_status(session)
 
-        recoverable_tasks = (
-            int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
-            + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
-            + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
-        )
+        recoverable_tasks = self._recoverable_task_count(task_summary)
         if not org_units and recoverable_tasks <= 0:
             message = (
                 "resume_blocked_missing_cache: start URL was already crawled but no page cache, "
@@ -432,7 +428,18 @@ class CrawlerAgent:
                 self.university_name,
                 recoverable_tasks,
             )
-            await self._extract_professors([])
+            await self._extract_professors([], recovery_limit=recoverable_tasks)
+            async with self.db.session() as session:
+                task_summary = await crawler_db.summarize_crawl_task_status(session)
+            remaining_recoverable = self._recoverable_task_count(task_summary)
+            self.logger.info(
+                "Strict resume recovery progress university=%s before=%s remaining=%s done=%s failed=%s",
+                self.university_name,
+                recoverable_tasks,
+                remaining_recoverable,
+                task_summary.get(CrawlTaskStatus.DONE.value, 0),
+                task_summary.get(CrawlTaskStatus.FAILED.value, 0),
+            )
 
         if org_units:
             self.logger.info(
@@ -446,6 +453,25 @@ class CrawlerAgent:
                 faculty_links = await self._find_faculty_pages(org_units)
                 if faculty_links:
                     await self._extract_professors(faculty_links)
+
+        async with self.db.session() as session:
+            final_task_summary = await crawler_db.summarize_crawl_task_status(session)
+        final_recoverable_tasks = self._recoverable_task_count(final_task_summary)
+        if final_recoverable_tasks > 0:
+            message = (
+                "resume_incomplete_recoverable_tasks: strict resume still has "
+                f"{final_recoverable_tasks} pending/retry/in_progress crawl tasks"
+            )
+            self.logger.warning(
+                "Strict resume incomplete university=%s recoverable_remaining=%s pending=%s retry=%s in_progress=%s",
+                self.university_name,
+                final_recoverable_tasks,
+                final_task_summary.get(CrawlTaskStatus.PENDING.value, 0),
+                final_task_summary.get(CrawlTaskStatus.RETRY.value, 0),
+                final_task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0),
+            )
+            await self._set_status(CrawlStatus.FAILED)
+            return self._result(CrawlStatus.FAILED, [message])
 
         total_professor_count = await self._professor_count()
         newly_saved_count = max(0, total_professor_count - initial_professor_count)
@@ -471,6 +497,14 @@ class CrawlerAgent:
         )
         await self._set_status(CrawlStatus.FAILED)
         return self._result(CrawlStatus.FAILED, [message])
+
+    @staticmethod
+    def _recoverable_task_count(task_summary: dict[str, int]) -> int:
+        return (
+            int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
+        )
 
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
@@ -1126,7 +1160,12 @@ class CrawlerAgent:
                 len(result.links),
             )
         return found
-    async def _extract_professors(self, faculty_links: list[_QueuedUrl]) -> None:
+    async def _extract_professors(
+        self,
+        faculty_links: list[_QueuedUrl],
+        *,
+        recovery_limit: int | None = None,
+    ) -> None:
         self._log_state(CrawlerState.EXTRACT_PROFESSORS)
         skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
         max_pages = min(max(40, len(faculty_links)), 120)
@@ -1285,13 +1324,6 @@ class CrawlerAgent:
 
         llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
         db_queue: asyncio.Queue[_SaveEvent | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
-
-        if self.pipeline_enabled and self.task_recovery_enabled:
-            recovered = await self._recover_pipeline_tasks(limit=self.pipeline_queue_cap * 4)
-            for task in recovered:
-                await llm_queue.put(task)
-            if recovered:
-                self.logger.info("Recovered %s pending extraction tasks from DB", len(recovered))
 
         llm_workers = [
             asyncio.create_task(self._pipeline_llm_worker(llm_queue, db_queue, skills), name=f"llm_worker_{i}")
@@ -1854,17 +1886,20 @@ class CrawlerAgent:
                 updated = int(result.get("updated", 0) or 0)
                 unchanged = int(result.get("unchanged", 0) or 0)
                 deduped_by_name_key = int(result.get("deduped_by_name_key", 0) or 0)
+                deduped_by_homepage = int(result.get("deduped_by_homepage", 0) or 0)
                 totals["accepted"] += accepted
                 totals["created"] += created
                 totals["updated"] += updated
                 totals["unchanged"] += unchanged
                 totals["deduped_by_name_key"] += deduped_by_name_key
+                totals["deduped_by_homepage"] += deduped_by_homepage
                 self.saved_professors += created
         self._pipeline_stats["records_accepted"] = int(self._pipeline_stats.get("records_accepted", 0)) + totals["accepted"]
         self._pipeline_stats["records_created"] = int(self._pipeline_stats.get("records_created", 0)) + totals["created"]
         self._pipeline_stats["records_updated"] = int(self._pipeline_stats.get("records_updated", 0)) + totals["updated"]
         self._pipeline_stats["records_unchanged"] = int(self._pipeline_stats.get("records_unchanged", 0)) + totals["unchanged"]
         self._pipeline_stats["deduped_by_name_key"] = int(self._pipeline_stats.get("deduped_by_name_key", 0)) + totals["deduped_by_name_key"]
+        self._pipeline_stats["deduped_by_homepage"] = int(self._pipeline_stats.get("deduped_by_homepage", 0)) + totals["deduped_by_homepage"]
         if task is not None:
             self._record_roster_overlap_observation(task, totals)
         return totals
