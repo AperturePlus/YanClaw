@@ -63,13 +63,12 @@ userscripts/
 
 ### 3.2 与现有系统的集成点
 
-HumanFetcherBridge 实现与 `Fetcher` 相同的接口（`fetch(url) -> FetchResult`），
-因此 CrawlerAgent 无需任何修改。集成方式：
+HumanFetcherBridge 是当前唯一支持的运行时 fetcher，并实现 `fetch(url) -> FetchResult`。
+集成方式：
 
-1. `CrawlerSettings` 新增 `fetcher_backend = "human"` 选项
-2. `CrawlDispatcher` 的 fetcher factory 新增 `human` 分支，创建 HumanFetcherBridge
-3. HumanFetcherBridge 内部启动 aiohttp HTTP server，暴露 job queue API
-4. CrawlerAgent 调用 `fetcher.fetch(url)` 时，bridge 创建 FetchJob 并 `await` 直到人工完成
+1. `CrawlDispatcher` 的默认 fetcher factory 直接创建 HumanFetcherBridge
+2. HumanFetcherBridge 内部启动 aiohttp HTTP server，暴露 job queue API
+3. CrawlerAgent 调用 `fetcher.fetch(url)` 时，bridge 创建 FetchJob 并 `await` 直到人工完成
 
 ```
 CrawlerAgent.fetch(url)

@@ -263,10 +263,12 @@ class CrawlDispatcher:
         async with semaphore:
             timeout_seconds = float(self.settings.university_timeout_seconds)
             self.logger.info(
-                "Dispatching %s (timeout=%ss request_timeout=%ss llm_timeout=%ss)",
+                "Dispatching %s (timeout=%ss human_bridge=%s:%s human_job_timeout=%ss llm_timeout=%ss)",
                 university.name,
                 timeout_seconds,
-                self.settings.request_timeout_seconds,
+                self.settings.human_server_host,
+                self.settings.human_server_port,
+                self.settings.human_job_timeout_seconds,
                 self.settings.llm_timeout_seconds,
             )
 
@@ -299,11 +301,8 @@ class CrawlDispatcher:
                         fetcher=fetcher,
                         model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
                         detail_enrich_enabled=self.settings.detail_enrich_enabled,
-                        detail_fetch_backend=self.settings.detail_fetch_backend,
                         detail_profile_hard_cap_per_org_unit=self.settings.detail_profile_hard_cap_per_org_unit,
-                        detail_failure_threshold=self.settings.detail_failure_threshold,
                         pipeline_enabled=self.settings.pipeline_enabled,
-                        pipeline_fetch_workers=self.settings.pipeline_fetch_workers,
                         pipeline_llm_workers=self.settings.pipeline_llm_workers,
                         pipeline_db_workers=self.settings.pipeline_db_workers,
                         pipeline_queue_cap=self.settings.pipeline_queue_cap,

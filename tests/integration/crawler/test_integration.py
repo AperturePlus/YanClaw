@@ -109,8 +109,6 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         websites_path=websites,
         crawler_skills_dir=skills_dir,
         university_db_dir=tmp_path / "universities",
-        request_interval_seconds=0,
-        max_retries=0,
         max_concurrency=1,
     )
     dispatcher = CrawlDispatcher(
