@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from agents.crawler.sanitizer import sanitize_professor_payload
+from agents.crawler.sanitizer import normalize_name, normalize_name_key, sanitize_professor_payload
 
 
 def test_sanitize_professor_payload_normalizes_title_and_nullish_fields():
@@ -49,3 +49,12 @@ def test_sanitize_professor_payload_does_not_copy_homepage_into_external_link():
 
     assert cleaned["homepage"] == "https://cs.testu.edu.cn/info/1001/1.htm"
     assert cleaned["external_link"] is None
+
+
+def test_normalize_name_removes_only_cjk_internal_spaces():
+    assert normalize_name("王 俊") == "王俊"
+    assert normalize_name("汪　莎") == "汪莎"
+    assert normalize_name("李\u200b 四") == "李四"
+    assert normalize_name("John Smith") == "John Smith"
+    assert normalize_name_key("王 俊") == "王俊"
+    assert normalize_name_key("John Smith") == "John Smith"

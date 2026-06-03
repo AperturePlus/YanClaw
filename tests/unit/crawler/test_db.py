@@ -6,6 +6,7 @@ from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler.models import (
+    Academician,
     CrawlExtractionFailure,
     CrawlLogStatus,
     CrawlStatus,
@@ -125,6 +126,46 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
     await db.close()
 
 
+async def test_upsert_professor_dedupes_same_org_unit_by_name_key(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "name_key_professor.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王俊",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "title": "Professor",
+                "source_url": "https://soft.example.edu.cn/szdw.htm",
+            },
+        )
+        second = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王 俊",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "email": "wangjun@example.edu.cn",
+                "source_url": "https://soft.example.edu.cn/info/1001/1.htm",
+            },
+        )
+        assert first.id == second.id
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        assert len(professors) == 1
+        assert len(affiliations) == 1
+        assert professors[0].name == "王俊"
+        assert professors[0].name_key == "王俊"
+        assert professors[0].email == "wangjun@example.edu.cn"
+        assert affiliations[0].source_url == "https://soft.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
 async def test_load_university_targets_accepts_markdown_autolink_urls(tmp_path):
     csv_path = tmp_path / "websites.md"
     csv_path.write_text(
@@ -165,6 +206,41 @@ async def test_upsert_academician_professors(tmp_path):
     await db.close()
 
 
+async def test_upsert_academician_dedupes_same_org_unit_by_name_key(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "name_key_academician.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_academician(
+            session,
+            {
+                "name": "汪莎",
+                "org_unit_name": "材料学院",
+                "org_unit_url": "https://mat.example.edu.cn/",
+                "title": "Academician",
+            },
+        )
+        second = await crawler_db.upsert_academician(
+            session,
+            {
+                "name": "汪　莎",
+                "org_unit_name": "材料学院",
+                "org_unit_url": "https://mat.example.edu.cn/",
+                "email": "wangsha@example.edu.cn",
+            },
+        )
+        assert first.id == second.id
+
+    async with db.session() as session:
+        academicians = (await session.execute(select(Academician))).scalars().all()
+        assert len(academicians) == 1
+        assert academicians[0].name == "汪莎"
+        assert academicians[0].name_key == "汪莎"
+        assert academicians[0].email == "wangsha@example.edu.cn"
+
+    await db.close()
+
+
 async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "schema.db"))
     await db.init_db()
@@ -191,6 +267,67 @@ async def test_ensure_runtime_schema_normalizes_empty_professor_fields(tmp_path)
         assert professor.email is None
         assert professor.phone is None
         assert professor.homepage == "https://cs.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_ensure_runtime_schema_repairs_professor_name_key_pollution(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "schema_name_key_repair.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        org_unit = OrgUnit(name="软件学院", url="https://soft.example.edu.cn/", kind="college")
+        session.add(org_unit)
+        await session.flush()
+        clean = Professor(
+            name="王俊",
+            name_key="",
+            org_unit_name="软件学院",
+            title="教授",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        polluted = Professor(
+            name="王 俊",
+            name_key="",
+            org_unit_name="软件学院",
+            email="wangjun@example.edu.cn",
+            bio="研究软件工程",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([clean, polluted])
+        await session.flush()
+        session.add_all(
+            [
+                ProfessorAffiliation(
+                    professor_id=clean.id,
+                    org_unit_id=org_unit.id,
+                    source_url="https://soft.example.edu.cn/szdw.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+                ProfessorAffiliation(
+                    professor_id=polluted.id,
+                    org_unit_id=org_unit.id,
+                    source_url="https://soft.example.edu.cn/info/1001/1.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        assert len(professors) == 1
+        assert len(affiliations) == 1
+        assert professors[0].name == "王俊"
+        assert professors[0].name_key == "王俊"
+        assert professors[0].email == "wangjun@example.edu.cn"
+        assert professors[0].bio == "研究软件工程"
+        assert affiliations[0].source_url == "https://soft.example.edu.cn/info/1001/1.htm"
 
     await db.close()
 
@@ -422,6 +559,54 @@ async def test_crawl_task_recovery_and_failure_audit(tmp_path):
         await crawler_db.set_crawl_task_status(session, recovered[0].id, status=CrawlTaskStatus.DONE)
         done = (await session.execute(select(CrawlTask))).scalar_one()
         assert done.status == CrawlTaskStatus.DONE.value
+
+    await db.close()
+
+
+async def test_stale_in_progress_crawl_tasks_are_recovered_with_task_kind_preserved(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "stale_tasks.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        list_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url="https://cs.testu.edu.cn/faculty.htm",
+            page_url="https://cs.testu.edu.cn/faculty.htm",
+            page_hash="list-hash",
+            task_kind=CrawlTaskKind.LIST_PAGE,
+            page_text_snapshot="faculty list",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        detail_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_hash="detail-hash",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="Ada profile",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        await crawler_db.set_crawl_task_status(session, list_task.id, status=CrawlTaskStatus.IN_PROGRESS)
+        await crawler_db.set_crawl_task_status(session, detail_task.id, status=CrawlTaskStatus.IN_PROGRESS)
+
+    async with db.session() as session:
+        recovered_count = await crawler_db.recover_stale_in_progress_crawl_tasks(session)
+        recovered = await crawler_db.list_recoverable_crawl_tasks(session, limit=20)
+        assert recovered_count == 2
+        assert {task.task_kind for task in recovered} == {
+            CrawlTaskKind.LIST_PAGE.value,
+            CrawlTaskKind.DETAIL_PAGE.value,
+        }
+        assert all(task.status == CrawlTaskStatus.RETRY.value for task in recovered)
+        assert all(task.last_error == "recovered_stale_in_progress" for task in recovered)
 
     await db.close()
 

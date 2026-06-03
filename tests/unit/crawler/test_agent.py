@@ -651,6 +651,51 @@ async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path
     await db.close()
 
 
+async def test_pipeline_save_payloads_counts_only_created_records_and_logs_roster_overlap(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    numerals = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+    task = SimpleNamespace(
+        task_id=1,
+        org_unit_name="CS",
+        task_kind="list_page",
+        detail_mode=False,
+    )
+
+    first = await agent._save_payloads_to_db(
+        [
+            {
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "source_url": "https://www.example.edu.cn/cs/faculty",
+                "professors": [{"name": f"教师{item}", "title": "Professor"} for item in numerals],
+            }
+        ],
+        task=task,
+    )
+    second = await agent._save_payloads_to_db(
+        [
+            {
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "source_url": "https://www.example.edu.cn/cs/faculty-duplicate",
+                "professors": [{"name": f"教师 {item}", "title": "Professor"} for item in numerals],
+            }
+        ],
+        task=task,
+    )
+
+    assert first["created"] == 10
+    assert second["accepted"] == 10
+    assert second["created"] == 0
+    assert second["deduped_by_name_key"] == 10
+    assert agent.saved_professors == 10
+    assert int(agent._pipeline_stats.get("list_roster_overlap_high", 0)) == 1
+
+    async with db.session() as session:
+        assert await crawler_db.count_professors(session) == 10
+    await db.close()
+
+
 async def test_agent_build_llm_payload_trims_links_and_visited_fields(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
     agent.visited_urls = {f"https://www.example.edu.cn/v/{i}" for i in range(100)}
@@ -1129,7 +1174,9 @@ async def test_agent_still_follows_sub_faculty_links_after_saving_from_parent_pa
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
-    assert result.saved_professors == 2
+    assert result.saved_professors == 1
+    assert int(agent._pipeline_stats.get("records_accepted", 0)) == 2
+    assert int(agent._pipeline_stats.get("deduped_by_name_key", 0)) >= 1
     assert "https://www.example.edu.cn/cs/software" in fetcher.calls
     await db.close()
 
