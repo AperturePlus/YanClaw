@@ -1297,7 +1297,7 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
@@ -1308,6 +1308,13 @@ class CrawlerAgent:
                 self._pipeline_stats.get("detail_processed", 0),
                 self._pipeline_stats.get("detail_failed", 0),
                 self._pipeline_stats.get("detail_skipped", 0),
+                self._pipeline_stats.get("records_accepted", 0),
+                self._pipeline_stats.get("records_created", 0),
+                self._pipeline_stats.get("records_updated", 0),
+                self._pipeline_stats.get("records_unchanged", 0),
+                self._pipeline_stats.get("deduped_by_name_key", 0),
+                self._pipeline_stats.get("list_roster_overlap_high", 0),
+                self._pipeline_stats.get("stale_in_progress_recovered", 0),
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
                 self._pipeline_stats.get("llm_calls_total", 0),
                 self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
@@ -1394,7 +1401,13 @@ class CrawlerAgent:
 
     async def _recover_pipeline_tasks(self, *, limit: int) -> list[_ExtractionTaskItem]:
         async with self.db.session() as session:
+            stale_count = await crawler_db.recover_stale_in_progress_crawl_tasks(session)
             rows = await crawler_db.list_recoverable_crawl_tasks(session, limit=limit)
+        if stale_count:
+            self._pipeline_stats["stale_in_progress_recovered"] = int(
+                self._pipeline_stats.get("stale_in_progress_recovered", 0)
+            ) + int(stale_count)
+            self.logger.info("Recovered %s stale in_progress extraction tasks", stale_count)
         recovered: list[_ExtractionTaskItem] = []
         for row in rows:
             allowed_tools = ["save_professors"]
@@ -1510,7 +1523,7 @@ class CrawlerAgent:
                 return
             task = event.task
             try:
-                saved = await self._save_payloads_to_db(event.payloads)
+                save_summary = await self._save_payloads_to_db(event.payloads, task=task)
             except Exception as error:
                 async with self.db.session() as session:
                     await crawler_db.set_crawl_task_status(
@@ -1546,13 +1559,16 @@ class CrawlerAgent:
             self._pipeline_stats["done"] += 1
             self._pipeline_stats["processed_tasks"] += 1
             self._increment_task_kind_stat(task, "processed")
-            if saved > 0:
-                self.logger.debug(
-                    "Extraction task done task_id=%s org_unit=%s saved=%s",
-                    task.task_id,
-                    task.org_unit_name,
-                    saved,
-                )
+            self.logger.debug(
+                "Extraction task done task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s deduped_by_name_key=%s",
+                task.task_id,
+                task.org_unit_name,
+                save_summary.get("accepted", 0),
+                save_summary.get("created", 0),
+                save_summary.get("updated", 0),
+                save_summary.get("unchanged", 0),
+                save_summary.get("deduped_by_name_key", 0),
+            )
             db_queue.task_done()
 
     async def _handle_invalid_json_retry(
@@ -1726,9 +1742,20 @@ class CrawlerAgent:
             content_fallback_used=used_fallback,
         )
 
-    async def _save_payloads_to_db(self, payloads: list[dict[str, Any]]) -> int:
+    async def _save_payloads_to_db(
+        self,
+        payloads: list[dict[str, Any]],
+        *,
+        task: _ExtractionTaskItem | None = None,
+    ) -> dict[str, int]:
         tools = get_crawler_tools(self.db, self.skill_manager)
-        total_saved = 0
+        totals = {
+            "accepted": 0,
+            "created": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "deduped_by_name_key": 0,
+        }
         for payload in payloads:
             result = await tools["save_professors"](
                 org_unit_name=str(payload.get("org_unit_name") or "Unknown"),
@@ -1737,10 +1764,50 @@ class CrawlerAgent:
                 professors=[item for item in payload.get("professors", []) if isinstance(item, dict)],
             )
             if isinstance(result, dict):
-                saved = int(result.get("saved", 0) or 0)
-                self.saved_professors += saved
-                total_saved += saved
-        return total_saved
+                accepted = int(result.get("accepted", 0) or 0)
+                created = int(result.get("created", result.get("saved", 0)) or 0)
+                updated = int(result.get("updated", 0) or 0)
+                unchanged = int(result.get("unchanged", 0) or 0)
+                deduped_by_name_key = int(result.get("deduped_by_name_key", 0) or 0)
+                totals["accepted"] += accepted
+                totals["created"] += created
+                totals["updated"] += updated
+                totals["unchanged"] += unchanged
+                totals["deduped_by_name_key"] += deduped_by_name_key
+                self.saved_professors += created
+        self._pipeline_stats["records_accepted"] = int(self._pipeline_stats.get("records_accepted", 0)) + totals["accepted"]
+        self._pipeline_stats["records_created"] = int(self._pipeline_stats.get("records_created", 0)) + totals["created"]
+        self._pipeline_stats["records_updated"] = int(self._pipeline_stats.get("records_updated", 0)) + totals["updated"]
+        self._pipeline_stats["records_unchanged"] = int(self._pipeline_stats.get("records_unchanged", 0)) + totals["unchanged"]
+        self._pipeline_stats["deduped_by_name_key"] = int(self._pipeline_stats.get("deduped_by_name_key", 0)) + totals["deduped_by_name_key"]
+        if task is not None:
+            self._record_roster_overlap_observation(task, totals)
+        return totals
+
+    def _record_roster_overlap_observation(self, task: _ExtractionTaskItem, summary: dict[str, int]) -> None:
+        if self._task_kind_prefix(task) != "list":
+            return
+        accepted = int(summary.get("accepted", 0) or 0)
+        if accepted < 10:
+            return
+        created = int(summary.get("created", 0) or 0)
+        non_new = max(0, accepted - created)
+        ratio = non_new / float(accepted)
+        if ratio < 0.8:
+            return
+        self._pipeline_stats["list_roster_overlap_high"] = int(
+            self._pipeline_stats.get("list_roster_overlap_high", 0)
+        ) + 1
+        self.logger.info(
+            "High roster overlap observed task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s overlap_ratio=%.2f",
+            task.task_id,
+            task.org_unit_name,
+            accepted,
+            created,
+            summary.get("updated", 0),
+            summary.get("unchanged", 0),
+            ratio,
+        )
 
     def _build_professor_instruction(self, org_unit_name: str, *, detail_mode: bool, strict_retry: bool) -> str:
         return self.prompt_builder.build_professor_instruction(
@@ -2189,7 +2256,7 @@ class CrawlerAgent:
             return self.saved_professors - saved_before
 
         if outcome.payloads:
-            await self._save_payloads_to_db(outcome.payloads)
+            await self._save_payloads_to_db(outcome.payloads, task=task)
         else:
             async with self.db.session() as session:
                 await crawler_db.log_extraction_failure(

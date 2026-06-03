@@ -37,6 +37,11 @@ class CrawlSessionState:
                 "no_structured_data_failures": 0,
                 "save_errors": 0,
                 "processed_tasks": 0,
+                "records_accepted": 0,
+                "records_created": 0,
+                "records_updated": 0,
+                "records_unchanged": 0,
+                "deduped_by_name_key": 0,
                 "timed_tasks": 0,
                 "average_task_ms": 0.0,
                 "queue_depth": 0,
@@ -61,6 +66,8 @@ class CrawlSessionState:
                 "detail_links_dropped_directory": 0,
                 "detail_links_dropped_already_enriched": 0,
                 "detail_pending_empty_with_candidates": 0,
+                "list_roster_overlap_high": 0,
+                "stale_in_progress_recovered": 0,
             }
         )
         return state

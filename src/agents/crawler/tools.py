@@ -128,8 +128,14 @@ def get_crawler_tools(
         org_unit_url: str | None = None,
         source_url: str | None = None,
     ) -> dict[str, Any]:
-        saved = 0
+        accepted = 0
+        created = 0
+        updated = 0
+        unchanged = 0
+        deduped_by_name_key = 0
         academicians_saved = 0
+        academicians_updated = 0
+        academicians_unchanged = 0
         deduped_by_academician = 0
         academicians_enriched = 0
         professors_deleted_as_academician_duplicates = 0
@@ -149,6 +155,7 @@ def get_crawler_tools(
                     professor,
                     org_unit_name=org_unit_name,
                 )
+                accepted += 1
                 async with db.session() as session:
                     data = {
                         **cleaned,
@@ -156,13 +163,21 @@ def get_crawler_tools(
                         "source_url": source_url,
                     }
                     if is_academician:
-                        academician = await crawler_db.upsert_academician(session, data)
+                        upsert_result = await crawler_db.upsert_academician_with_status(session, data)
+                        academician = upsert_result.entity
+                        if upsert_result.status == "created":
+                            academicians_saved += 1
+                        elif upsert_result.status == "updated":
+                            academicians_updated += 1
+                        else:
+                            academicians_unchanged += 1
+                        if upsert_result.deduped_by_name_key:
+                            deduped_by_name_key += 1
                         removed = await crawler_db.delete_professor_duplicates_for_academician(
                             session,
                             academician,
                         )
                         professors_deleted_as_academician_duplicates += int(removed or 0)
-                        academicians_saved += 1
                     else:
                         matched_academician, _reason = await crawler_db.match_academician_for_professor(
                             session,
@@ -195,13 +210,31 @@ def get_crawler_tools(
                             )
                             professors_deleted_as_academician_duplicates += int(removed or 0)
                             continue
-                        await crawler_db.upsert_professor(session, data)
-                        saved += 1
+                        upsert_result = await crawler_db.upsert_professor_with_status(session, data)
+                        if upsert_result.status == "created":
+                            created += 1
+                        elif upsert_result.status == "updated":
+                            updated += 1
+                        else:
+                            unchanged += 1
+                        if upsert_result.deduped_by_name_key:
+                            deduped_by_name_key += 1
             except Exception as exc:
                 errors.append(f"{professor.get('name', '?')}: {exc}")
-        result: dict[str, Any] = {"saved": saved}
+        result: dict[str, Any] = {
+            "accepted": accepted,
+            "created": created,
+            "updated": updated,
+            "unchanged": unchanged,
+            "deduped_by_name_key": deduped_by_name_key,
+            "saved": created,
+        }
         if academicians_saved:
             result["academicians_saved"] = academicians_saved
+        if academicians_updated:
+            result["academicians_updated"] = academicians_updated
+        if academicians_unchanged:
+            result["academicians_unchanged"] = academicians_unchanged
         if deduped_by_academician:
             result["deduped_by_academician"] = deduped_by_academician
         if academicians_enriched:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import CrawlExtractionFailure, CrawlTask, CrawlTaskKind, CrawlTaskStatus
@@ -149,6 +149,20 @@ async def list_recoverable_crawl_tasks(session: AsyncSession, *, limit: int = 10
     return list(rows)
 
 
+async def recover_stale_in_progress_crawl_tasks(session: AsyncSession) -> int:
+    result = await session.execute(
+        update(CrawlTask)
+        .where(CrawlTask.status == CrawlTaskStatus.IN_PROGRESS.value)
+        .values(
+            status=CrawlTaskStatus.RETRY.value,
+            last_error="recovered_stale_in_progress",
+            updated_at=_now_utc(),
+        )
+    )
+    await session.flush()
+    return int(result.rowcount or 0)
+
+
 async def log_extraction_failure(
     session: AsyncSession,
     *,
@@ -202,6 +216,7 @@ async def summarize_crawl_task_status(session: AsyncSession) -> dict[str, int]:
 __all__ = [
     "list_recoverable_crawl_tasks",
     "log_extraction_failure",
+    "recover_stale_in_progress_crawl_tasks",
     "set_crawl_task_status",
     "summarize_crawl_task_status",
     "upsert_crawl_task",
