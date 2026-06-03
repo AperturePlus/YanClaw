@@ -21,6 +21,31 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
     if session.bind is None or session.bind.dialect.name != "sqlite":
         return
 
+    await session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_page_cache (
+                id INTEGER PRIMARY KEY,
+                url TEXT NOT NULL,
+                final_url TEXT NOT NULL DEFAULT '',
+                status_code INTEGER NOT NULL DEFAULT 0,
+                text_snapshot TEXT NOT NULL DEFAULT '',
+                links_json TEXT NOT NULL DEFAULT '[]',
+                link_signals_json TEXT NOT NULL DEFAULT '[]',
+                block_reason TEXT,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+    )
+    await session.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_crawl_page_cache_url ON crawl_page_cache(url)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_page_cache_final_url ON crawl_page_cache(final_url)")
+    )
+
     if not await _sqlite_has_column(session, "professors", "org_unit_name"):
         await session.execute(
             text("ALTER TABLE professors ADD COLUMN org_unit_name VARCHAR(255) DEFAULT 'Unknown'")

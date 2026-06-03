@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
+from agents.crawler.fetchers import FetchResult
+from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
     Academician,
     CrawlExtractionFailure,
@@ -122,6 +124,53 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
         assert professors[0].title == "教授"
         assert "Computer Science" in professors[0].org_unit_name
         assert "Software" in professors[0].org_unit_name
+
+    await db.close()
+
+
+async def test_crawl_page_cache_roundtrips_fetch_result_by_requested_and_final_url(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "page_cache.db"))
+    await db.init_db()
+    fetched = FetchResult(
+        "https://www.example.edu.cn/final",
+        "faculty text",
+        ["https://www.example.edu.cn/final/detail"],
+        200,
+        link_signals=(
+            LinkSignal(
+                url="https://www.example.edu.cn/final/detail",
+                anchor_text="Ada",
+                heading_text="Teachers",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=3,
+            ),
+        ),
+    )
+
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/original",
+            fetched=fetched,
+        )
+
+    async with db.session() as session:
+        by_original = await crawler_db.get_cached_fetch_result(
+            session,
+            "https://www.example.edu.cn/original",
+        )
+        by_final = await crawler_db.get_cached_fetch_result(
+            session,
+            "https://www.example.edu.cn/final",
+        )
+
+    assert by_original is not None
+    assert by_final is not None
+    assert by_original.url == "https://www.example.edu.cn/final"
+    assert by_final.text == "faculty text"
+    assert by_final.links == ["https://www.example.edu.cn/final/detail"]
+    assert by_final.link_signals[0].anchor_text == "Ada"
+    assert by_final.link_signals[0].parent_tags_or_classes == ("nav.menu",)
 
     await db.close()
 

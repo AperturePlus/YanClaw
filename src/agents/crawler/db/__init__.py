@@ -12,6 +12,10 @@ from agents.crawler.db.professors import (
     upsert_professor,
     upsert_professor_with_status,
 )
+from agents.crawler.db.page_cache import (
+    get_cached_fetch_result,
+    upsert_page_cache,
+)
 from agents.crawler.db.schema import ensure_runtime_schema
 from agents.crawler.db.steward import (
     add_data_quality_audit,
@@ -56,6 +60,7 @@ __all__ = [
     "ensure_runtime_schema",
     "ensure_university_meta",
     "get_or_create_org_unit",
+    "get_cached_fetch_result",
     "get_university_status",
     "is_url_crawled",
     "list_org_units",
@@ -76,6 +81,7 @@ __all__ = [
     "upsert_academician",
     "upsert_academician_with_status",
     "upsert_crawl_task",
+    "upsert_page_cache",
     "upsert_professor",
     "upsert_professor_with_status",
 ]

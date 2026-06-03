@@ -163,6 +163,22 @@ class CrawlLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class CrawlPageCache(Base):
+    __tablename__ = "crawl_page_cache"
+    __table_args__ = (UniqueConstraint("url", name="uq_crawl_page_cache_url"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    url: Mapped[str] = mapped_column(Text, index=True)
+    final_url: Mapped[str] = mapped_column(Text, index=True)
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    text_snapshot: Mapped[str] = mapped_column(Text, default="")
+    links_json: Mapped[str] = mapped_column(Text, default="[]")
+    link_signals_json: Mapped[str] = mapped_column(Text, default="[]")
+    block_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class CrawlTask(Base):
     __tablename__ = "crawl_tasks"
     __table_args__ = (
