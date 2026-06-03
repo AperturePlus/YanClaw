@@ -13,15 +13,21 @@ from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
 from agents.crawler import agent_detail, agent_parsing
+from agents.crawler.extraction_pipeline import ExtractionPipeline
+from agents.crawler.faculty_discovery import FacultyDiscoveryService
 from agents.crawler.fetchers import FetchResult, Fetcher
+from agents.crawler.fetch_scheduler import FetchScheduler
 from agents.crawler.models import (
     CrawlLogStatus,
     CrawlStatus,
+    CrawlTaskKind,
     CrawlTaskStatus,
     OrgUnit,
     OrgUnitStatus,
     UniversityMeta,
 )
+from agents.crawler.prompt_builder import CrawlerPromptBuilder
+from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_NOISE,
@@ -55,7 +61,6 @@ from agents.crawler.url_heuristics import (
     _same_site,
     _sanitize_url,
     _select_balanced_faculty_candidates,
-    _truncate_middle,
     _url_found_on_page,
 )
 from runtime.context import ContextManager
@@ -71,6 +76,9 @@ class CrawlerState(str, Enum):
     FIND_FACULTY_PAGES = "FIND_FACULTY_PAGES"
     EXTRACT_PROFESSORS = "EXTRACT_PROFESSORS"
     DONE = "DONE"
+
+
+_FOLLOWUP_PAGE_LIMIT = 36
 
 
 @dataclass(frozen=True)
@@ -105,6 +113,7 @@ class _ExtractionTaskItem:
     priority: int = 0
     strict_retry: bool = False
     detail_mode: bool = False
+    task_kind: str = CrawlTaskKind.LIST_PAGE.value
 
 
 @dataclass
@@ -141,11 +150,8 @@ class CrawlerAgent:
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
         detail_enrich_enabled: bool = True,
-        detail_fetch_backend: str = "human",
         detail_profile_hard_cap_per_org_unit: int = 200,
-        detail_failure_threshold: int = 10,
         pipeline_enabled: bool = True,
-        pipeline_fetch_workers: int = 1,
         pipeline_llm_workers: int = 1,
         pipeline_db_workers: int = 1,
         pipeline_queue_cap: int = 64,
@@ -169,11 +175,8 @@ class CrawlerAgent:
         self.min_org_units = min_org_units
         self.model_max_tokens = model_max_tokens
         self.detail_enrich_enabled = detail_enrich_enabled
-        self.detail_fetch_backend = detail_fetch_backend
         self.detail_profile_hard_cap_per_org_unit = max(1, int(detail_profile_hard_cap_per_org_unit))
-        self.detail_failure_threshold = max(1, int(detail_failure_threshold))
         self.pipeline_enabled = bool(pipeline_enabled)
-        self.pipeline_fetch_workers = max(1, int(pipeline_fetch_workers))
         self.pipeline_llm_workers = max(1, int(pipeline_llm_workers))
         self.pipeline_db_workers = max(1, int(pipeline_db_workers))
         self.pipeline_queue_cap = max(1, int(pipeline_queue_cap))
@@ -181,49 +184,35 @@ class CrawlerAgent:
         self.task_recovery_enabled = bool(task_recovery_enabled)
         self.target_org_units = [str(item).strip() for item in (target_org_units or []) if str(item).strip()]
         self.org_unit_match_threshold = min(1.0, max(0.0, float(org_unit_match_threshold)))
-        self.visited_urls: set[str] = set()
-        self._fetch_cache: dict[str, FetchResult] = {}
+        self.session_state = CrawlSessionState.create(pipeline_enabled=self.pipeline_enabled)
+        self.visited_urls = self.session_state.visited_urls
+        self._fetch_cache = self.session_state.fetch_cache
         self.backtrack_count = 0
         self.execution_log: list[str] = []
         self.saved_professors = 0
         self._current_state: str = ""
         self._university_cache: UniversityMeta | None = None
         self._skip_cross_run_dedup = False
-        self._blocked_hosts: set[str] = set()
-        self._detail_visited_urls: set[str] = set()
-        self._detail_processed_by_org_unit: dict[str, int] = {}
-        self._enriched_names_by_org_unit: dict[str, set[str]] = {}
-        self._target_org_unit_ids: set[int] = set()
-        self._org_units_marked_no_faculty: set[int] = set()
-        self._pipeline_stats: dict[str, Any] = {
-            "enabled": self.pipeline_enabled,
-            "pending": 0,
-            "in_progress": 0,
-            "retry": 0,
-            "done": 0,
-            "failed": 0,
-            "retries": 0,
-            "invalid_json_failures": 0,
-            "no_structured_data_failures": 0,
-            "save_errors": 0,
-            "processed_tasks": 0,
-            "timed_tasks": 0,
-            "average_task_ms": 0.0,
-            "queue_depth": 0,
-            "llm_calls_total": 0,
-            "llm_calls_skipped_by_gate": 0,
-            "llm_payload_bytes_total": 0,
-            "avg_payload_bytes": 0.0,
-            "followup_dropped_noise": 0,
-            "followups_scheduled": 0,
-            "pagination_scheduled": 0,
-            "duplicate_tasks_skipped": 0,
-            "duplicate_followups_skipped": 0,
-            "detail_links_dropped_noise": 0,
-            "detail_links_dropped_directory": 0,
-            "detail_links_dropped_already_enriched": 0,
-            "detail_pending_empty_with_candidates": 0,
-        }
+        self._blocked_hosts = self.session_state.blocked_hosts
+        self._detail_visited_urls = self.session_state.detail_visited_urls
+        self._detail_processed_by_org_unit = self.session_state.detail_processed_by_org_unit
+        self._enriched_names_by_org_unit = self.session_state.enriched_names_by_org_unit
+        self._active_detail_llm_queue: asyncio.Queue[_ExtractionTaskItem | None] | None = None
+        self._target_org_unit_ids = self.session_state.target_org_unit_ids
+        self._org_units_marked_no_faculty = self.session_state.org_units_marked_no_faculty
+        self._pipeline_stats = self.session_state.pipeline_stats
+        self.extraction_pipeline = ExtractionPipeline(self._pipeline_stats)
+        self.fetch_scheduler = FetchScheduler(self)
+        self.faculty_discovery = FacultyDiscoveryService(self)
+        self.detail_enricher = agent_detail.DetailEnricher(self)
+        self.prompt_builder = CrawlerPromptBuilder(
+            context_manager=self.context_manager,
+            fetcher=self.fetcher,
+            start_url=self.start_url,
+            university_name=self.university_name,
+            location=self.location,
+            visited_urls=self.visited_urls,
+        )
 
     @property
     def _is_interactive(self) -> bool:
@@ -702,6 +691,9 @@ class CrawlerAgent:
         await self._set_org_unit_status(org_unit_id, OrgUnitStatus.IN_PROGRESS)
 
     async def _find_and_extract_streaming(self, org_units: list[OrgUnit]) -> None:
+        await self.faculty_discovery.find_and_extract_streaming(org_units)
+
+    async def _find_and_extract_streaming_impl(self, org_units: list[OrgUnit]) -> None:
         """Interactive mode: for each org unit, find faculty pages then immediately extract professors."""
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
         max_links_per_org_unit = 4
@@ -818,6 +810,9 @@ class CrawlerAgent:
 
 
     async def _find_faculty_pages(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
+        return await self.faculty_discovery.find_faculty_pages(org_units)
+
+    async def _find_faculty_pages_impl(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.FIND_FACULTY_PAGES)
         faculty_links: list[_QueuedUrl] = []
         max_links_per_org_unit = 4
@@ -1068,9 +1063,8 @@ class CrawlerAgent:
         skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
         max_pages = min(max(40, len(faculty_links)), 120)
         self.logger.info(
-            "Extraction pipeline enabled=%s fetch_workers=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s",
+            "Extraction pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s",
             self.pipeline_enabled,
-            self.pipeline_fetch_workers,
             self.pipeline_llm_workers,
             self.pipeline_db_workers,
             self.pipeline_queue_cap,
@@ -1107,11 +1101,15 @@ class CrawlerAgent:
             processed_urls.add(key)
             return True
 
-        def _schedule_related_pages(current: _QueuedUrl, fetched: FetchResult, pages_to_process: list[_QueuedUrl]) -> None:
+        def _schedule_related_pages(
+            current: _QueuedUrl,
+            fetched: FetchResult,
+            pages_to_process: list[_QueuedUrl],
+        ) -> set[str]:
             added_followups: list[str] = []
             skipped_duplicates = 0
             followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-            for link in followups[:10]:
+            for link in followups[:_FOLLOWUP_PAGE_LIMIT]:
                 next_depth = current.depth + 1
                 if not self._within_depth(next_depth):
                     continue
@@ -1168,6 +1166,7 @@ class CrawlerAgent:
                     skipped_duplicates,
                     sample,
                 )
+            return {_queue_key(url) for url in added_followups + added_pagination if _queue_key(url)}
 
         if not self.pipeline_enabled:
             for item in faculty_links[:max_pages]:
@@ -1207,8 +1206,13 @@ class CrawlerAgent:
                             skills,
                             detail_mode=False,
                         )
-                    _schedule_related_pages(current, fetched, pages_to_process)
-                    await self._enrich_profiles_with_detail_backend(current, fetched, skills)
+                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
+                    await self._enrich_profiles_with_detail_backend(
+                        current,
+                        fetched,
+                        skills,
+                        reserved_urls=reserved_urls,
+                    )
             return
 
         llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
@@ -1269,8 +1273,18 @@ class CrawlerAgent:
                             detail_mode=False,
                             priority=0,
                         )
-                    _schedule_related_pages(current, fetched, pages_to_process)
-                    await self._enrich_profiles_with_detail_backend(current, fetched, skills)
+                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
+                    previous_detail_queue = self._active_detail_llm_queue
+                    self._active_detail_llm_queue = llm_queue
+                    try:
+                        await self._enrich_profiles_with_detail_backend(
+                            current,
+                            fetched,
+                            skills,
+                            reserved_urls=reserved_urls,
+                        )
+                    finally:
+                        self._active_detail_llm_queue = previous_detail_queue
         finally:
             await llm_queue.join()
             for _ in llm_workers:
@@ -1283,11 +1297,17 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s avg_payload_bytes=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
                 self._pipeline_stats.get("failed", 0),
+                self._pipeline_stats.get("list_processed", 0),
+                self._pipeline_stats.get("list_failed", 0),
+                self._pipeline_stats.get("detail_enqueued", 0),
+                self._pipeline_stats.get("detail_processed", 0),
+                self._pipeline_stats.get("detail_failed", 0),
+                self._pipeline_stats.get("detail_skipped", 0),
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
                 self._pipeline_stats.get("llm_calls_total", 0),
                 self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
@@ -1295,6 +1315,8 @@ class CrawlerAgent:
                 self._pipeline_stats.get("pagination_scheduled", 0),
                 self._pipeline_stats.get("duplicate_tasks_skipped", 0),
                 self._pipeline_stats.get("detail_links_dropped_directory", 0),
+                self._pipeline_stats.get("detail_links_reserved_for_list", 0),
+                self._pipeline_stats.get("detail_directory_skipped", 0),
                 float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
             )
 
@@ -1314,6 +1336,7 @@ class CrawlerAgent:
         snapshot = self._compact_page_text(fetched.text or "", text_limit)
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
         allowed_tools = ["save_professors"]
+        task_kind = CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value
         async with self.db.session() as session:
             row = await crawler_db.upsert_crawl_task(
                 session,
@@ -1323,6 +1346,7 @@ class CrawlerAgent:
                 source_url=source_url,
                 page_url=source_url,
                 page_hash=page_hash,
+                task_kind=task_kind,
                 page_text_snapshot=snapshot,
                 allowed_tools=json.dumps(sorted(allowed_tools), ensure_ascii=False, separators=(",", ":")),
                 attempt=0,
@@ -1333,6 +1357,10 @@ class CrawlerAgent:
                 self._pipeline_stats["duplicate_tasks_skipped"] = int(
                     self._pipeline_stats.get("duplicate_tasks_skipped", 0)
                 ) + 1
+                if detail_mode:
+                    self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
+                else:
+                    self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
                 self.logger.debug(
                     "Skip existing extraction task source=%s status=%s task_id=%s",
                     source_url,
@@ -1354,9 +1382,14 @@ class CrawlerAgent:
                 priority=int(row.priority or 0),
                 strict_retry=False,
                 detail_mode=detail_mode,
+                task_kind=str(getattr(row, "task_kind", None) or task_kind),
             )
         await llm_queue.put(task)
         self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
+        if detail_mode:
+            self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
+        else:
+            self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
         self._pipeline_stats["queue_depth"] = llm_queue.qsize()
 
     async def _recover_pipeline_tasks(self, *, limit: int) -> list[_ExtractionTaskItem]:
@@ -1365,6 +1398,8 @@ class CrawlerAgent:
         recovered: list[_ExtractionTaskItem] = []
         for row in rows:
             allowed_tools = ["save_professors"]
+            task_kind = str(getattr(row, "task_kind", None) or CrawlTaskKind.LIST_PAGE.value)
+            detail_mode = task_kind == CrawlTaskKind.DETAIL_PAGE.value
             if row.allowed_tools:
                 try:
                     parsed = json.loads(row.allowed_tools)
@@ -1386,13 +1421,18 @@ class CrawlerAgent:
                     attempt=int(row.attempt or 0),
                     priority=int(row.priority or 0),
                     strict_retry=(int(row.attempt or 0) > 0),
-                    detail_mode=False,
+                    detail_mode=detail_mode,
+                    task_kind=task_kind,
                 )
             )
             if row.status == CrawlTaskStatus.RETRY.value:
                 self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
             else:
                 self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
+            if detail_mode:
+                self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
+            else:
+                self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
         return recovered
 
     async def _pipeline_llm_worker(
@@ -1447,6 +1487,7 @@ class CrawlerAgent:
                         resolver="dropped",
                     )
                 self._pipeline_stats["failed"] += 1
+                self._increment_task_kind_stat(task, "failed")
                 self._pipeline_stats["no_structured_data_failures"] += 1
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 self._update_pipeline_timing(elapsed_ms)
@@ -1490,6 +1531,7 @@ class CrawlerAgent:
                         resolver="dropped",
                     )
                 self._pipeline_stats["failed"] += 1
+                self._increment_task_kind_stat(task, "failed")
                 self._pipeline_stats["save_errors"] += 1
                 db_queue.task_done()
                 continue
@@ -1503,6 +1545,7 @@ class CrawlerAgent:
                 )
             self._pipeline_stats["done"] += 1
             self._pipeline_stats["processed_tasks"] += 1
+            self._increment_task_kind_stat(task, "processed")
             if saved > 0:
                 self.logger.debug(
                     "Extraction task done task_id=%s org_unit=%s saved=%s",
@@ -1535,6 +1578,7 @@ class CrawlerAgent:
                 priority=task.priority,
                 strict_retry=True,
                 detail_mode=task.detail_mode,
+                task_kind=task.task_kind,
             )
             async with self.db.session() as session:
                 await crawler_db.set_crawl_task_status(
@@ -1579,6 +1623,7 @@ class CrawlerAgent:
                 resolver="dropped",
             )
         self._pipeline_stats["failed"] += 1
+        self._increment_task_kind_stat(task, "failed")
         self._pipeline_stats["invalid_json_failures"] += 1
         self._pipeline_stats["retry"] = max(0, int(self._pipeline_stats.get("retry", 0)) - 1)
 
@@ -1698,92 +1743,43 @@ class CrawlerAgent:
         return total_saved
 
     def _build_professor_instruction(self, org_unit_name: str, *, detail_mode: bool, strict_retry: bool) -> str:
-        if detail_mode:
-            base = (
-                "Extract professor records from this detail page and call save_professors when records are found. "
-                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                + "Prioritize fields: email, phone, research_areas. "
-                + "Only save records that include at least one of email/phone/research_areas. "
-                + "If this page only contains category/list names without these fields, do not save placeholders. "
-                + "Do not include retired/emeritus records. "
-                + "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
-            )
-        else:
-            base = (
-                "Extract public professor records and call save_professors when records are found. "
-                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                + "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
-                + "Do not include retired/emeritus records. "
-                + "Skip noise pages dominated by notices/news/policies/recruitment/personnel content."
-            )
-        if not strict_retry:
-            return base
-        return (
-            base
-            + " Retry mode: output only key fields {name,title,email,phone,research_areas}; "
-            + "keep response concise, max 25 records, avoid extra keys."
+        return self.prompt_builder.build_professor_instruction(
+            org_unit_name,
+            detail_mode=detail_mode,
+            strict_retry=strict_retry,
         )
 
     def _update_pipeline_timing(self, elapsed_ms: float) -> None:
-        total = float(self._pipeline_stats.get("average_task_ms", 0.0))
-        timed = int(self._pipeline_stats.get("timed_tasks", 0))
-        current = timed + 1
-        self._pipeline_stats["average_task_ms"] = ((total * timed) + elapsed_ms) / current
-        self._pipeline_stats["timed_tasks"] = current
+        self.extraction_pipeline.update_timing(elapsed_ms)
+
+    @staticmethod
+    def _task_kind_prefix(task: _ExtractionTaskItem) -> str:
+        return ExtractionPipeline.task_kind_prefix(task)
+
+    def _increment_task_kind_stat(self, task: _ExtractionTaskItem, suffix: str, amount: int = 1) -> None:
+        self.extraction_pipeline.increment_task_kind_stat(task, suffix, amount)
 
     @staticmethod
     def _state_link_limit(state: CrawlerState) -> int:
-        limits = {
-            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 40,
-            CrawlerState.EXTRACT_ORG_UNITS: 40,
-            CrawlerState.FIND_FACULTY_PAGES: 30,
-            CrawlerState.EXTRACT_PROFESSORS: 0,
-        }
-        return limits.get(state, 30)
+        return CrawlerPromptBuilder.state_link_limit(state)
 
     @staticmethod
     def _state_text_limit(state: CrawlerState, *, detail_mode: bool = False) -> int:
-        if detail_mode:
-            return 8000
-        limits = {
-            CrawlerState.DISCOVER_ORG_UNIT_PAGES: 3000,
-            CrawlerState.EXTRACT_ORG_UNITS: 8000,
-            CrawlerState.FIND_FACULTY_PAGES: 6000,
-            CrawlerState.EXTRACT_PROFESSORS: 6000,
-        }
-        return limits.get(state, 6000)
+        return CrawlerPromptBuilder.state_text_limit(state, detail_mode=detail_mode)
 
     def _compact_page_text(self, text: str, max_chars: int, *, min_chars: int = 300) -> str:
-        if max_chars <= 0 or not text:
-            return ""
-        compacted = self.context_manager.compact_text(text)
-        if compacted and len(compacted) > max_chars:
-            compacted = _truncate_middle(compacted, max_chars)
-
-        # Avoid over-filtering: fallback to middle truncation when compacted text is too short.
-        if not compacted or (len(compacted) < min(min_chars, max_chars // 2) and len(text) > len(compacted) * 2):
-            return _truncate_middle(text, max_chars)
-        return compacted
+        return self.prompt_builder.compact_page_text(text, max_chars, min_chars=min_chars)
 
     @staticmethod
     def _serialize_payload(payload: dict[str, Any]) -> str:
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return CrawlerPromptBuilder.serialize_payload(payload)
 
     @staticmethod
     def _build_tool_call_policy(allowed_tools: set[str]) -> str:
-        if not allowed_tools:
-            return "Do not call any tools."
-        names = sorted(allowed_tools)
-        if len(names) == 1:
-            return f"Only call {names[0]}. Do not invent tool names."
-        return f"Only call tools listed in allowed_tools ({', '.join(names)}). Do not invent tool names."
+        return CrawlerPromptBuilder.build_tool_call_policy(allowed_tools)
 
     def _record_llm_payload(self, payload_bytes: int) -> None:
-        calls = int(self._pipeline_stats.get("llm_calls_total", 0)) + 1
-        total = int(self._pipeline_stats.get("llm_payload_bytes_total", 0)) + max(0, int(payload_bytes))
-        self._pipeline_stats["llm_calls_total"] = calls
-        self._pipeline_stats["llm_payload_bytes_total"] = total
-        self._pipeline_stats["avg_payload_bytes"] = float(total) / float(calls)
+        self.extraction_pipeline.record_llm_payload(payload_bytes)
 
     def _build_llm_payload(
         self,
@@ -1796,44 +1792,22 @@ class CrawlerAgent:
         allowed_tools: set[str],
         detail_mode: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        raw_links = list(links or [])
-        same_domain_links = self.fetcher.filter_same_domain(raw_links, self.start_url) if raw_links else []
-        if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.EXTRACT_ORG_UNITS}:
-            candidate_links = _keyword_filter(same_domain_links, ORG_UNIT_PAGE_KEYWORDS) or same_domain_links
-        elif state in {CrawlerState.FIND_FACULTY_PAGES, CrawlerState.EXTRACT_PROFESSORS}:
-            candidate_links = _keyword_filter(same_domain_links, FACULTY_KEYWORDS) or same_domain_links
-        else:
-            candidate_links = same_domain_links
-        link_limit = self._state_link_limit(state)
-        kept_links = candidate_links[:link_limit] if link_limit > 0 else []
-
-        text_limit = self._state_text_limit(state, detail_mode=detail_mode)
-        compacted_text = self._compact_page_text(page_text or "", text_limit)
-
-        payload: dict[str, Any] = {
-            "allowed_tools": sorted(allowed_tools),
-            "instruction": instruction,
-            "links": kept_links,
-            "location": self.location,
-            "page_text": compacted_text,
-            "state": state.value,
-            "university": self.university_name,
-            "url": url,
-            "visited_count": len(self.visited_urls),
-        }
-        if state is CrawlerState.DISCOVER_ORG_UNIT_PAGES:
-            payload["visited_urls"] = sorted(self.visited_urls)[-15:]
-
-        user_content = self._serialize_payload(payload)
-        payload_bytes = len(user_content.encode("utf-8", errors="ignore"))
-        metadata = {
-            "raw_chars": len(page_text or ""),
-            "compacted_chars": len(compacted_text),
-            "links_raw": len(raw_links),
-            "links_kept": len(kept_links),
-            "payload_bytes": payload_bytes,
-        }
-        return user_content, metadata
+        self.prompt_builder.fetcher = self.fetcher
+        self.prompt_builder.visited_urls = self.visited_urls
+        self.prompt_builder.update_context(
+            start_url=self.start_url,
+            university_name=self.university_name,
+            location=self.location,
+        )
+        return self.prompt_builder.build_llm_payload(
+            state=state,
+            instruction=instruction,
+            url=url,
+            page_text=page_text,
+            links=links,
+            allowed_tools=allowed_tools,
+            detail_mode=detail_mode,
+        )
 
     def _host_gate_allows_faculty_candidate(
         self,
@@ -2189,6 +2163,7 @@ class CrawlerAgent:
             priority=0,
             strict_retry=False,
             detail_mode=detail_mode,
+            task_kind=CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value,
         )
         outcome = await self._run_extraction_task(task, skills)
         invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
@@ -2229,25 +2204,53 @@ class CrawlerAgent:
 
         return self.saved_professors - saved_before
     async def _enrich_profiles_with_detail_backend(
-        self, current: _QueuedUrl, fetched: FetchResult, skills: str
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        skills: str,
+        *,
+        reserved_urls: set[str] | None = None,
     ) -> None:
-        await agent_detail.enrich_profiles_with_detail_backend(self, current, fetched, skills)
+        await self.detail_enricher.enrich_profiles_with_detail_backend(
+            current,
+            fetched,
+            skills,
+            reserved_urls=reserved_urls,
+        )
 
-    async def _enrich_profiles_with_human(self, current: _QueuedUrl, fetched: FetchResult, skills: str) -> None:
-        await agent_detail.enrich_profiles_with_human(self, current, fetched, skills)
+    async def _enrich_profiles_with_human(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        skills: str,
+        *,
+        reserved_urls: set[str] | None = None,
+    ) -> None:
+        await self.detail_enricher.enrich_profiles_with_human(
+            current,
+            fetched,
+            skills,
+            reserved_urls=reserved_urls,
+        )
 
     async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
-        await agent_detail.process_detail_urls_with_human(self, urls, current, skills)
+        await self.detail_enricher.process_detail_urls_with_human(urls, current, skills)
 
-    def _extract_detail_profile_links(self, links: list[str], current_url: str) -> list[str]:
-        return agent_detail.extract_detail_profile_links(self, links, current_url)
+    def _extract_detail_profile_links(
+        self,
+        links: list[str],
+        current_url: str,
+        *,
+        link_signals: tuple[Any, ...] | list[Any] | None = None,
+    ) -> list[str]:
+        return self.detail_enricher.extract_detail_profile_links(links, current_url, link_signals=link_signals)
 
     def _detail_org_unit_key(self, current: _QueuedUrl) -> str:
-        return agent_detail.detail_org_unit_key(self, current)
+        return self.detail_enricher.detail_org_unit_key(current)
 
     @staticmethod
     def _derive_section_prefix(path: str) -> str:
-        return agent_detail.derive_section_prefix(path)
+        return agent_detail.DetailEnricher.derive_section_prefix(path)
 
     def _log_org_unit_queue_preview(self, candidates: list[OrgUnit], start_host: str, *, stage: str) -> None:
         if not candidates:
@@ -2264,10 +2267,13 @@ class CrawlerAgent:
         )
 
     def _is_failed_detail_fetch(self, fetched: FetchResult) -> bool:
-        return agent_detail.is_failed_detail_fetch(self, fetched)
+        return self.detail_enricher.is_failed_detail_fetch(fetched)
 
     def _is_retired_page(self, fetched: FetchResult) -> bool:
-        return agent_detail.is_retired_page(self, fetched)
+        return self.detail_enricher.is_retired_page(fetched)
+
+    def _looks_like_detail_directory_page(self, fetched: FetchResult) -> bool:
+        return self.detail_enricher.looks_like_detail_directory_page(fetched)
 
     async def _ask_llm(
         self,
@@ -2338,114 +2344,15 @@ class CrawlerAgent:
         return final_result
 
     async def _select_skills(self, state: CrawlerState) -> str:
-        metas = self.skill_manager.list_skills()
-        if not metas:
-            return ""
-
-        available = {meta.name for meta in metas}
         if state in {CrawlerState.DISCOVER_ORG_UNIT_PAGES, CrawlerState.FIND_FACULTY_PAGES}:
-            desired = ["extract-links", "crawler-loop-detection"]
+            allowed_tools = {"extract_links"}
         elif state is CrawlerState.EXTRACT_PROFESSORS:
-            desired = ["save-professors", "crawler-loop-detection"]
+            allowed_tools = {"save_professors"}
         else:
-            desired = ["crawler-loop-detection"]
-
-        names = [name for name in desired if name in available]
-        if not names:
-            names = [meta.name for meta in metas]
-        return "\n\n".join(self.skill_manager.load_skills(names).values())
+            allowed_tools = set()
+        return self.skill_manager.select_for_state(state.value, allowed_tools).rendered_text
     async def _fetch_url(self, url: str, depth: int) -> FetchResult | None:
-        url = _sanitize_url(url)
-        if not url:
-            return None
-        if not self._within_depth(depth):
-            self.execution_log.append(f"skip depth url={url} depth={depth}")
-            self.logger.info("Skipping %s: depth %s exceeds max_depth=%s", url, depth, self.max_depth)
-            return None
-        if not _same_site(url, self.start_url):
-            self.execution_log.append(f"skip external url={url}")
-            self.logger.info("Skipping external URL: %s", url)
-            return None
-
-        if url in self.visited_urls and not self._skip_cross_run_dedup:
-            cached = self._fetch_cache.get(url)
-            if cached is not None and url == _sanitize_url(self.start_url):
-                self.execution_log.append(f"fetch cache url={url} depth={depth}")
-                self.logger.debug("Using cached start URL: %s", url)
-                return cached
-            self.execution_log.append(f"skip visited url={url}")
-            self.logger.info("Skipping already visited URL: %s", url)
-            return None
-
-        cached = self._fetch_cache.get(url)
-        if cached is not None:
-            self.execution_log.append(f"fetch cache url={url} depth={depth}")
-            self.logger.debug("Using cached URL: %s", url)
-            return cached
-
-        if url != self.start_url and not self._skip_cross_run_dedup:
-            async with self.db.session() as session:
-                if await crawler_db.is_url_crawled(session, url):
-                    self.visited_urls.add(url)
-                    self.execution_log.append(f"skip already_crawled url={url}")
-                    self.logger.info("Skipping previously crawled URL: %s", url)
-                    return None
-
-        self.visited_urls.add(url)
-        try:
-            fetched = await self.fetcher.fetch(url)
-        except Exception as error:
-            async with self.db.session() as session:
-                await crawler_db.log_crawl(
-                    session,
-                    url,
-                    CrawlLogStatus.FAILED,
-                    str(error),
-                )
-            self.execution_log.append(f"fetch failed url={url} error={error}")
-            self.logger.warning("Fetch failed for %s: %s", url, error)
-            return None
-
-        canonical = _sanitize_url(fetched.url)
-        if canonical:
-            self.visited_urls.add(canonical)
-            self._fetch_cache.setdefault(canonical, fetched)
-        self._fetch_cache.setdefault(url, fetched)
-
-        async with self.db.session() as session:
-            crawl_status = CrawlLogStatus.SUCCESS
-            crawl_message = f"depth={depth} status_code={fetched.status_code}"
-            if fetched.block_reason:
-                crawl_status = CrawlLogStatus.FAILED
-                crawl_message = (
-                    f"{crawl_message} blocked={fetched.block_reason} links={len(fetched.links)}"
-                )
-            await crawler_db.log_crawl(
-                session,
-                fetched.url,
-                crawl_status,
-                crawl_message,
-            )
-
-        if fetched.block_reason:
-            blocked_host = (urlparse(fetched.url).hostname or "").lower()
-            if blocked_host:
-                self._blocked_hosts.add(blocked_host)
-            self.logger.warning(
-                "WAF/challenge page detected url=%s status=%s reason=%s links=%s",
-                fetched.url,
-                fetched.status_code,
-                fetched.block_reason,
-                len(fetched.links),
-            )
-            self.execution_log.append(
-                f"fetch blocked url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
-            )
-        else:
-            self.execution_log.append(
-                f"fetch ok url={fetched.url} depth={depth} status={fetched.status_code} links={len(fetched.links)}"
-            )
-        return fetched
+        return await self.fetch_scheduler.fetch_url(url, depth)
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
         payload = self._parse_json_from_text(content)

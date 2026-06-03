@@ -23,21 +23,36 @@ _FACULTY_CATEGORY_STEMS = frozenset(
         "bsds",
         "bssds",
         "byds",
+        "cxzx",
         "fjs",
+        "gjjcqnjjhdz",
         "ggjs",
+        "gxnjszx",
+        "jcjs",
         "js",
         "js1",
+        "jsjgcx",
+        "jsjkxx",
         "jsgg",
+        "jjzx",
         "jzg",
+        "msfc",
         "qzjs",
         "qtjs",
+        "rcyj",
+        "rgznx",
+        "rjgcx",
+        "rsgz",
         "shidao",
         "ssds",
         "sys",
         "szdw",
         "szll",
+        "txtxyrjgcs",
         "tutor",
+        "yxqnjjhdz",
         "yjry",
+        "ys",
         "yjsds",
         "zzjs",
     }
@@ -69,6 +84,109 @@ _CLEAR_PROFILE_DETAIL_HINTS = (
     "teacher_show",
     "showteacher",
 )
+
+_PROFILE_EVIDENCE_TOKENS = (
+    "@",
+    "email",
+    "e-mail",
+    "邮箱",
+    "电子邮件",
+    "电话",
+    "联系方式",
+    "办公电话",
+    "研究方向",
+    "研究领域",
+    "科研方向",
+    "个人简介",
+    "教育经历",
+    "代表论文",
+    "科研项目",
+    "homepage",
+    "个人主页",
+)
+
+_PERSON_ANCHOR_BLOCKLIST = (
+    "师资",
+    "教师",
+    "队伍",
+    "名录",
+    "列表",
+    "中心",
+    "学院",
+    "系",
+    "团队",
+    "栏目",
+    "更多",
+    "查看",
+    "详情",
+    "首页",
+    "院士",
+    "杰出",
+    "青年",
+    "基金",
+    "人才",
+    "招聘",
+    "人事",
+    "政策",
+    "通知",
+    "公告",
+    "news",
+    "notice",
+    "list",
+    "more",
+)
+
+
+class DetailEnricher:
+    """Manages detail profile candidate filtering and processing for an agent."""
+
+    def __init__(self, agent: Any) -> None:
+        self.agent = agent
+
+    async def enrich_profiles_with_detail_backend(
+        self,
+        current: Any,
+        fetched: Any,
+        skills: str,
+        reserved_urls: set[str] | None = None,
+    ) -> None:
+        await enrich_profiles_with_detail_backend(self.agent, current, fetched, skills, reserved_urls=reserved_urls)
+
+    async def enrich_profiles_with_human(
+        self,
+        current: Any,
+        fetched: Any,
+        skills: str,
+        reserved_urls: set[str] | None = None,
+    ) -> None:
+        await enrich_profiles_with_human(self.agent, current, fetched, skills, reserved_urls=reserved_urls)
+
+    async def process_detail_urls_with_human(self, urls: list[str], current: Any, skills: str) -> None:
+        await process_detail_urls_with_human(self.agent, urls, current, skills)
+
+    def extract_detail_profile_links(
+        self,
+        links: list[str],
+        current_url: str,
+        link_signals: tuple[Any, ...] | list[Any] | None = None,
+    ) -> list[str]:
+        return extract_detail_profile_links(self.agent, links, current_url, link_signals=link_signals)
+
+    def detail_org_unit_key(self, current: Any) -> str:
+        return detail_org_unit_key(self.agent, current)
+
+    @staticmethod
+    def derive_section_prefix(path: str) -> str:
+        return derive_section_prefix(path)
+
+    def is_failed_detail_fetch(self, fetched: Any) -> bool:
+        return is_failed_detail_fetch(self.agent, fetched)
+
+    def is_retired_page(self, fetched: Any) -> bool:
+        return is_retired_page(self.agent, fetched)
+
+    def looks_like_detail_directory_page(self, fetched: Any) -> bool:
+        return looks_like_detail_directory_page(self.agent, fetched)
 
 
 def _url_path_stem(url: str) -> str:
@@ -104,13 +222,27 @@ def _looks_like_profile_detail_url(url: str) -> bool:
     return bool(re.search(r"/info/\d+/\d+(\.s?html?)?$", path))
 
 
-async def enrich_profiles_with_detail_backend(self: Any, current: Any, fetched: Any, skills: str) -> None:
+async def enrich_profiles_with_detail_backend(
+    self: Any,
+    current: Any,
+    fetched: Any,
+    skills: str,
+    *,
+    reserved_urls: set[str] | None = None,
+) -> None:
     if not self._is_interactive or not self.detail_enrich_enabled:
         return
-    await self._enrich_profiles_with_human(current, fetched, skills)
+    await self._enrich_profiles_with_human(current, fetched, skills, reserved_urls=reserved_urls)
 
 
-async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skills: str) -> None:
+async def enrich_profiles_with_human(
+    self: Any,
+    current: Any,
+    fetched: Any,
+    skills: str,
+    *,
+    reserved_urls: set[str] | None = None,
+) -> None:
     org_unit_key = self._detail_org_unit_key(current)
     processed = self._detail_processed_by_org_unit.get(org_unit_key, 0)
     remaining = self.detail_profile_hard_cap_per_org_unit - processed
@@ -122,10 +254,15 @@ async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skil
         )
         return
 
-    candidates = self._extract_detail_profile_links(fetched.links, fetched.url)
+    candidates = self._extract_detail_profile_links(
+        fetched.links,
+        fetched.url,
+        link_signals=getattr(fetched, "link_signals", ()) or (),
+    )
     if not candidates:
         return
 
+    reserved = {_sanitize_url(url) for url in (reserved_urls or set()) if _sanitize_url(url)}
     enriched_names = await _load_enriched_names(self, current, org_unit_key)
     sig_by_url = {
         getattr(sig, "url", ""): sig
@@ -135,9 +272,14 @@ async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skil
 
     pending: list[str] = []
     skipped_by_name = 0
+    skipped_reserved = 0
     for link in candidates:
         if len(pending) >= remaining:
             break
+        normalized = _sanitize_url(link)
+        if normalized in reserved:
+            skipped_reserved += 1
+            continue
         if link in self._detail_visited_urls or link in self.visited_urls:
             continue
         if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(link), enriched_names):
@@ -156,9 +298,19 @@ async def enrich_profiles_with_human(self: Any, current: Any, fetched: Any, skil
             current.label or "Unknown",
             fetched.url,
         )
+    if skipped_reserved:
+        self._pipeline_stats["detail_links_reserved_for_list"] = int(
+            self._pipeline_stats.get("detail_links_reserved_for_list", 0)
+        ) + skipped_reserved
+        self.logger.debug(
+            "Detail enrichment reserved %s links for list/followup processing org_unit=%s page=%s",
+            skipped_reserved,
+            current.label or "Unknown",
+            fetched.url,
+        )
 
     if not pending:
-        if candidates:
+        if candidates and skipped_reserved < len(candidates):
             self._pipeline_stats["detail_pending_empty_with_candidates"] = int(
                 self._pipeline_stats.get("detail_pending_empty_with_candidates", 0)
             ) + 1
@@ -193,6 +345,22 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
         if self._is_retired_page(fetched):
             self.logger.info("Skip retired human detail page url=%s", fetched.url)
             continue
+        if self._looks_like_detail_directory_page(fetched):
+            self._pipeline_stats["detail_directory_skipped"] = int(
+                self._pipeline_stats.get("detail_directory_skipped", 0)
+            ) + 1
+            self.logger.debug("Skip directory/list page from detail enrichment url=%s", fetched.url)
+            continue
+        llm_queue = getattr(self, "_active_detail_llm_queue", None)
+        if llm_queue is not None and getattr(self, "pipeline_enabled", False):
+            await self._enqueue_extraction_task(
+                current,
+                fetched,
+                llm_queue=llm_queue,
+                detail_mode=True,
+                priority=1,
+            )
+            continue
         await self._extract_professors_from_page(
             current,
             fetched,
@@ -201,13 +369,24 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
         )
 
 
-def extract_detail_profile_links(self: Any, links: list[str], current_url: str) -> list[str]:
+def extract_detail_profile_links(
+    self: Any,
+    links: list[str],
+    current_url: str,
+    *,
+    link_signals: tuple[Any, ...] | list[Any] | None = None,
+) -> list[str]:
     same_domain = self.fetcher.filter_same_domain(links, self.start_url)
     current_parsed = urlparse(current_url)
     current_host = (current_parsed.hostname or "").lower()
     current_path = current_parsed.path.lower()
     current_dir = self._derive_section_prefix(current_path)
     current_is_noise = _is_non_faculty_noise_url(current_url)
+    signal_by_url = {
+        _sanitize_url(getattr(sig, "url", "")): sig
+        for sig in (link_signals or ())
+        if _sanitize_url(getattr(sig, "url", ""))
+    }
 
     detail_hints = _DETAIL_URL_HINTS
     section_hints = ("/szdw/", "/team/", "/staff/", "/jsdw/")
@@ -253,7 +432,9 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
         if any(lowered.endswith(ext) for ext in file_ext_hints):
             continue
         path = parsed.path.lower()
-        if _is_faculty_directory_or_category_link(link) and not _looks_like_profile_detail_url(link):
+        looks_like_profile_detail = _looks_like_profile_detail_url(link)
+        anchor_looks_personal = _link_signal_looks_like_person(signal_by_url.get(_sanitize_url(link)))
+        if _is_faculty_directory_or_category_link(link) and not looks_like_profile_detail:
             dropped_directory += 1
             continue
         related_by_path = False
@@ -266,6 +447,9 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
             dropped_parent_noise += 1
             continue
         if not related_by_path and not related_by_hint:
+            continue
+        if not (looks_like_profile_detail or anchor_looks_personal):
+            dropped_directory += 1
             continue
         candidates.append(link)
 
@@ -289,12 +473,15 @@ def extract_detail_profile_links(self: Any, links: list[str], current_url: str) 
 
     def _score(url: str) -> tuple[int, int]:
         lowered = url.lower()
+        signal = signal_by_url.get(_sanitize_url(url))
         depth = max(0, urlparse(url).path.count("/") - 1)
         score = depth
         if current_dir and urlparse(url).path.lower().startswith(current_dir.rstrip("/") + "/"):
             score += 4
         if any(token in lowered for token in detail_hints):
             score += 4
+        if _link_signal_looks_like_person(signal):
+            score += 3
         if any(token in lowered for token in section_hints):
             score += 2
         if any(token in lowered for token in noise_hints):
@@ -355,13 +542,31 @@ def is_retired_page(self: Any, fetched: Any) -> bool:
     return _looks_like_retired_content(fetched.text, fetched.url)
 
 
+def looks_like_detail_directory_page(self: Any, fetched: Any) -> bool:
+    url = getattr(fetched, "url", "") or ""
+    if _looks_like_profile_detail_url(url):
+        return False
+    text = (getattr(fetched, "text", "") or "").lower()
+    if any(token in text for token in _PROFILE_EVIDENCE_TOKENS):
+        return False
+    links = list(getattr(fetched, "links", ()) or ())
+    if _is_faculty_directory_or_category_link(url):
+        return True
+    if len(links) >= 1 and any(_is_faculty_directory_or_category_link(link) for link in links):
+        return True
+    return False
+
+
 _NAME_NOISE_TOKENS = (
-    "教授",
     "副教授",
-    "讲师",
-    "研究员",
     "副研究员",
     "助理研究员",
+    "助理教授",
+    "院士",
+    "杰出教授",
+    "教授",
+    "讲师",
+    "研究员",
     "导师",
     "博导",
     "硕导",
@@ -383,6 +588,34 @@ def _normalize_anchor_for_name_match(text: str) -> str:
         cleaned = cleaned.replace(token, " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
+
+
+def _link_signal_looks_like_person(signal: Any) -> bool:
+    if signal is None:
+        return False
+    pieces: list[str] = []
+    for attr in ("anchor_text", "heading_text"):
+        value = getattr(signal, attr, "")
+        if value:
+            pieces.append(str(value))
+    if not pieces:
+        return False
+    raw = " ".join(pieces).strip().lower()
+    cleaned = _normalize_anchor_for_name_match(raw)
+    if not cleaned:
+        return False
+    compact = re.sub(r"[\s·•\-_/|:：,，.。()（）\[\]【】]+", "", cleaned)
+    if not compact:
+        return False
+    if any(token in compact for token in _PERSON_ANCHOR_BLOCKLIST):
+        return False
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", compact)
+    if 2 <= len(cjk_chars) <= 4 and len(compact) <= 6:
+        return True
+    words = re.findall(r"[a-z][a-z'.-]+", cleaned)
+    if 2 <= len(words) <= 4 and len("".join(words)) >= 4:
+        return True
+    return False
 
 
 def _anchor_matches_enriched_name(signal: Any, enriched_names: set[str]) -> bool:
