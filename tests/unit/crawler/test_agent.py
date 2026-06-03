@@ -228,6 +228,96 @@ async def test_agent_bypasses_cross_run_dedup_when_all_org_pages_are_history(tmp
     await db.close()
 
 
+async def test_resume_mode_uses_page_cache_without_fetching_start_url(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/",
+            fetched=FetchResult(
+                "https://www.example.edu.cn/",
+                "home",
+                ["https://www.example.edu.cn/orgs"],
+                200,
+            ),
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://www.example.edu.cn/" not in fetcher.calls
+    assert "fetch resume_cache url=https://www.example.edu.cn/ depth=0" in agent.execution_log
+    await db.close()
+
+
+async def test_resume_mode_recovers_tasks_without_refetching_historical_start_url(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages={}, resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/",
+            CrawlLogStatus.SUCCESS,
+            "seeded-history",
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url="https://www.example.edu.cn/cs/faculty",
+            page_url="https://www.example.edu.cn/cs/faculty",
+            page_hash="resume-task",
+            page_text_snapshot="faculty list Ada",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert fetcher.calls == []
+    assert "skip already_crawled url=https://www.example.edu.cn/" in agent.execution_log
+    await db.close()
+
+
+async def test_resume_mode_blocks_without_cache_or_seed_state(tmp_path):
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages={}, resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/",
+            CrawlLogStatus.SUCCESS,
+            "seeded-history",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.FAILED.value
+    assert fetcher.calls == []
+    assert any("resume_blocked_missing_cache" in message for message in result.messages)
+    await db.close()
+
+
+async def test_resume_mode_probe_skips_previously_crawled_common_path(tmp_path, monkeypatch):
+    monkeypatch.setattr("agents.crawler.agent._INTERMEDIATE_ORG_PATHS", ("/known-org.htm",))
+    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages={}, resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/known-org.htm",
+            CrawlLogStatus.SUCCESS,
+            "seeded-history",
+        )
+
+    links = await agent._probe_intermediate_org_pages()
+
+    assert links == []
+    assert fetcher.calls == []
+    assert "skip already_crawled url=https://www.example.edu.cn/known-org.htm" in agent.execution_log
+    await db.close()
+
+
 async def test_agent_respects_max_depth(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM(), max_depth=0)
     result = await agent.run()

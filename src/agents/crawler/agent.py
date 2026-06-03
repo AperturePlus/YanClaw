@@ -18,7 +18,6 @@ from agents.crawler.faculty_discovery import FacultyDiscoveryService
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.fetch_scheduler import FetchScheduler
 from agents.crawler.models import (
-    CrawlLogStatus,
     CrawlStatus,
     CrawlTaskKind,
     CrawlTaskStatus,
@@ -157,6 +156,7 @@ class CrawlerAgent:
         pipeline_queue_cap: int = 64,
         invalid_json_max_retry: int = 1,
         task_recovery_enabled: bool = True,
+        resume_mode: bool = False,
         target_org_units: list[str] | None = None,
         org_unit_match_threshold: float = 0.60,
     ) -> None:
@@ -182,6 +182,7 @@ class CrawlerAgent:
         self.pipeline_queue_cap = max(1, int(pipeline_queue_cap))
         self.invalid_json_max_retry = max(0, int(invalid_json_max_retry))
         self.task_recovery_enabled = bool(task_recovery_enabled)
+        self.resume_mode = bool(resume_mode)
         self.target_org_units = [str(item).strip() for item in (target_org_units or []) if str(item).strip()]
         self.org_unit_match_threshold = min(1.0, max(0.0, float(org_unit_match_threshold)))
         self.session_state = CrawlSessionState.create(pipeline_enabled=self.pipeline_enabled)
@@ -234,10 +235,16 @@ class CrawlerAgent:
                 pass
 
         try:
-            self.logger.info("Starting crawl for %s", self.university_name)
+            self.logger.info(
+                "Starting crawl for %s strict_resume=%s",
+                self.university_name,
+                self.resume_mode,
+            )
             initial_professor_count = await self._professor_count()
             home = await self._fetch_url(self.start_url, 0)
             if home is None:
+                if self.resume_mode:
+                    return await self._resume_without_start_page(initial_professor_count)
                 self.logger.warning("Start URL could not be fetched: %s", self.start_url)
                 await self._set_status(CrawlStatus.FAILED)
                 return self._result(CrawlStatus.FAILED, ["Failed to fetch start URL"])
@@ -395,6 +402,76 @@ class CrawlerAgent:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
+
+    async def _resume_without_start_page(self, initial_professor_count: int) -> AgentResult:
+        async with self.db.session() as session:
+            org_units = await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
+            task_summary = await crawler_db.summarize_crawl_task_status(session)
+
+        recoverable_tasks = (
+            int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
+        )
+        if not org_units and recoverable_tasks <= 0:
+            message = (
+                "resume_blocked_missing_cache: start URL was already crawled but no page cache, "
+                "org units, or recoverable crawl tasks were available"
+            )
+            self.logger.warning(
+                "Strict resume blocked university=%s reason=missing_cache_no_seed start_url=%s",
+                self.university_name,
+                self.start_url,
+            )
+            await self._set_status(CrawlStatus.FAILED)
+            return self._result(CrawlStatus.FAILED, [message])
+
+        if recoverable_tasks > 0:
+            self.logger.info(
+                "Strict resume recovering extraction tasks university=%s recoverable_tasks=%s",
+                self.university_name,
+                recoverable_tasks,
+            )
+            await self._extract_professors([])
+
+        if org_units:
+            self.logger.info(
+                "Strict resume seeding from existing org_units university=%s org_units=%s",
+                self.university_name,
+                len(org_units),
+            )
+            if self._is_interactive:
+                await self._find_and_extract_streaming(org_units)
+            else:
+                faculty_links = await self._find_faculty_pages(org_units)
+                if faculty_links:
+                    await self._extract_professors(faculty_links)
+
+        total_professor_count = await self._professor_count()
+        newly_saved_count = max(0, total_professor_count - initial_professor_count)
+        if total_professor_count > 0:
+            await self._set_status(CrawlStatus.COMPLETED)
+            self.logger.info(
+                "Strict resume completed university=%s professors_total=%s professors_new=%s",
+                self.university_name,
+                total_professor_count,
+                newly_saved_count,
+            )
+            return self._result(CrawlStatus.COMPLETED, [])
+
+        message = (
+            "resume_blocked_missing_cache: strict resume found existing state but no cached pages "
+            "or extracted professors were available"
+        )
+        self.logger.warning(
+            "Strict resume blocked university=%s reason=missing_cache_no_output org_units=%s recoverable_tasks=%s",
+            self.university_name,
+            len(org_units),
+            recoverable_tasks,
+        )
+        await self._set_status(CrawlStatus.FAILED)
+        return self._result(CrawlStatus.FAILED, [message])
+
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
         links = _keyword_filter(home.links, ORG_UNIT_PAGE_KEYWORDS)
@@ -985,40 +1062,32 @@ class CrawlerAgent:
             probe_url = base + suffix
             if probe_url in self.visited_urls:
                 continue
-            try:
-                result = await self.fetcher.fetch(probe_url)
-                if result.block_reason:
-                    self.logger.info(
-                        "Faculty probe blocked url=%s status=%s reason=%s",
-                        probe_url,
-                        result.status_code,
-                        result.block_reason,
-                    )
-                    self.execution_log.append(
-                        f"probe_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
-                    )
-                    continue
-                if result.status_code == 200 and len(result.text) > 200:
-                    found.append(probe_url)
-                    self.logger.info("Probed faculty path found: %s", probe_url)
-                    self.execution_log.append(f"probe_found url={probe_url}")
-                    async with self.db.session() as session:
-                        await crawler_db.log_crawl(
-                            session,
-                            probe_url,
-                            CrawlLogStatus.SUCCESS,
-                            "probed",
-                        )
-                    break
-                self.logger.debug(
-                    "Faculty probe miss url=%s status=%s text_chars=%s links=%s",
+            result = await self._fetch_url(probe_url, 2)
+            if result is None:
+                continue
+            if result.block_reason:
+                self.logger.info(
+                    "Faculty probe blocked url=%s status=%s reason=%s",
                     probe_url,
                     result.status_code,
-                    len(result.text),
-                    len(result.links),
+                    result.block_reason,
                 )
-            except Exception:
-                pass
+                self.execution_log.append(
+                    f"probe_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
+                )
+                continue
+            if result.status_code == 200 and len(result.text) > 200:
+                found.append(probe_url)
+                self.logger.info("Probed faculty path found: %s", probe_url)
+                self.execution_log.append(f"probe_found url={probe_url}")
+                break
+            self.logger.debug(
+                "Faculty probe miss url=%s status=%s text_chars=%s links=%s",
+                probe_url,
+                result.status_code,
+                len(result.text),
+                len(result.links),
+            )
         return found
 
     async def _probe_intermediate_org_pages(self) -> list[str]:
@@ -1030,33 +1099,32 @@ class CrawlerAgent:
             probe_url = base + suffix
             if probe_url in self.visited_urls:
                 continue
-            try:
-                result = await self.fetcher.fetch(probe_url)
-                if result.block_reason:
-                    self.logger.info(
-                        "Org-page probe blocked url=%s status=%s reason=%s",
-                        probe_url,
-                        result.status_code,
-                        result.block_reason,
-                    )
-                    self.execution_log.append(
-                        f"probe_org_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
-                    )
-                    continue
-                if result.status_code == 200 and len(result.text) > 200:
-                    found.append(probe_url)
-                    self.logger.info("Probed org page found: %s", probe_url)
-                    self.execution_log.append(f"probe_org_found url={probe_url}")
-                    break
-                self.logger.debug(
-                    "Org-page probe miss url=%s status=%s text_chars=%s links=%s",
+            result = await self._fetch_url(probe_url, 1)
+            if result is None:
+                continue
+            if result.block_reason:
+                self.logger.info(
+                    "Org-page probe blocked url=%s status=%s reason=%s",
                     probe_url,
                     result.status_code,
-                    len(result.text),
-                    len(result.links),
+                    result.block_reason,
                 )
-            except Exception:
-                pass
+                self.execution_log.append(
+                    f"probe_org_blocked url={probe_url} status={result.status_code} reason={result.block_reason}"
+                )
+                continue
+            if result.status_code == 200 and len(result.text) > 200:
+                found.append(probe_url)
+                self.logger.info("Probed org page found: %s", probe_url)
+                self.execution_log.append(f"probe_org_found url={probe_url}")
+                break
+            self.logger.debug(
+                "Org-page probe miss url=%s status=%s text_chars=%s links=%s",
+                probe_url,
+                result.status_code,
+                len(result.text),
+                len(result.links),
+            )
         return found
     async def _extract_professors(self, faculty_links: list[_QueuedUrl]) -> None:
         self._log_state(CrawlerState.EXTRACT_PROFESSORS)

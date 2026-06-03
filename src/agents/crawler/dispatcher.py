@@ -139,7 +139,7 @@ class CrawlDispatcher:
                 if resume and await self._should_skip(university):
                     skipped += 1
                     continue
-                tasks.append(self._run_one(university, fetcher, semaphore))
+                tasks.append(self._run_one(university, fetcher, semaphore, resume_mode=resume))
             if tasks:
                 results = list(await asyncio.gather(*tasks))
 
@@ -259,6 +259,8 @@ class CrawlDispatcher:
         university: _UniversityTarget,
         fetcher: Fetcher,
         semaphore: asyncio.Semaphore,
+        *,
+        resume_mode: bool,
     ) -> AgentResult:
         async with semaphore:
             timeout_seconds = float(self.settings.university_timeout_seconds)
@@ -308,6 +310,7 @@ class CrawlDispatcher:
                         pipeline_queue_cap=self.settings.pipeline_queue_cap,
                         invalid_json_max_retry=self.settings.invalid_json_max_retry,
                         task_recovery_enabled=self.settings.task_recovery_enabled,
+                        resume_mode=resume_mode,
                         target_org_units=list(self.settings.target_org_units or []),
                         org_unit_match_threshold=self.settings.org_unit_match_threshold,
                     )

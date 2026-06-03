@@ -48,6 +48,14 @@ class FakeAgent:
         )()
 
 
+class NoopFetcher:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
 async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -63,7 +71,7 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
     FakeAgent.active = 0
     FakeAgent.max_active = 0
 
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
     summary = await dispatcher.run(universities=["A", "B"])
 
     assert summary.success == 2
@@ -139,7 +147,7 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
         max_concurrency=1,
         university_timeout_seconds=0.5,
     )
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=SlowAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=SlowAgent, fetcher_factory=NoopFetcher)
     summary = await dispatcher.run(universities=["A"])
 
     assert summary.failed == 1
@@ -162,13 +170,34 @@ async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
         org_unit_match_threshold=0.7,
     )
     CaptureAgent.last_kwargs = None
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
     summary = await dispatcher.run(universities=["A"])
 
     assert summary.success == 1
     assert CaptureAgent.last_kwargs is not None
     assert CaptureAgent.last_kwargs.get("target_org_units") == ["计算机学院", "软件学院"]
     assert CaptureAgent.last_kwargs.get("org_unit_match_threshold") == 0.7
+
+
+async def test_dispatcher_passes_resume_mode_to_agent(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+    )
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(universities=["A"], resume=True)
+
+    assert summary.success == 1
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("resume_mode") is True
 
 
 def test_university_db_path_differs_per_school(tmp_path):
@@ -443,7 +472,7 @@ async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
     db_path_a.write_bytes(b"old-a")
     db_path_b.write_bytes(b"old-b")
 
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
     summary = await dispatcher.run(universities=["A"])
 
     assert summary.success == 1
@@ -497,7 +526,7 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
         )
     await db.close()
 
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
     summary = await dispatcher.run(universities=["A"], resume=True)
 
     assert summary.success == 0
@@ -527,7 +556,7 @@ async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypa
 
     monkeypatch.setattr(dispatcher_module.shutil, "copy2", _raise_copy)
 
-    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent)
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
     with pytest.raises(RuntimeError, match="Failed to back up selected university DB files"):
         await dispatcher.run(universities=["A"])
     assert db_path.exists()
