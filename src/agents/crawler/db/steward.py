@@ -14,7 +14,7 @@ from agents.crawler.models import (
     ProfessorAffiliation,
     StewardRun,
 )
-from agents.crawler.sanitizer import normalize_org_unit_name
+from agents.crawler.sanitizer import normalize_name_key, normalize_org_unit_name
 from agents.crawler.db.utils import _normalize_email, _normalize_homepage, _now_utc
 
 
@@ -100,6 +100,7 @@ async def match_academician_for_professor(
     clean_name = str(name or "").strip()
     if not clean_name:
         return None, ""
+    clean_name_key = normalize_name_key(clean_name)
     clean_org = normalize_org_unit_name(org_unit_name, default="")
     clean_email = _normalize_email(email)
     clean_homepage = _normalize_homepage(homepage)
@@ -111,22 +112,24 @@ async def match_academician_for_professor(
                 select(Academician)
                 .join(OrgUnit, Academician.org_unit_id == OrgUnit.id)
                 .where(
-                    Academician.name == clean_name,
+                    Academician.name_key == clean_name_key,
                     OrgUnit.name == clean_org,
                 )
+                .order_by(Academician.id.asc())
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if same_org is not None:
-            return same_org, "same_name_org_unit"
+            return same_org, "same_name_key_org_unit"
 
     if clean_email:
         by_email = (
             await session.execute(
                 select(Academician).where(
                     func.lower(Academician.email) == clean_email.lower(),
-                )
+                ).order_by(Academician.id.asc()).limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if by_email is not None:
             return by_email, "email_exact"
 
@@ -139,9 +142,9 @@ async def match_academician_for_professor(
                         Academician.homepage == candidate,
                         Academician.external_link == candidate,
                     )
-                )
+                ).order_by(Academician.id.asc()).limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if by_url is not None:
             return by_url, "profile_url_exact"
 

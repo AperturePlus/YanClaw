@@ -86,6 +86,7 @@ class Professor(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    name_key: Mapped[str] = mapped_column(String(255), default="", index=True)
     org_unit_name: Mapped[str] = mapped_column(String(255), default="Unknown", index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -109,10 +110,14 @@ class Professor(Base):
 
 class Academician(Base):
     __tablename__ = "academicians"
-    __table_args__ = (UniqueConstraint("name", "org_unit_id", name="uq_academician_name_org_unit"),)
+    __table_args__ = (
+        UniqueConstraint("name", "org_unit_id", name="uq_academician_name_org_unit"),
+        UniqueConstraint("org_unit_id", "name_key", name="uq_academician_org_unit_name_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    name_key: Mapped[str] = mapped_column(String(255), default="", index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)

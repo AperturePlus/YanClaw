@@ -5,9 +5,12 @@ lives in smaller focused modules.
 """
 
 from agents.crawler.db.professors import (
+    UpsertEntityResult,
     ensure_professor_affiliation,
     upsert_academician,
+    upsert_academician_with_status,
     upsert_professor,
+    upsert_professor_with_status,
 )
 from agents.crawler.db.schema import ensure_runtime_schema
 from agents.crawler.db.steward import (
@@ -23,6 +26,7 @@ from agents.crawler.db.steward import (
 from agents.crawler.db.tasks import (
     list_recoverable_crawl_tasks,
     log_extraction_failure,
+    recover_stale_in_progress_crawl_tasks,
     set_crawl_task_status,
     summarize_crawl_task_status,
     upsert_crawl_task,
@@ -62,12 +66,16 @@ __all__ = [
     "log_extraction_failure",
     "match_academician_for_professor",
     "merge_into_academician_from_professor",
+    "recover_stale_in_progress_crawl_tasks",
     "hard_delete_professor",
+    "UpsertEntityResult",
     "set_crawl_task_status",
     "set_org_unit_status",
     "set_university_status",
     "summarize_crawl_task_status",
     "upsert_academician",
+    "upsert_academician_with_status",
     "upsert_crawl_task",
     "upsert_professor",
+    "upsert_professor_with_status",
 ]
