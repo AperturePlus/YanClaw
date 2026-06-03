@@ -30,6 +30,11 @@ class CrawlTaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class CrawlTaskKind(str, Enum):
+    LIST_PAGE = "list_page"
+    DETAIL_PAGE = "detail_page"
+
+
 class OrgUnitStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -166,6 +171,7 @@ class CrawlTask(Base):
     source_url: Mapped[str] = mapped_column(Text, index=True)
     page_url: Mapped[str] = mapped_column(Text, index=True)
     page_hash: Mapped[str] = mapped_column(String(64), index=True)
+    task_kind: Mapped[str] = mapped_column(String(32), index=True, default=CrawlTaskKind.LIST_PAGE.value)
     page_text_snapshot: Mapped[str] = mapped_column(Text, default="")
     allowed_tools: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)

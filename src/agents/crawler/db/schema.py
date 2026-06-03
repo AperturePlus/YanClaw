@@ -20,6 +20,16 @@ async def ensure_runtime_schema(session: AsyncSession) -> None:
         await session.execute(text("ALTER TABLE professors ADD COLUMN external_link TEXT"))
     if not await _sqlite_has_column(session, "academicians", "external_link"):
         await session.execute(text("ALTER TABLE academicians ADD COLUMN external_link TEXT"))
+    if not await _sqlite_has_column(session, "crawl_tasks", "task_kind"):
+        await session.execute(
+            text("ALTER TABLE crawl_tasks ADD COLUMN task_kind VARCHAR(32) DEFAULT 'list_page'")
+        )
+    await session.execute(
+        text(
+            "UPDATE crawl_tasks SET task_kind = 'list_page' "
+            "WHERE task_kind IS NULL OR trim(task_kind) = ''"
+        )
+    )
 
     await session.execute(
         text(

@@ -4,6 +4,7 @@ import json
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
+from agents.crawler.agent_detail import _looks_like_profile_detail_url
 from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_NOISE,
     _allow_faculty_candidate_for_org_unit,
@@ -46,6 +47,8 @@ def extract_followup_faculty_links(self: Any, links: list[str], current_url: str
     candidates: list[str] = []
     for link in same_domain:
         if link == current_url:
+            continue
+        if _looks_like_profile_detail_url(link):
             continue
         if not _allow_faculty_candidate_for_org_unit(link, org_unit_url=current_url, start_url=self.start_url):
             continue

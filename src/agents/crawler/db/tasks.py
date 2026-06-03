@@ -5,7 +5,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.crawler.models import CrawlExtractionFailure, CrawlTask, CrawlTaskStatus
+from agents.crawler.models import CrawlExtractionFailure, CrawlTask, CrawlTaskKind, CrawlTaskStatus
 from agents.crawler.sanitizer import normalize_org_unit_name
 from agents.crawler.db.utils import _normalize_url, _now_utc, _serialize_optional
 
@@ -21,6 +21,7 @@ async def upsert_crawl_task(
     page_hash: str,
     page_text_snapshot: str,
     allowed_tools: str | None,
+    task_kind: str | CrawlTaskKind = CrawlTaskKind.LIST_PAGE,
     attempt: int = 0,
     priority: int = 0,
     status: str | CrawlTaskStatus = CrawlTaskStatus.PENDING,
@@ -32,23 +33,34 @@ async def upsert_crawl_task(
     if not source_url:
         raise ValueError("source_url or page_url is required for crawl task")
     status_value = status.value if isinstance(status, CrawlTaskStatus) else str(status)
+    task_kind_value = task_kind.value if isinstance(task_kind, CrawlTaskKind) else str(task_kind)
+    if task_kind_value not in {item.value for item in CrawlTaskKind}:
+        task_kind_value = CrawlTaskKind.LIST_PAGE.value
 
+    existing_filters = [
+        CrawlTask.source_url == source_url,
+        CrawlTask.org_unit_name == org_unit_name,
+    ]
+    if task_kind_value == CrawlTaskKind.DETAIL_PAGE.value:
+        existing_filters.append(CrawlTask.task_kind == task_kind_value)
+    else:
+        existing_filters.append(CrawlTask.page_hash == page_hash)
     existing = (
-        await session.execute(
-            select(CrawlTask).where(
-                CrawlTask.source_url == source_url,
-                CrawlTask.org_unit_name == org_unit_name,
-                CrawlTask.page_hash == page_hash,
-            )
-        )
-    ).scalar_one_or_none()
+        await session.execute(select(CrawlTask).where(*existing_filters).order_by(CrawlTask.id.asc()).limit(1))
+    ).scalars().first()
     if existing:
         changed = False
+        if page_hash and existing.page_hash != page_hash and len(existing.page_text_snapshot or "") < len(page_text_snapshot or ""):
+            existing.page_hash = page_hash
+            changed = True
         if page_text_snapshot and len(existing.page_text_snapshot or "") < len(page_text_snapshot):
             existing.page_text_snapshot = page_text_snapshot
             changed = True
         if allowed_tools and existing.allowed_tools != allowed_tools:
             existing.allowed_tools = allowed_tools
+            changed = True
+        if task_kind_value and getattr(existing, "task_kind", None) != task_kind_value:
+            existing.task_kind = task_kind_value
             changed = True
         protected_from_pending = {
             CrawlTaskStatus.DONE.value,
@@ -87,6 +99,7 @@ async def upsert_crawl_task(
         source_url=source_url,
         page_url=page_url,
         page_hash=page_hash,
+        task_kind=task_kind_value,
         page_text_snapshot=page_text_snapshot or "",
         allowed_tools=allowed_tools,
         attempt=attempt,
