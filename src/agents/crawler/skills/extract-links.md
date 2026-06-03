@@ -2,6 +2,10 @@
 name: extract-links
 description: Select same-site links that maximize org-unit and faculty coverage.
 version: 7
+applies_to: DISCOVER_ORG_UNIT_PAGES,FIND_FACULTY_PAGES
+allowed_tools: extract_links
+priority: 20
+token_budget: 900
 created_at: 2026-04-26T00:00:00
 updated_at: 2026-04-28T20:10:00
 ---

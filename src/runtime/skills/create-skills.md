@@ -2,6 +2,10 @@
 name: create-skills
 description: Guidance for creating and updating markdown skills with version history.
 version: 1
+applies_to: "*"
+allowed_tools:
+priority: 100
+token_budget: 700
 created_at: 2026-04-26T00:00:00
 updated_at: 2026-04-26T00:00:00
 ---
