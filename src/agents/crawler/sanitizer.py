@@ -52,6 +52,7 @@ _BULLET_PREFIX_RE = re.compile(r"^[\s\d\.\-、:：\)\(]+")
 _ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
 _CJK_CHAR = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ebef"
 _CJK_INNER_SPACE_RE = re.compile(rf"(?<=[{_CJK_CHAR}])\s+(?=[{_CJK_CHAR}])")
+_TRAILING_LOW_VALUE_NAME_MARKER_RE = re.compile(r"\s*[\(（]\s*(?:兼|兼职)\s*[\)）]\s*$")
 
 
 def sanitize_professor_payload(
@@ -104,6 +105,11 @@ def normalize_name(value: Any) -> str:
     text = _BULLET_PREFIX_RE.sub("", text)
     text = " ".join(text.split())
     text = _CJK_INNER_SPACE_RE.sub("", text)
+    while True:
+        cleaned = _TRAILING_LOW_VALUE_NAME_MARKER_RE.sub("", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
     return text.strip()
 
 

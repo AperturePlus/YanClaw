@@ -133,6 +133,7 @@ def get_crawler_tools(
         updated = 0
         unchanged = 0
         deduped_by_name_key = 0
+        deduped_by_homepage = 0
         academicians_saved = 0
         academicians_updated = 0
         academicians_unchanged = 0
@@ -173,6 +174,8 @@ def get_crawler_tools(
                             academicians_unchanged += 1
                         if upsert_result.deduped_by_name_key:
                             deduped_by_name_key += 1
+                        if upsert_result.deduped_by_homepage:
+                            deduped_by_homepage += 1
                         removed = await crawler_db.delete_professor_duplicates_for_academician(
                             session,
                             academician,
@@ -219,6 +222,8 @@ def get_crawler_tools(
                             unchanged += 1
                         if upsert_result.deduped_by_name_key:
                             deduped_by_name_key += 1
+                        if upsert_result.deduped_by_homepage:
+                            deduped_by_homepage += 1
             except Exception as exc:
                 errors.append(f"{professor.get('name', '?')}: {exc}")
         result: dict[str, Any] = {
@@ -227,6 +232,7 @@ def get_crawler_tools(
             "updated": updated,
             "unchanged": unchanged,
             "deduped_by_name_key": deduped_by_name_key,
+            "deduped_by_homepage": deduped_by_homepage,
             "saved": created,
         }
         if academicians_saved:

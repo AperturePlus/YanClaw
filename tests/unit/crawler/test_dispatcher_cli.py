@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler import cli as crawler_cli
@@ -13,7 +14,7 @@ from agents.crawler import dispatcher as dispatcher_module
 from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError, _university_db_path
-from agents.crawler.models import CrawlStatus
+from agents.crawler.models import CrawlStatus, OrgUnit, Professor, ProfessorAffiliation
 from runtime.database import DatabaseManager
 from runtime.skills import SkillMeta
 from runtime.cli import cli as runtime_cli
@@ -524,6 +525,23 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
                 "source_url": "https://a.example.edu.cn/cs/faculty",
             },
         )
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == "CS"))).scalar_one()
+        polluted = Professor(
+            name="Ada（兼）",
+            name_key="Ada（兼）",
+            org_unit_name="CS",
+            homepage="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            bio="polluted row",
+        )
+        session.add(polluted)
+        await session.flush()
+        session.add(
+            ProfessorAffiliation(
+                professor_id=polluted.id,
+                org_unit_id=org_unit.id,
+                source_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            )
+        )
     await db.close()
 
     dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
@@ -533,6 +551,15 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
     assert summary.failed == 0
     assert summary.skipped == 1
     assert not (Path(settings.university_db_dir) / "backup").exists()
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        assert len(professors) == 1
+        assert professors[0].name == "Ada"
+        assert professors[0].bio == "polluted row"
+    await db.close()
 
 
 async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypatch):

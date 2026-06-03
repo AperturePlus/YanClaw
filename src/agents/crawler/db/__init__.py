@@ -16,7 +16,13 @@ from agents.crawler.db.page_cache import (
     get_cached_fetch_result,
     upsert_page_cache,
 )
-from agents.crawler.db.schema import ensure_runtime_schema
+from agents.crawler.db.schema import (
+    ProfessorIdentityRepairCandidate,
+    ProfessorIdentityRepairSummary,
+    ensure_runtime_schema,
+    list_professor_identity_repair_candidates,
+    repair_professor_identity_data,
+)
 from agents.crawler.db.steward import (
     add_data_quality_audit,
     create_steward_run,
@@ -73,6 +79,10 @@ __all__ = [
     "merge_into_academician_from_professor",
     "recover_stale_in_progress_crawl_tasks",
     "hard_delete_professor",
+    "list_professor_identity_repair_candidates",
+    "ProfessorIdentityRepairCandidate",
+    "ProfessorIdentityRepairSummary",
+    "repair_professor_identity_data",
     "UpsertEntityResult",
     "set_crawl_task_status",
     "set_org_unit_status",

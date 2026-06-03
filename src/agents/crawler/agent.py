@@ -1303,6 +1303,20 @@ class CrawlerAgent:
         ]
 
         try:
+            if self.pipeline_enabled and self.task_recovery_enabled:
+                default_recovery_limit = self.pipeline_queue_cap * 4
+                effective_recovery_limit = max(default_recovery_limit, int(recovery_limit or 0))
+                recovered = await self._recover_pipeline_tasks(limit=effective_recovery_limit)
+                for task in recovered:
+                    await llm_queue.put(task)
+                if recovered:
+                    self.logger.info(
+                        "Recovered %s pending extraction tasks from DB queue_cap=%s recovery_limit=%s",
+                        len(recovered),
+                        self.pipeline_queue_cap,
+                        effective_recovery_limit,
+                    )
+
             for item in faculty_links[:max_pages]:
                 if not _mark_scheduled(item.url):
                     continue
@@ -1365,7 +1379,7 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s deduped_by_homepage=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
@@ -1381,6 +1395,7 @@ class CrawlerAgent:
                 self._pipeline_stats.get("records_updated", 0),
                 self._pipeline_stats.get("records_unchanged", 0),
                 self._pipeline_stats.get("deduped_by_name_key", 0),
+                self._pipeline_stats.get("deduped_by_homepage", 0),
                 self._pipeline_stats.get("list_roster_overlap_high", 0),
                 self._pipeline_stats.get("stale_in_progress_recovered", 0),
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
@@ -1628,7 +1643,7 @@ class CrawlerAgent:
             self._pipeline_stats["processed_tasks"] += 1
             self._increment_task_kind_stat(task, "processed")
             self.logger.debug(
-                "Extraction task done task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s deduped_by_name_key=%s",
+                "Extraction task done task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s deduped_by_name_key=%s deduped_by_homepage=%s",
                 task.task_id,
                 task.org_unit_name,
                 save_summary.get("accepted", 0),
@@ -1636,6 +1651,7 @@ class CrawlerAgent:
                 save_summary.get("updated", 0),
                 save_summary.get("unchanged", 0),
                 save_summary.get("deduped_by_name_key", 0),
+                save_summary.get("deduped_by_homepage", 0),
             )
             db_queue.task_done()
 
@@ -1823,6 +1839,7 @@ class CrawlerAgent:
             "updated": 0,
             "unchanged": 0,
             "deduped_by_name_key": 0,
+            "deduped_by_homepage": 0,
         }
         for payload in payloads:
             result = await tools["save_professors"](

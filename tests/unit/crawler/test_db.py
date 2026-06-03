@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetchers import FetchResult
@@ -215,6 +215,84 @@ async def test_upsert_professor_dedupes_same_org_unit_by_name_key(tmp_path):
     await db.close()
 
 
+async def test_upsert_professor_strips_low_value_name_marker_before_deduping(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "name_marker_professor.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王俊（兼）",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "title": "Professor",
+                "source_url": "https://soft.example.edu.cn/szdw.htm",
+            },
+        )
+        second = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王俊",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "homepage": "https://soft.example.edu.cn/info/1001/1.htm",
+            },
+        )
+        assert first.id == second.id
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        assert len(professors) == 1
+        assert professors[0].name == "王俊"
+        assert professors[0].name_key == "王俊"
+        assert professors[0].homepage == "https://soft.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_upsert_professor_dedupes_cross_org_unit_by_homepage(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "homepage_dedupe.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_professor_with_status(
+            session,
+            {
+                "name": "王俊（兼）",
+                "org_unit_name": "软件学院",
+                "org_unit_url": "https://soft.example.edu.cn/",
+                "homepage": "https://soft.example.edu.cn/info/1001/1.htm#top",
+                "title": "Professor",
+            },
+        )
+        second = await crawler_db.upsert_professor_with_status(
+            session,
+            {
+                "name": "王俊",
+                "org_unit_name": "计算机学院",
+                "org_unit_url": "https://cs.example.edu.cn/",
+                "homepage": "https://soft.example.edu.cn/info/1001/1.htm/",
+                "email": "wangjun@example.edu.cn",
+            },
+        )
+        assert first.entity.id == second.entity.id
+        assert second.deduped_by_homepage is True
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        assert len(professors) == 1
+        assert len(affiliations) == 2
+        assert professors[0].name == "王俊"
+        assert professors[0].homepage == "https://soft.example.edu.cn/info/1001/1.htm"
+        assert professors[0].email == "wangjun@example.edu.cn"
+        assert "软件学院" in professors[0].org_unit_name
+        assert "计算机学院" in professors[0].org_unit_name
+
+    await db.close()
+
+
 async def test_load_university_targets_accepts_markdown_autolink_urls(tmp_path):
     csv_path = tmp_path / "websites.md"
     csv_path.write_text(
@@ -377,6 +455,86 @@ async def test_ensure_runtime_schema_repairs_professor_name_key_pollution(tmp_pa
         assert professors[0].email == "wangjun@example.edu.cn"
         assert professors[0].bio == "研究软件工程"
         assert affiliations[0].source_url == "https://soft.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_ensure_runtime_schema_repairs_professor_homepage_pollution(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "schema_homepage_repair.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        soft = OrgUnit(name="软件学院", url="https://soft.example.edu.cn/", kind="college")
+        cs = OrgUnit(name="计算机学院", url="https://cs.example.edu.cn/", kind="college")
+        session.add_all([soft, cs])
+        await session.flush()
+        soft_id = int(soft.id)
+        cs_id = int(cs.id)
+        keeper = Professor(
+            name="王俊（兼）",
+            name_key="王俊（兼）",
+            org_unit_name="软件学院",
+            title="教授",
+            homepage="https://SOFT.example.edu.cn/info/1001/1.htm#profile",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        victim = Professor(
+            name="王俊",
+            name_key="王俊",
+            org_unit_name="计算机学院",
+            email="wangjun@example.edu.cn",
+            homepage="https://soft.example.edu.cn/info/1001/1.htm/",
+            bio="研究软件工程",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        list_homepage = Professor(
+            name="列表污染",
+            name_key="列表污染",
+            org_unit_name="软件学院",
+            homepage="https://soft.example.edu.cn/szdw.htm",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([keeper, victim, list_homepage])
+        await session.flush()
+        session.add_all(
+            [
+                ProfessorAffiliation(
+                    professor_id=keeper.id,
+                    org_unit_id=soft_id,
+                    source_url="https://soft.example.edu.cn/szdw.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+                ProfessorAffiliation(
+                    professor_id=victim.id,
+                    org_unit_id=cs_id,
+                    source_url="https://soft.example.edu.cn/info/1001/1.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor).order_by(Professor.id.asc()))).scalars().all()
+        wang = [row for row in professors if row.name == "王俊"]
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        indexes = (await session.execute(text("PRAGMA index_list(professors)"))).fetchall()
+        assert len(wang) == 1
+        assert len(professors) == 2
+        assert len(affiliations) == 2
+        assert wang[0].name_key == "王俊"
+        assert wang[0].email == "wangjun@example.edu.cn"
+        assert wang[0].bio == "研究软件工程"
+        assert wang[0].homepage == "https://soft.example.edu.cn/info/1001/1.htm"
+        assert {aff.org_unit_id for aff in affiliations} == {soft_id, cs_id}
+        polluted = next(row for row in professors if row.name == "列表污染")
+        assert polluted.homepage is None
+        assert any(row[1] == "uq_professors_homepage" for row in indexes)
 
     await db.close()
 

@@ -1,13 +1,13 @@
 ---
 name: save-professors
 description: Extract public professor records and save them with strict field normalization.
-version: 4
+version: 5
 applies_to: EXTRACT_PROFESSORS
 allowed_tools: save_professors
 priority: 20
 token_budget: 1000
 created_at: 2026-04-26T00:00:00
-updated_at: 2026-04-28T20:10:00
+updated_at: 2026-06-03T00:00:00
 ---
 ## Goal
 
@@ -24,10 +24,16 @@ Use `save_professors` with:
 
 ## Field Rules (Strict)
 
-- `name`: required; no extra punctuation or numbering.
+- `name`: required; use the teacher's real name only. Remove extra punctuation, numbering,
+  and low-value role markers such as `（兼）`, `(兼)`, or `兼职`.
 - `title`: use only academic rank / role. Do not include honors.
 - `enrollment_pref`: put advisor information here (博导/硕导), not in `title`.
-- `email` / `phone` / `homepage` / `bio` / `research_areas` / `publications`: only if visible on the page.
+- `email` / `phone` / `homepage` / `external_link` / `bio` / `research_areas` / `publications`: only if visible on the page.
+- `homepage`: prefer the teacher's official profile/detail page. If the current `source_url`
+  is a single-teacher profile page, it may be used as that teacher's `homepage`.
+- Do not use roster/list pages, org-unit homepages, or faculty directory pages as a teacher `homepage`.
+- Put external personal sites such as Google Scholar, ORCID, ResearchGate, or personal domains
+  in `external_link`, not in `homepage`.
 - Missing optional values should be `null` (not empty string `""`).
 
 ## Allowed Title Set

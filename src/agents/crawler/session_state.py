@@ -42,6 +42,7 @@ class CrawlSessionState:
                 "records_updated": 0,
                 "records_unchanged": 0,
                 "deduped_by_name_key": 0,
+                "deduped_by_homepage": 0,
                 "timed_tasks": 0,
                 "average_task_ms": 0.0,
                 "queue_depth": 0,

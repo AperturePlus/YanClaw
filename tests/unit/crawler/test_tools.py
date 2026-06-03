@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import select
 
 from agents.crawler.models import Academician, Professor
@@ -52,6 +54,34 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
         assert len(wang) == 1
         assert wang[0].name_key == "王俊"
         assert wang[0].email == "wangjun@example.edu.cn"
+
+    await tools["save_professors"](
+        org_unit_name="Software",
+        org_unit_url="https://soft.example.edu.cn",
+        source_url="https://soft.example.edu.cn/list",
+        professors=[
+            {
+                "name": "李雷（兼）",
+                "homepage": "https://soft.example.edu.cn/info/1001/9.htm",
+            }
+        ],
+    )
+    homepage_deduped = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://cs.example.edu.cn",
+        source_url="https://soft.example.edu.cn/info/1001/9.htm",
+        professors=[
+            {
+                "name": "李雷",
+                "homepage": "https://soft.example.edu.cn/info/1001/9.htm#detail",
+                "email": "lilei@example.edu.cn",
+            }
+        ],
+    )
+    assert homepage_deduped["accepted"] == 1
+    assert homepage_deduped["created"] == 0
+    assert homepage_deduped["updated"] == 1
+    assert homepage_deduped["deduped_by_homepage"] == 1
 
     links = await tools["extract_links"](
         links=["https://cs.example.edu.cn/faculty", "https://other.example.com/"],
@@ -179,3 +209,10 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
         assert dup_academician.bio == "focus on systems"
 
     await db.close()
+
+
+def test_save_professors_skill_documents_name_and_homepage_rules():
+    text = Path("src/agents/crawler/skills/save-professors.md").read_text(encoding="utf-8")
+    assert "（兼）" in text
+    assert "external_link" in text
+    assert "Do not use roster/list pages" in text
