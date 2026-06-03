@@ -581,6 +581,76 @@ async def test_agent_pipeline_retries_invalid_json_once_then_saves(tmp_path):
     await db.close()
 
 
+async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    detail_url = "https://www.example.edu.cn/cs/faculty/info/1.htm"
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "faculty profile list Ada",
+            [detail_url],
+            200,
+        ),
+        detail_url: FetchResult(
+            detail_url,
+            "Ada Professor ada@example.edu.cn research systems",
+            [],
+            200,
+        ),
+    }
+
+    class DetailPipelineLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_urls: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                self.extract_urls.append(payload["url"])
+                name = "Ada Detail" if payload["url"] == detail_url else "Ada List"
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="CS",
+                    org_unit_url="https://www.example.edu.cn/cs",
+                    source_url=payload["url"],
+                    professors=[{"name": name, "title": "Professor", "email": "ada@example.edu.cn"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    db = DatabaseManager(sqlite_url(tmp_path / "detail_pipeline.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    llm = DetailPipelineLLM()
+    agent = CrawlerAgent(
+        university_name="DetailPipelineU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=llm,
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=FakeHumanFetcher(pages),
+        min_org_units=1,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+
+    task_kind_by_url = {task.page_url: task.task_kind for task in tasks}
+    assert task_kind_by_url[list_url] == "list_page"
+    assert task_kind_by_url[detail_url] == "detail_page"
+    assert list_url in llm.extract_urls
+    assert detail_url in llm.extract_urls
+    assert int(agent._pipeline_stats.get("detail_enqueued", 0)) == 1
+    assert int(agent._pipeline_stats.get("detail_processed", 0)) == 1
+    await db.close()
+
+
 async def test_agent_build_llm_payload_trims_links_and_visited_fields(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
     agent.visited_urls = {f"https://www.example.edu.cn/v/{i}" for i in range(100)}
@@ -633,6 +703,18 @@ async def test_agent_build_llm_payload_trims_links_and_visited_fields(tmp_path):
     )
     extract_payload = json.loads(extract_content)
     assert extract_payload["links"] == []
+    await db.close()
+
+
+async def test_professor_instruction_distinguishes_list_and_detail_field_strictness(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+
+    list_instruction = agent._build_professor_instruction("CS", detail_mode=False, strict_retry=False)
+    detail_instruction = agent._build_professor_instruction("CS", detail_mode=True, strict_retry=False)
+
+    assert "save visible names and academic titles" in list_instruction
+    assert "email/phone/research_areas are absent" in list_instruction
+    assert "Only save records that include at least one of email/phone/research_areas" in detail_instruction
     await db.close()
 
 
@@ -1529,9 +1611,16 @@ async def test_extract_org_units_keeps_processing_candidates_after_minimum_core_
 
 
 async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tmp_path):
+    from agents.crawler.fetchers.link_signals import LinkSignal
+
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    anchored_detail = "https://www.example.edu.cn/szdw/zzjs1/jjx.htm"
+    strong_detail = "https://www.example.edu.cn/info/1012/3958.htm"
+    category_page = "https://www.example.edu.cn/szdw/rgznx.htm"
     links = [
-        "https://www.example.edu.cn/szdw/zzjs1/jjx.htm",
+        anchored_detail,
+        strong_detail,
+        category_page,
         "https://www.example.edu.cn/gywm/jxdw1/jjx.htm",
         "https://sub.example.edu.cn/info/1012/3958.htm",
         "https://www.example.edu.cn/news/1234.htm",
@@ -1539,8 +1628,17 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
         "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml",
         "https://www.example.edu.cn/szdw/rszc/4.htm",
     ]
-    out = agent._extract_detail_profile_links(links, "https://www.example.edu.cn/szdw.htm")
-    assert "https://www.example.edu.cn/szdw/zzjs1/jjx.htm" in out
+    out = agent._extract_detail_profile_links(
+        links,
+        "https://www.example.edu.cn/szdw.htm",
+        link_signals=(
+            LinkSignal(url=anchored_detail, anchor_text="贾俊祥 教授"),
+            LinkSignal(url=category_page, anchor_text="人工智能系"),
+        ),
+    )
+    assert anchored_detail in out
+    assert strong_detail in out
+    assert category_page not in out
     assert "https://www.example.edu.cn/gywm/jxdw1/jjx.htm" not in out
     assert "https://sub.example.edu.cn/info/1012/3958.htm" not in out
     assert "https://www.example.edu.cn/news/1234.htm" not in out
@@ -1548,6 +1646,107 @@ async def test_detail_profile_links_are_scoped_to_same_host_and_related_paths(tm
     assert "https://www.example.edu.cn/szdw/renshi/202603/t20260310_1122.shtml" not in out
     assert "https://www.example.edu.cn/szdw/rszc/4.htm" not in out
     assert int(agent._pipeline_stats.get("detail_links_dropped_noise", 0)) >= 1
+    await db.close()
+
+
+async def test_scu_computer_faculty_sections_stay_list_pages_and_info_links_are_details(tmp_path):
+    list_url = "https://cs.scu.edu.cn/szdw.htm"
+    section_urls = [
+        "https://cs.scu.edu.cn/szdw/msfc/ys.htm",
+        "https://cs.scu.edu.cn/szdw/msfc/jcjs.htm",
+        "https://cs.scu.edu.cn/szdw/msfc/yxqnjjhdz.htm",
+        "https://cs.scu.edu.cn/szdw/msfc/gjjcqnjjhdz.htm",
+        "https://cs.scu.edu.cn/szdw/msfc.htm",
+        "https://cs.scu.edu.cn/szdw/jjzx.htm",
+        "https://cs.scu.edu.cn/szdw/cxzx.htm",
+        "https://cs.scu.edu.cn/szdw/rgznx.htm",
+        "https://cs.scu.edu.cn/szdw/rjgcx.htm",
+        "https://cs.scu.edu.cn/szdw/jsjkxx.htm",
+        "https://cs.scu.edu.cn/szdw/jsjgcx.htm",
+        "https://cs.scu.edu.cn/szdw/gxnjszx.htm",
+        "https://cs.scu.edu.cn/szdw/txtxyrjgcs.htm",
+        "https://cs.scu.edu.cn/szdw/jczx.htm",
+        "https://cs.scu.edu.cn/szdw/sjkxy.htm",
+    ]
+    detail_by_section = {
+        url: f"https://cs.scu.edu.cn/info/{1300 + index}/{13760 + index}.htm"
+        for index, url in enumerate(section_urls, start=1)
+    }
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "师资队伍 计算机学院 教师列表 教授 副教授",
+            [*section_urls, *detail_by_section.values()],
+            200,
+        ),
+    }
+    for index, section_url in enumerate(section_urls, start=1):
+        detail_url = detail_by_section[section_url]
+        pages[section_url] = FetchResult(
+            section_url,
+            f"教师列表 教授 副教授 教师{index}",
+            [detail_url],
+            200,
+        )
+        pages[detail_url] = FetchResult(
+            detail_url,
+            f"教师{index} 教授 邮箱 teacher{index}@scu.edu.cn 研究方向 人工智能",
+            [],
+            200,
+        )
+
+    class ScuComputerLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_urls: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") != "EXTRACT_PROFESSORS":
+                return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+            self.extract_urls.append(payload["url"])
+            if "/info/" not in payload["url"]:
+                return LLMResult("{}")
+            name = payload["page_text"].split(" ", 1)[0]
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机学院",
+                org_unit_url=list_url,
+                source_url=payload["url"],
+                professors=[{"name": name, "title": "教授", "email": "teacher@example.scu.edu.cn"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    db = DatabaseManager(sqlite_url(tmp_path / "scu_computer.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    llm = ScuComputerLLM()
+    agent = CrawlerAgent(
+        university_name="四川大学",
+        start_url="https://www.scu.edu.cn/",
+        location="成都",
+        db=db,
+        llm_client=llm,
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=FakeHumanFetcher(pages),
+        min_org_units=1,
+        max_depth=4,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="计算机学院")])
+
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    task_kind_by_url = {task.page_url: task.task_kind for task in tasks}
+    for section_url in section_urls:
+        assert task_kind_by_url[section_url] == "list_page"
+    for detail_url in detail_by_section.values():
+        assert task_kind_by_url[detail_url] == "detail_page"
+    assert not any(task.task_kind == "detail_page" and "/szdw/" in task.page_url for task in tasks)
+    assert int(agent._pipeline_stats.get("followups_scheduled", 0)) >= len(section_urls)
+    assert int(agent._pipeline_stats.get("detail_links_dropped_directory", 0)) >= len(section_urls)
     await db.close()
 
 

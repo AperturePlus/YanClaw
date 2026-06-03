@@ -10,6 +10,7 @@ from agents.crawler.models import (
     CrawlLogStatus,
     CrawlStatus,
     CrawlTask,
+    CrawlTaskKind,
     CrawlTaskStatus,
     OrgUnit,
     Professor,
@@ -365,6 +366,7 @@ async def test_upsert_crawl_task_does_not_reset_active_or_terminal_statuses(tmp_
                 status=CrawlTaskStatus.PENDING,
             )
             assert updated.status == status.value
+            assert updated.task_kind == CrawlTaskKind.LIST_PAGE.value
 
     await db.close()
 
@@ -382,6 +384,7 @@ async def test_crawl_task_recovery_and_failure_audit(tmp_path):
             source_url="https://cs.testu.edu.cn/info/1001/1.htm",
             page_url="https://cs.testu.edu.cn/info/1001/1.htm",
             page_hash="abc123",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
             page_text_snapshot="sample text",
             allowed_tools='["save_professors"]',
             status=CrawlTaskStatus.PENDING,
@@ -408,6 +411,7 @@ async def test_crawl_task_recovery_and_failure_audit(tmp_path):
         recovered = await crawler_db.list_recoverable_crawl_tasks(session, limit=20)
         assert len(recovered) == 1
         assert recovered[0].status == CrawlTaskStatus.RETRY.value
+        assert recovered[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
         summary = await crawler_db.summarize_crawl_task_status(session)
         assert summary[CrawlTaskStatus.RETRY.value] == 1
         failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
@@ -419,4 +423,44 @@ async def test_crawl_task_recovery_and_failure_audit(tmp_path):
         done = (await session.execute(select(CrawlTask))).scalar_one()
         assert done.status == CrawlTaskStatus.DONE.value
 
+    await db.close()
+
+
+async def test_detail_crawl_task_dedupes_by_url_org_unit_and_kind(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "detail_task_dedup.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_hash="hash-short",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="Ada Professor",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        second = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_url="https://cs.testu.edu.cn/info/1001/1.htm",
+            page_hash="hash-longer",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="Ada Professor email ada@testu.edu.cn research systems",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+
+    assert first.id == second.id
+    assert len(rows) == 1
+    assert rows[0].page_hash == "hash-longer"
+    assert "ada@testu.edu.cn" in rows[0].page_text_snapshot
     await db.close()
