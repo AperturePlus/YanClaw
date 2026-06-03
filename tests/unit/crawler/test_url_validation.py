@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from agents.crawler.agent import _is_category_name, _url_found_on_page
+from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.url_heuristics import (
+    FACULTY_PAGE_TYPE_CATEGORY,
+    FACULTY_PAGE_TYPE_ELITE,
+    FACULTY_PAGE_TYPE_FULL,
+    FACULTY_PAGE_TYPE_NOISE,
+    _assess_faculty_candidate,
+    _assess_structural_faculty_candidates,
     _allow_faculty_candidate_for_org_unit,
     _is_non_faculty_noise_url,
     _is_faculty_platform,
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
     _rank_faculty_page_candidates,
+    _select_balanced_faculty_candidates,
 )
 
 
@@ -107,6 +115,19 @@ def test_non_faculty_noise_url_does_not_block_regular_faculty_paths():
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/faculty/teacher_list.htm")
 
 
+def test_non_faculty_noise_url_ignores_news_token_in_query_string():
+    # BUAA siteweaver detail URLs (`teachershouw.jsp?urltype=news.NewsContentUrl&...`)
+    # were misclassified as noise because the query string carried the literal
+    # token "news"; only the path should drive noise classification.
+    assert not _is_non_faculty_noise_url(
+        "https://soft.buaa.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=9633"
+    )
+    # Path-based news pages must still be flagged.
+    assert _is_non_faculty_noise_url(
+        "https://soft.buaa.edu.cn/news_list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078"
+    )
+
+
 def test_faculty_platform_detects_teacher_and_faculty_subdomains():
     assert _is_faculty_platform("https://teacher.buaa.edu.cn/")
     assert _is_faculty_platform("https://faculty.buaa.edu.cn/")
@@ -146,3 +167,91 @@ def test_rank_faculty_page_candidates_tie_break_is_stable():
     ranked_one = _rank_faculty_page_candidates([c, a, b])
     ranked_two = _rank_faculty_page_candidates([b, c, a])
     assert ranked_one == ranked_two
+
+
+def test_assess_faculty_candidate_classifies_noise_or_login_hard_reject():
+    item = _assess_faculty_candidate(
+        "https://scse.buaa.edu.cn/system/resource/tplloginaccount.jsp?owner=1"
+    )
+    assert item.page_type == FACULTY_PAGE_TYPE_NOISE
+    assert item.hard_reject is True
+    assert item.score < 0
+
+
+def test_assess_faculty_candidate_classifies_full_category_and_elite():
+    full = _assess_faculty_candidate(
+        "https://scse.buaa.edu.cn/szdw/jsdw.htm",
+        anchor_text="全体教师",
+        heading_text="师资队伍",
+    )
+    category = _assess_faculty_candidate(
+        "https://scse.buaa.edu.cn/szdw/js.htm",
+        anchor_text="教授",
+        heading_text="教师名录",
+    )
+    elite = _assess_faculty_candidate(
+        "https://scse.buaa.edu.cn/szdw/jcrc.htm",
+        anchor_text="杰出人才",
+        heading_text="高层次人才",
+    )
+    assert full.page_type == FACULTY_PAGE_TYPE_FULL
+    assert category.page_type == FACULTY_PAGE_TYPE_CATEGORY
+    assert elite.page_type == FACULTY_PAGE_TYPE_ELITE
+
+
+def test_select_balanced_candidates_drops_elite_when_full_exists():
+    assessed = _assess_structural_faculty_candidates(
+        [
+            "https://scse.buaa.edu.cn/szdw/jsdw.htm",
+            "https://scse.buaa.edu.cn/szdw/js.htm",
+            "https://scse.buaa.edu.cn/szdw/jcrc.htm",
+        ],
+        link_signals=(
+            LinkSignal(
+                url="https://scse.buaa.edu.cn/szdw/jsdw.htm",
+                anchor_text="全体教师",
+                heading_text="师资队伍",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=1,
+            ),
+            LinkSignal(
+                url="https://scse.buaa.edu.cn/szdw/js.htm",
+                anchor_text="教授",
+                heading_text="教师名录",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=2,
+            ),
+            LinkSignal(
+                url="https://scse.buaa.edu.cn/szdw/jcrc.htm",
+                anchor_text="杰出人才",
+                heading_text="高层次人才",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=3,
+            ),
+        ),
+    )
+    selected = _select_balanced_faculty_candidates(assessed, limit=4)
+    selected_urls = [item.url for item in selected]
+    assert "https://scse.buaa.edu.cn/szdw/jsdw.htm" in selected_urls
+    assert "https://scse.buaa.edu.cn/szdw/js.htm" in selected_urls
+    assert "https://scse.buaa.edu.cn/szdw/jcrc.htm" not in selected_urls
+
+
+def test_assess_structural_candidates_tie_break_is_stable_without_signals():
+    links_one = [
+        "https://scse.buaa.edu.cn/szdw/jsdw/c.htm",
+        "https://scse.buaa.edu.cn/szdw/jsdw/a.htm",
+        "https://scse.buaa.edu.cn/szdw/jsdw/b.htm",
+    ]
+    links_two = [
+        "https://scse.buaa.edu.cn/szdw/jsdw/b.htm",
+        "https://scse.buaa.edu.cn/szdw/jsdw/c.htm",
+        "https://scse.buaa.edu.cn/szdw/jsdw/a.htm",
+    ]
+
+    assessed_one = _assess_structural_faculty_candidates(links_one, link_signals=())
+    assessed_two = _assess_structural_faculty_candidates(links_two, link_signals=())
+
+    ordered_one = [item.url for item in assessed_one]
+    ordered_two = [item.url for item in assessed_two]
+    assert ordered_one == ordered_two

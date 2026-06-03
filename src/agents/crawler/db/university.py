@@ -148,6 +148,22 @@ async def list_org_units(session: AsyncSession, *, limit: int | None = None) -> 
     return list((await session.execute(stmt)).scalars().all())
 
 
+async def set_org_unit_status(
+    session: AsyncSession,
+    org_unit_id: int,
+    status: str | OrgUnitStatus,
+) -> OrgUnit | None:
+    row = await session.get(OrgUnit, int(org_unit_id))
+    if row is None:
+        return None
+    status_value = status.value if isinstance(status, OrgUnitStatus) else str(status)
+    if status_value and row.status != status_value:
+        row.status = status_value
+        row.updated_at = _now_utc()
+        await session.flush()
+    return row
+
+
 async def log_crawl(
     session: AsyncSession,
     url: str,
@@ -273,5 +289,6 @@ __all__ = [
     "load_university_targets_from_csv",
     "log_crawl",
     "set_university_status",
+    "set_org_unit_status",
     "_dedupe_org_units_by_name",
 ]

@@ -15,6 +15,7 @@ class FetchResult:
     links: list[str]
     status_code: int
     block_reason: str | None = None
+    link_signals: tuple[Any, ...] = ()
 
 
 class _LinkParser(HTMLParser):

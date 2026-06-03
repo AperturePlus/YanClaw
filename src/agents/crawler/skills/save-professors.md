@@ -2,6 +2,10 @@
 name: save-professors
 description: Extract public professor records and save them with strict field normalization.
 version: 4
+applies_to: EXTRACT_PROFESSORS
+allowed_tools: save_professors
+priority: 20
+token_budget: 1000
 created_at: 2026-04-26T00:00:00
 updated_at: 2026-04-28T20:10:00
 ---
@@ -48,7 +52,8 @@ Prefer these normalized titles:
 
 ## Precision and Coverage
 
-- If a page is only a navigation page, continue to list/profile pages before saving.
+- On official roster/list pages, save visible teacher names and academic titles even when contact or research fields are not shown; profile/detail pages can enrich those records later.
+- If a page is only a navigation page with no teacher names, continue to list/profile pages before saving.
 - Prefer complete list extraction for each org unit page before moving on.
 - Do not fabricate any value not present in page text.
 

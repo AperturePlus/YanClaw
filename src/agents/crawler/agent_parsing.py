@@ -4,8 +4,11 @@ import json
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
+from agents.crawler.agent_detail import _looks_like_profile_detail_url
 from agents.crawler.url_heuristics import (
+    FACULTY_PAGE_TYPE_NOISE,
     _allow_faculty_candidate_for_org_unit,
+    _assess_faculty_candidate,
     _contains_cjk,
     _dedupe_query_terms,
     _extract_urls_from_text,
@@ -45,11 +48,17 @@ def extract_followup_faculty_links(self: Any, links: list[str], current_url: str
     for link in same_domain:
         if link == current_url:
             continue
+        if _looks_like_profile_detail_url(link):
+            continue
         if not _allow_faculty_candidate_for_org_unit(link, org_unit_url=current_url, start_url=self.start_url):
             continue
         if _is_faculty_platform(link) or _looks_like_retired_url(link):
             continue
         if _is_non_faculty_noise_url(link):
+            dropped_noise += 1
+            continue
+        assessed = _assess_faculty_candidate(link)
+        if assessed.page_type == FACULTY_PAGE_TYPE_NOISE and (assessed.hard_reject or assessed.score <= 0):
             dropped_noise += 1
             continue
         parsed = urlparse(link)

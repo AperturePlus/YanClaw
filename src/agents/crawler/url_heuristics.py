@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -173,8 +174,12 @@ _EXPLICIT_FACULTY_DIR_HINTS = (
 
 
 def _iter_url_noise_tokens(url: str) -> list[str]:
+    # Only tokenize the path: query strings frequently embed generic words such
+    # as "news" inside parameter values (e.g. BUAA siteweaver detail pages use
+    # urltype=news.NewsContentUrl) and would otherwise condemn legitimate
+    # teacher-detail URLs as faculty noise.
     parsed = urlparse(url.lower())
-    text = " ".join((parsed.path or "", parsed.query or "", parsed.fragment or ""))
+    text = parsed.path or ""
     return [token for token in re.split(r"[^a-z0-9]+", text) if token]
 
 
@@ -314,6 +319,291 @@ def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
 def _is_academician_showcase_page(url: str) -> bool:
     lowered = url.lower()
     return any(token in lowered for token in ("lyys", "yuanshi", "academician", "yuan-shi"))
+
+
+FACULTY_PAGE_TYPE_FULL = "full_list"
+FACULTY_PAGE_TYPE_CATEGORY = "category_list"
+FACULTY_PAGE_TYPE_ELITE = "elite_list"
+FACULTY_PAGE_TYPE_NOISE = "noise_or_login"
+FACULTY_PAGE_TYPE_UNKNOWN = "unknown"
+
+_FACULTY_LOGIN_HARD_REJECT_HINTS = (
+    "tplloginaccount",
+    "/login",
+    "login.jsp",
+    "/account",
+    "signin",
+    "xw_list_new",
+)
+
+_FACULTY_FULL_TEXT_HINTS = (
+    "全体教师",
+    "教师名录",
+    "师资队伍",
+    "教师队伍",
+    "专任教师",
+    "faculty list",
+    "teacher list",
+    "all teachers",
+    "teaching staff",
+    "staff directory",
+)
+
+_FACULTY_FULL_STRONG_TEXT_HINTS = (
+    "全体教师",
+    "师资队伍",
+    "教师队伍",
+    "专任教师",
+    "faculty list",
+    "all teachers",
+    "teaching staff",
+    "staff directory",
+)
+
+_FACULTY_CATEGORY_TEXT_HINTS = (
+    "教授",
+    "副教授",
+    "讲师",
+    "研究员",
+    "博导",
+    "硕导",
+    "博士生导师",
+    "硕士生导师",
+    "professor",
+    "associate professor",
+    "assistant professor",
+    "lecturer",
+    "researcher",
+)
+
+_FACULTY_ELITE_TEXT_HINTS = (
+    "杰出人才",
+    "高层次人才",
+    "名师",
+    "杰青",
+    "优青",
+    "academician",
+    "distinguished",
+    "talent",
+    "fellow",
+)
+
+_FACULTY_NOISE_TEXT_HINTS = (
+    "新闻",
+    "通知",
+    "公告",
+    "党建",
+    "人事",
+    "招聘",
+    "news",
+    "notice",
+    "announcement",
+    "events",
+    "policy",
+    "recruit",
+)
+
+_FACULTY_NAV_CONTEXT_HINTS = ("nav", "menu", "tab", "tree", "list")
+
+
+@dataclass(frozen=True)
+class FacultyCandidateAssessment:
+    url: str
+    page_type: str
+    score: int
+    uncertain: bool
+    hard_reject: bool
+    reasons: tuple[str, ...] = ()
+    anchor_text: str = ""
+    heading_text: str = ""
+    parent_tags_or_classes: tuple[str, ...] = ()
+    link_order: int = 0
+
+
+def _contains_any(text: str, hints: tuple[str, ...]) -> bool:
+    lowered = (text or "").lower()
+    return any(hint.lower() in lowered for hint in hints)
+
+
+def _assess_faculty_candidate(
+    url: str,
+    *,
+    anchor_text: str = "",
+    heading_text: str = "",
+    parent_tags_or_classes: tuple[str, ...] = (),
+    link_order: int = 0,
+) -> FacultyCandidateAssessment:
+    lowered_url = (url or "").lower()
+    reasons: list[str] = []
+
+    for token in _FACULTY_LOGIN_HARD_REJECT_HINTS:
+        if token in lowered_url:
+            return FacultyCandidateAssessment(
+                url=url,
+                page_type=FACULTY_PAGE_TYPE_NOISE,
+                score=-100,
+                uncertain=False,
+                hard_reject=True,
+                reasons=(f"hard_reject:{token}",),
+                anchor_text=anchor_text,
+                heading_text=heading_text,
+                parent_tags_or_classes=parent_tags_or_classes,
+                link_order=link_order,
+            )
+
+    signal_text = " ".join(
+        [
+            lowered_url,
+            (anchor_text or "").lower(),
+            (heading_text or "").lower(),
+            " ".join((item or "").lower() for item in parent_tags_or_classes),
+        ]
+    )
+
+    full_hit = _contains_any(signal_text, _FACULTY_FULL_TEXT_HINTS)
+    full_strong_hit = _contains_any(signal_text, _FACULTY_FULL_STRONG_TEXT_HINTS)
+    category_hit = _contains_any(signal_text, _FACULTY_CATEGORY_TEXT_HINTS)
+    elite_hit = _contains_any(signal_text, _FACULTY_ELITE_TEXT_HINTS)
+    noise_hit = _contains_any(signal_text, _FACULTY_NOISE_TEXT_HINTS) or _is_non_faculty_noise_url(url)
+    nav_hit = _contains_any(signal_text, _FACULTY_NAV_CONTEXT_HINTS)
+
+    score = 0
+    if full_hit:
+        score += 12
+        reasons.append("full_hit")
+    if category_hit:
+        score += 7
+        reasons.append("category_hit")
+    if elite_hit:
+        score += 5
+        reasons.append("elite_hit")
+    if nav_hit:
+        score += 2
+        reasons.append("nav_hit")
+    if _looks_like_faculty_page(url):
+        score += 3
+        reasons.append("url_faculty_hit")
+    if _is_pagination_link(url):
+        score -= 2
+        reasons.append("pagination_penalty")
+    if noise_hit:
+        score -= 14
+        reasons.append("noise_hit")
+
+    page_type = FACULTY_PAGE_TYPE_UNKNOWN
+    if noise_hit and score <= 0:
+        page_type = FACULTY_PAGE_TYPE_NOISE
+    elif category_hit and (not full_strong_hit or _contains_any(f"{anchor_text} {heading_text}", _FACULTY_CATEGORY_TEXT_HINTS)):
+        page_type = FACULTY_PAGE_TYPE_CATEGORY
+    elif full_hit:
+        page_type = FACULTY_PAGE_TYPE_FULL
+    elif elite_hit:
+        page_type = FACULTY_PAGE_TYPE_ELITE
+
+    uncertain = False
+    if page_type in {FACULTY_PAGE_TYPE_FULL, FACULTY_PAGE_TYPE_CATEGORY, FACULTY_PAGE_TYPE_ELITE}:
+        uncertain = 3 <= score <= 7
+    elif page_type == FACULTY_PAGE_TYPE_UNKNOWN:
+        uncertain = score >= 2
+
+    return FacultyCandidateAssessment(
+        url=url,
+        page_type=page_type,
+        score=score,
+        uncertain=uncertain,
+        hard_reject=False,
+        reasons=tuple(reasons),
+        anchor_text=anchor_text,
+        heading_text=heading_text,
+        parent_tags_or_classes=parent_tags_or_classes,
+        link_order=link_order,
+    )
+
+
+def _assess_structural_faculty_candidates(
+    links: list[str],
+    *,
+    link_signals: tuple[Any, ...] | list[Any] | None = None,
+) -> list[FacultyCandidateAssessment]:
+    if not links:
+        return []
+
+    signal_map: dict[str, Any] = {}
+    for signal in link_signals or ():
+        signal_url = str(getattr(signal, "url", "") or "")
+        if signal_url and signal_url not in signal_map:
+            signal_map[signal_url] = signal
+
+    assessments: list[FacultyCandidateAssessment] = []
+    for link in links:
+        signal = signal_map.get(link)
+        assessment = _assess_faculty_candidate(
+            link,
+            anchor_text=str(getattr(signal, "anchor_text", "") or ""),
+            heading_text=str(getattr(signal, "heading_text", "") or ""),
+            parent_tags_or_classes=tuple(getattr(signal, "parent_tags_or_classes", ()) or ()),
+            link_order=int(getattr(signal, "link_order", 0) or 0),
+        )
+        assessments.append(assessment)
+
+    type_priority = {
+        FACULTY_PAGE_TYPE_FULL: 0,
+        FACULTY_PAGE_TYPE_CATEGORY: 1,
+        FACULTY_PAGE_TYPE_ELITE: 2,
+        FACULTY_PAGE_TYPE_UNKNOWN: 3,
+        FACULTY_PAGE_TYPE_NOISE: 4,
+    }
+    return sorted(
+        assessments,
+        key=lambda item: (
+            -item.score,
+            type_priority.get(item.page_type, 9),
+            item.url.lower(),
+            item.link_order,
+        ),
+    )
+
+
+def _select_balanced_faculty_candidates(
+    assessments: list[FacultyCandidateAssessment],
+    *,
+    limit: int = 4,
+) -> list[FacultyCandidateAssessment]:
+    if not assessments or limit <= 0:
+        return []
+
+    accepted = [
+        item
+        for item in assessments
+        if not item.hard_reject
+        and item.page_type != FACULTY_PAGE_TYPE_NOISE
+        and item.score >= 3
+    ]
+    if not accepted:
+        return []
+
+    full = [item for item in accepted if item.page_type == FACULTY_PAGE_TYPE_FULL]
+    category = [item for item in accepted if item.page_type == FACULTY_PAGE_TYPE_CATEGORY]
+    elite = [item for item in accepted if item.page_type == FACULTY_PAGE_TYPE_ELITE]
+    unknown = [item for item in accepted if item.page_type == FACULTY_PAGE_TYPE_UNKNOWN]
+
+    selected: list[FacultyCandidateAssessment] = []
+    selected.extend(full[:2])
+    selected.extend(category[:2])
+    if not full and not category:
+        selected.extend(elite[:1])
+    selected.extend(unknown)
+
+    deduped: list[FacultyCandidateAssessment] = []
+    seen: set[str] = set()
+    for item in selected:
+        if item.url in seen:
+            continue
+        seen.add(item.url)
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
 
 
 _RETIRED_URL_HINTS = (

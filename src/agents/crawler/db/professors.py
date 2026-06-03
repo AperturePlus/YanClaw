@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -10,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.crawler.models import Academician, OrgUnit, Professor, ProfessorAffiliation
 from agents.crawler.sanitizer import (
     merge_enrollment_pref,
+    normalize_name,
+    normalize_name_key,
     normalize_multivalue,
     normalize_optional_text,
     normalize_org_unit_name,
@@ -27,10 +30,22 @@ from agents.crawler.db.utils import (
 )
 
 
+@dataclass(frozen=True)
+class UpsertEntityResult:
+    entity: Professor | Academician
+    status: str
+    deduped_by_name_key: bool = False
+
+
 async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Professor:
-    name = str(data["name"]).strip()
+    return (await upsert_professor_with_status(session, data)).entity  # type: ignore[return-value]
+
+
+async def upsert_professor_with_status(session: AsyncSession, data: dict[str, Any]) -> UpsertEntityResult:
+    name = normalize_name(data["name"])
     if not name:
         raise ValueError("Professor name is required")
+    name_key = normalize_name_key(name)
 
     org_unit_id = data.get("org_unit_id")
     org_unit_name = normalize_org_unit_name(
@@ -68,6 +83,7 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
     )
     values = {
         "name": name,
+        "name_key": name_key,
         "org_unit_name": org_unit_name,
         "title": normalize_title(data.get("title")),
         "research_areas": normalize_multivalue(data.get("research_areas")),
@@ -83,13 +99,14 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         "publications": normalize_multivalue(data.get("publications")),
     }
 
-    professor, same_org_unit = await _find_existing_professor(
+    professor, same_org_unit, match_reason = await _find_existing_professor(
         session,
-        name,
+        name_key,
         int(org_unit_id),
         email,
         external_link,
     )
+    deduped_by_name_key = False
     if professor is None:
         professor = Professor(
             **values,
@@ -98,25 +115,34 @@ async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Profe
         )
         session.add(professor)
         await session.flush()
+        status = "created"
     else:
-        _merge_professor(professor, values, overwrite=same_org_unit)
-        professor.updated_at = _now_utc()
+        changed = _merge_professor(professor, values, overwrite=same_org_unit)
+        deduped_by_name_key = match_reason == "same_org_name_key"
         await session.flush()
+        status = "updated" if changed else "unchanged"
 
-    await ensure_professor_affiliation(
+    _affiliation, affiliation_changed = await _ensure_professor_affiliation_with_status(
         session,
         professor_id=professor.id,
         org_unit_id=int(org_unit_id),
         source_url=source_url,
     )
+    if status == "unchanged" and affiliation_changed:
+        status = "updated"
     await session.flush()
-    return professor
+    return UpsertEntityResult(professor, status=status, deduped_by_name_key=deduped_by_name_key)
 
 
 async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Academician:
-    name = str(data["name"]).strip()
+    return (await upsert_academician_with_status(session, data)).entity  # type: ignore[return-value]
+
+
+async def upsert_academician_with_status(session: AsyncSession, data: dict[str, Any]) -> UpsertEntityResult:
+    name = normalize_name(data["name"])
     if not name:
         raise ValueError("Academician name is required")
+    name_key = normalize_name_key(name)
 
     org_unit_id = data.get("org_unit_id")
     org_unit_name = normalize_org_unit_name(
@@ -149,6 +175,7 @@ async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Aca
     )
     values = {
         "name": name,
+        "name_key": name_key,
         "title": normalize_title(data.get("title")) or "院士",
         "research_areas": normalize_multivalue(data.get("research_areas")),
         "email": _normalize_email(data.get("email")),
@@ -166,12 +193,15 @@ async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Aca
 
     existing = (
         await session.execute(
-            select(Academician).where(
-                Academician.name == name,
+            select(Academician)
+            .where(
+                Academician.name_key == name_key,
                 Academician.org_unit_id == int(org_unit_id),
             )
+            .order_by(Academician.id.asc())
+            .limit(1)
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if existing is None:
         existing = Academician(
             **values,
@@ -181,31 +211,18 @@ async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Aca
         )
         session.add(existing)
         await session.flush()
-        return existing
+        return UpsertEntityResult(existing, status="created")
 
-    changed = False
-    for key, value in values.items():
-        if value in {None, ""}:
-            continue
-        current = getattr(existing, key)
-        if key == "homepage":
-            best = _choose_better_profile_url(current, value)
-            if best and best != current:
-                setattr(existing, key, best)
-                changed = True
-            continue
-        if key == "external_link":
-            if current in {None, ""}:
-                setattr(existing, key, value)
-                changed = True
-            continue
-        if current in {None, ""}:
-            setattr(existing, key, value)
-            changed = True
+    changed = _merge_academician(existing, values)
+    deduped_by_name_key = True
     if changed:
         existing.updated_at = _now_utc()
     await session.flush()
-    return existing
+    return UpsertEntityResult(
+        existing,
+        status="updated" if changed else "unchanged",
+        deduped_by_name_key=deduped_by_name_key,
+    )
 
 
 async def ensure_professor_affiliation(
@@ -214,6 +231,21 @@ async def ensure_professor_affiliation(
     org_unit_id: int,
     source_url: str | None = None,
 ) -> ProfessorAffiliation:
+    affiliation, _changed = await _ensure_professor_affiliation_with_status(
+        session,
+        professor_id=professor_id,
+        org_unit_id=org_unit_id,
+        source_url=source_url,
+    )
+    return affiliation
+
+
+async def _ensure_professor_affiliation_with_status(
+    session: AsyncSession,
+    professor_id: int,
+    org_unit_id: int,
+    source_url: str | None = None,
+) -> tuple[ProfessorAffiliation, bool]:
     existing = (
         await session.execute(
             select(ProfessorAffiliation).where(
@@ -227,7 +259,8 @@ async def ensure_professor_affiliation(
             better_source = _choose_better_profile_url(existing.source_url, source_url)
             if better_source and better_source != existing.source_url:
                 existing.source_url = better_source
-        return existing
+                return existing, True
+        return existing, False
 
     affiliation = ProfessorAffiliation(
         professor_id=professor_id,
@@ -237,67 +270,136 @@ async def ensure_professor_affiliation(
     )
     session.add(affiliation)
     await session.flush()
-    return affiliation
+    return affiliation, True
 
 
 async def _find_existing_professor(
     session: AsyncSession,
-    name: str,
+    name_key: str,
     org_unit_id: int,
     email: str | None,
     external_link: str | None,
-) -> tuple[Professor | None, bool]:
+) -> tuple[Professor | None, bool, str]:
     same_org_unit = (
         await session.execute(
             select(Professor)
             .join(ProfessorAffiliation, ProfessorAffiliation.professor_id == Professor.id)
             .where(
-                Professor.name == name,
+                Professor.name_key == name_key,
                 ProfessorAffiliation.org_unit_id == org_unit_id,
             )
+            .order_by(Professor.id.asc())
+            .limit(1)
         )
-    ).scalar_one_or_none()
+    ).scalars().first()
     if same_org_unit:
-        return same_org_unit, True
+        return same_org_unit, True, "same_org_name_key"
 
     if email:
         by_email = (
             await session.execute(
-                select(Professor).where(func.lower(Professor.email) == email.lower())
+                select(Professor).where(func.lower(Professor.email) == email.lower()).order_by(Professor.id.asc()).limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if by_email:
-            return by_email, False
+            return by_email, False, "email_exact"
 
     if external_link:
         by_external_link = (
-            await session.execute(select(Professor).where(Professor.external_link == external_link))
-        ).scalar_one_or_none()
+            await session.execute(
+                select(Professor).where(Professor.external_link == external_link).order_by(Professor.id.asc()).limit(1)
+            )
+        ).scalars().first()
         if by_external_link:
-            return by_external_link, False
+            return by_external_link, False, "external_link_exact"
 
-    return None, False
+    return None, False, ""
 
 
-def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite: bool) -> None:
+def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite: bool) -> bool:
+    changed = False
     for key, value in values.items():
-        if key in {"name"} or value in {None, ""}:
+        if key == "name_key" or value in {None, ""}:
+            continue
+        if key == "name":
+            best_name = _choose_better_name(professor.name, value)
+            if best_name and best_name != professor.name:
+                professor.name = best_name
+                changed = True
             continue
         current = getattr(professor, key)
         if key == "org_unit_name":
-            setattr(professor, key, _merge_org_unit_names(current, value))
+            merged = _merge_org_unit_names(current, value)
+            if merged != current:
+                setattr(professor, key, merged)
+                changed = True
             continue
         if key == "homepage":
             best = _choose_better_profile_url(current, value)
             if best and best != current:
                 setattr(professor, key, best)
+                changed = True
             continue
         if key == "external_link":
             if current in {None, ""}:
                 setattr(professor, key, value)
+                changed = True
             continue
-        if overwrite or current in {None, ""}:
+        if (overwrite or current in {None, ""}) and current != value:
             setattr(professor, key, value)
+            changed = True
+    normalized_key = normalize_name_key(professor.name)
+    if professor.name_key != normalized_key:
+        professor.name_key = normalized_key
+        changed = True
+    if changed:
+        professor.updated_at = _now_utc()
+    return changed
+
+
+def _merge_academician(academician: Academician, values: dict[str, Any]) -> bool:
+    changed = False
+    for key, value in values.items():
+        if key == "name_key" or value in {None, ""}:
+            continue
+        current = getattr(academician, key)
+        if key == "name":
+            best_name = _choose_better_name(current, value)
+            if best_name and best_name != current:
+                setattr(academician, key, best_name)
+                changed = True
+            continue
+        if key == "homepage":
+            best = _choose_better_profile_url(current, value)
+            if best and best != current:
+                setattr(academician, key, best)
+                changed = True
+            continue
+        if key == "external_link":
+            if current in {None, ""}:
+                setattr(academician, key, value)
+                changed = True
+            continue
+        if current in {None, ""}:
+            setattr(academician, key, value)
+            changed = True
+    normalized_key = normalize_name_key(academician.name)
+    if academician.name_key != normalized_key:
+        academician.name_key = normalized_key
+        changed = True
+    return changed
+
+
+def _choose_better_name(current: Any, incoming: Any) -> str:
+    current_name = normalize_name(current)
+    incoming_name = normalize_name(incoming)
+    if not current_name:
+        return incoming_name
+    if not incoming_name:
+        return current_name
+    if normalize_name_key(current_name) == normalize_name_key(incoming_name) and current_name != incoming_name:
+        return incoming_name
+    return current_name
 
 
 def _split_profile_and_external_urls(
@@ -395,7 +497,10 @@ def _profile_url_quality(url: str | None) -> int:
 
 
 __all__ = [
+    "UpsertEntityResult",
     "ensure_professor_affiliation",
     "upsert_academician",
+    "upsert_academician_with_status",
     "upsert_professor",
+    "upsert_professor_with_status",
 ]

@@ -165,13 +165,15 @@
 
 ## Task 8: 实现 crawler Fetcher
 
-**目标**: 异步 HTTP 抓取 + per-domain 限速 + 重试 + HTML → 文本。
+**历史目标**: 异步 HTTP 抓取 + per-domain 限速 + 重试 + HTML → 文本。
+
+**当前状态**: human bridge 是唯一支持的运行时 fetcher；HTTP 抓取实现已下线，运行时不再暴露 HTTP fetch 间隔 / crawler fetch retry 旋钮。
 
 **实现**:
-- 创建 `src/agents/crawler/fetcher.py`：`Fetcher` 类
+- 历史实现为 `src/agents/crawler/fetcher.py`：`Fetcher` 类
   - 持有 `httpx.AsyncClient`，实现 `async with` 生命周期管理
   - per-domain 限速：`dict[str, float]` 记录每个域名上次请求时间，请求前 `asyncio.sleep` 补足间隔
-  - 指数退避重试：429/503/超时 → `delay * 2^attempt`，最多 `max_retries` 次
+  - 历史指数退避重试：429/503/超时 → `delay * 2^attempt`
   - HTML → 文本：`html2text` 转换，保留链接 `[text](url)`
   - 提取页面中所有链接并绝对化处理
   - `filter_same_domain(links, base_url) -> list[str]` — 同域名/子域名过滤

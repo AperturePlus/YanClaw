@@ -30,6 +30,8 @@ async def test_fetch_returns_result_on_complete():
     assert result.status_code == 200
     assert result.text  # html2text output
     assert result.block_reason is None
+    assert len(result.link_signals) == 1
+    assert result.link_signals[0].url == "https://example.edu.cn/page"
 
 
 async def test_fetch_returns_empty_on_skip():

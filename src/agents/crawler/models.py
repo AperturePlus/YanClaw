@@ -30,11 +30,17 @@ class CrawlTaskStatus(str, Enum):
     FAILED = "failed"
 
 
+class CrawlTaskKind(str, Enum):
+    LIST_PAGE = "list_page"
+    DETAIL_PAGE = "detail_page"
+
+
 class OrgUnitStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
+    NO_FACULTY_PAGE = "no_faculty_page"
 
 
 class UniversityMeta(Base):
@@ -80,6 +86,7 @@ class Professor(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    name_key: Mapped[str] = mapped_column(String(255), default="", index=True)
     org_unit_name: Mapped[str] = mapped_column(String(255), default="Unknown", index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -103,10 +110,14 @@ class Professor(Base):
 
 class Academician(Base):
     __tablename__ = "academicians"
-    __table_args__ = (UniqueConstraint("name", "org_unit_id", name="uq_academician_name_org_unit"),)
+    __table_args__ = (
+        UniqueConstraint("name", "org_unit_id", name="uq_academician_name_org_unit"),
+        UniqueConstraint("org_unit_id", "name_key", name="uq_academician_org_unit_name_key"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
+    name_key: Mapped[str] = mapped_column(String(255), default="", index=True)
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     research_areas: Mapped[str | None] = mapped_column(Text, nullable=True)
     email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
@@ -152,6 +163,22 @@ class CrawlLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class CrawlPageCache(Base):
+    __tablename__ = "crawl_page_cache"
+    __table_args__ = (UniqueConstraint("url", name="uq_crawl_page_cache_url"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    url: Mapped[str] = mapped_column(Text, index=True)
+    final_url: Mapped[str] = mapped_column(Text, index=True)
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    text_snapshot: Mapped[str] = mapped_column(Text, default="")
+    links_json: Mapped[str] = mapped_column(Text, default="[]")
+    link_signals_json: Mapped[str] = mapped_column(Text, default="[]")
+    block_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class CrawlTask(Base):
     __tablename__ = "crawl_tasks"
     __table_args__ = (
@@ -165,6 +192,7 @@ class CrawlTask(Base):
     source_url: Mapped[str] = mapped_column(Text, index=True)
     page_url: Mapped[str] = mapped_column(Text, index=True)
     page_hash: Mapped[str] = mapped_column(String(64), index=True)
+    task_kind: Mapped[str] = mapped_column(String(32), index=True, default=CrawlTaskKind.LIST_PAGE.value)
     page_text_snapshot: Mapped[str] = mapped_column(Text, default="")
     allowed_tools: Mapped[str | None] = mapped_column(Text, nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)

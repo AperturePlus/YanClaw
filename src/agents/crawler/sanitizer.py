@@ -49,6 +49,9 @@ _RETIRED_HINTS = (
 )
 _SEPARATOR_RE = re.compile(r"[;,，；、/|]+")
 _BULLET_PREFIX_RE = re.compile(r"^[\s\d\.\-、:：\)\(]+")
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+_CJK_CHAR = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ebef"
+_CJK_INNER_SPACE_RE = re.compile(rf"(?<=[{_CJK_CHAR}])\s+(?=[{_CJK_CHAR}])")
 
 
 def sanitize_professor_payload(
@@ -97,9 +100,15 @@ def normalize_name(value: Any) -> str:
     text = _to_text(value)
     if not text:
         return ""
+    text = _ZERO_WIDTH_RE.sub("", text).replace("\u3000", " ")
     text = _BULLET_PREFIX_RE.sub("", text)
     text = " ".join(text.split())
+    text = _CJK_INNER_SPACE_RE.sub("", text)
     return text.strip()
+
+
+def normalize_name_key(value: Any) -> str:
+    return normalize_name(value)
 
 
 def normalize_title(value: Any) -> str | None:

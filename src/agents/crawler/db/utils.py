@@ -113,19 +113,58 @@ def _should_replace_org_unit_url(current: str, candidate: str) -> bool:
     candidate_clean = _normalize_url(candidate)
     if not candidate_clean:
         return False
-    if not current_clean:
+    if not current_clean or current_clean.startswith("about:org_unit:"):
         return True
-    current_score = 0
-    candidate_score = 0
-    if "/info/" in current_clean:
-        current_score += 4
-    if "/info/" in candidate_clean:
-        candidate_score += 4
-    current_depth = max(0, urlparse(current_clean).path.count("/") - 1)
-    candidate_depth = max(0, urlparse(candidate_clean).path.count("/") - 1)
-    current_score += current_depth
-    candidate_score += candidate_depth
-    return candidate_score > current_score
+    if candidate_clean.startswith("about:org_unit:"):
+        return False
+    return _org_unit_url_quality(candidate_clean) > _org_unit_url_quality(current_clean)
+
+
+def _org_unit_url_quality(url: str) -> int:
+    normalized = _normalize_url(url)
+    if not normalized:
+        return -999
+    if normalized.startswith("about:org_unit:"):
+        return -500
+
+    parsed = urlparse(normalized)
+    path = (parsed.path or "").lower().rstrip("/")
+    host = (parsed.hostname or "").lower()
+    depth = max(0, path.count("/") - 1)
+
+    score = 0
+    if parsed.scheme and parsed.netloc:
+        score += 20
+    if host and not host.startswith("www."):
+        score += 6
+    if path in {"", "/"}:
+        score += 40
+    elif depth <= 0:
+        score += 20
+    elif depth == 1:
+        score += 8
+    else:
+        score -= depth * 5
+
+    deep_faculty_or_detail_hints = (
+        "/info/",
+        "/szdw/",
+        "/jsdw/",
+        "/szll/",
+        "/qzjs/",
+        "/teacher/",
+        "/teachers/",
+        "/faculty/",
+        "/people/",
+        "tu-list",
+        "teacherlist",
+        "facultylist",
+    )
+    if any(token in path for token in deep_faculty_or_detail_hints):
+        score -= 45
+    if path.endswith((".htm", ".html", ".shtml", ".jsp")) and depth >= 1:
+        score -= 8
+    return score
 
 
 async def _sqlite_has_column(session: AsyncSession, table: str, column: str) -> bool:

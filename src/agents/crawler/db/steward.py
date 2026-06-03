@@ -14,7 +14,7 @@ from agents.crawler.models import (
     ProfessorAffiliation,
     StewardRun,
 )
-from agents.crawler.sanitizer import normalize_org_unit_name
+from agents.crawler.sanitizer import normalize_name_key, normalize_org_unit_name
 from agents.crawler.db.utils import _normalize_email, _normalize_homepage, _now_utc
 
 
@@ -100,6 +100,7 @@ async def match_academician_for_professor(
     clean_name = str(name or "").strip()
     if not clean_name:
         return None, ""
+    clean_name_key = normalize_name_key(clean_name)
     clean_org = normalize_org_unit_name(org_unit_name, default="")
     clean_email = _normalize_email(email)
     clean_homepage = _normalize_homepage(homepage)
@@ -111,22 +112,24 @@ async def match_academician_for_professor(
                 select(Academician)
                 .join(OrgUnit, Academician.org_unit_id == OrgUnit.id)
                 .where(
-                    Academician.name == clean_name,
+                    Academician.name_key == clean_name_key,
                     OrgUnit.name == clean_org,
                 )
+                .order_by(Academician.id.asc())
+                .limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if same_org is not None:
-            return same_org, "same_name_org_unit"
+            return same_org, "same_name_key_org_unit"
 
     if clean_email:
         by_email = (
             await session.execute(
                 select(Academician).where(
                     func.lower(Academician.email) == clean_email.lower(),
-                )
+                ).order_by(Academician.id.asc()).limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if by_email is not None:
             return by_email, "email_exact"
 
@@ -139,9 +142,9 @@ async def match_academician_for_professor(
                         Academician.homepage == candidate,
                         Academician.external_link == candidate,
                     )
-                )
+                ).order_by(Academician.id.asc()).limit(1)
             )
-        ).scalar_one_or_none()
+        ).scalars().first()
         if by_url is not None:
             return by_url, "profile_url_exact"
 
@@ -210,6 +213,30 @@ async def hard_delete_professor(session: AsyncSession, professor: Professor) -> 
         await session.delete(row)
     await session.delete(professor)
     await session.flush()
+
+
+async def delete_professor_duplicates_for_academician(
+    session: AsyncSession,
+    academician: Academician,
+) -> int:
+    if academician is None:
+        return 0
+    professors = (await session.execute(select(Professor).order_by(Professor.id.asc()))).scalars().all()
+    deleted = 0
+    for professor in professors:
+        match, _reason = await match_academician_for_professor(
+            session,
+            name=professor.name,
+            org_unit_name=professor.org_unit_name,
+            email=professor.email,
+            homepage=professor.homepage,
+            external_link=professor.external_link,
+        )
+        if match is None or int(match.id) != int(academician.id):
+            continue
+        await hard_delete_professor(session, professor)
+        deleted += 1
+    return deleted
 
 
 async def list_professor_academician_duplicates(
