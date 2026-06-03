@@ -34,8 +34,8 @@ async def create_run(
     return int(run.id)
 
 
-async def ensure_schema(session: AsyncSession) -> None:
-    await crawler_db.ensure_runtime_schema(session)
+async def ensure_schema(session: AsyncSession, *, repair_identity: bool = True) -> None:
+    await crawler_db.ensure_runtime_schema(session, repair_identity=repair_identity)
 
 
 async def finish_run(
@@ -86,6 +86,14 @@ async def add_audit(
 
 async def list_duplicates(session: AsyncSession) -> list[tuple[Professor, Academician, str]]:
     return await crawler_db.list_professor_academician_duplicates(session)
+
+
+async def list_identity_repair_candidates(session: AsyncSession) -> list[crawler_db.ProfessorIdentityRepairCandidate]:
+    return await crawler_db.list_professor_identity_repair_candidates(session)
+
+
+async def repair_identity_data(session: AsyncSession) -> crawler_db.ProfessorIdentityRepairSummary:
+    return await crawler_db.repair_professor_identity_data(session, apply=True)
 
 
 async def merge_and_optionally_delete_professor(

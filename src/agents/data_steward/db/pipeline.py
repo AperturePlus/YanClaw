@@ -35,12 +35,41 @@ async def process_one_database(
     try:
         await db.init_db()
         async with db.session() as session:
-            await repository.ensure_schema(session)
+            await repository.ensure_schema(session, repair_identity=False)
             run_id = await repository.create_run(
                 session,
                 mode=mode,
                 target_db=str(target_db),
             )
+
+            identity_candidates = await repository.list_identity_repair_candidates(session)
+            for candidate in identity_candidates:
+                duplicates_detected += 1
+                action = "merged" if mode == "apply" else "report_only"
+                await repository.add_audit(
+                    session,
+                    run_id=run_id,
+                    db_name=target_db.name,
+                    entity_type="professor",
+                    entity_id=candidate.keeper_id,
+                    issue_type="duplicate_professor_identity",
+                    reason=candidate.reason,
+                    confidence=1.0,
+                    evidence={
+                        "match_key": candidate.match_key,
+                        "keeper_id": candidate.keeper_id,
+                        "victim_ids": list(candidate.victim_ids),
+                        "professor_ids": list(candidate.professor_ids),
+                    },
+                    action=action,
+                    before_snapshot=None,
+                )
+                audits_written += 1
+            if mode == "apply":
+                if identity_candidates:
+                    identity_repair = await repository.repair_identity_data(session)
+                    duplicates_deleted += int(identity_repair.professors_merged or 0)
+                await repository.ensure_schema(session, repair_identity=True)
 
             duplicates = await repository.list_duplicates(session)
             for professor, academician, reason in duplicates:
