@@ -7,6 +7,7 @@ from agents.crawler import db as crawler_db
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.models import CrawlLogStatus
 from agents.crawler.url_heuristics import _same_site, _sanitize_url
+from agents.crawler.url_validation import normalize_crawlable_url
 
 
 class FetchScheduler:
@@ -20,6 +21,15 @@ class FetchScheduler:
         url = _sanitize_url(url)
         if not url:
             return None
+        normalized_url = normalize_crawlable_url(url)
+        if not normalized_url:
+            stats = getattr(agent, "_pipeline_stats", None)
+            if isinstance(stats, dict):
+                stats["invalid_urls_skipped"] = int(stats.get("invalid_urls_skipped", 0)) + 1
+            agent.execution_log.append(f"skip invalid_url url={url}")
+            agent.logger.warning("Skipping invalid URL before fetch: %s", url)
+            return None
+        url = normalized_url
         if not agent._within_depth(depth):
             agent.execution_log.append(f"skip depth url={url} depth={depth}")
             agent.logger.info("Skipping %s: depth %s exceeds max_depth=%s", url, depth, agent.max_depth)

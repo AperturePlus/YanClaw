@@ -23,6 +23,7 @@ from agents.crawler.fetchers.human_models import (
     JobQueue,
 )
 from agents.crawler.fetchers.human_server import create_app
+from agents.crawler.url_validation import normalize_crawlable_url
 from runtime.logger import get_logger
 
 
@@ -69,6 +70,18 @@ class HumanFetcherBridge:
     # -- Fetcher-compatible interface --
 
     async def fetch(self, url: str) -> FetchResult:
+        normalized_url = normalize_crawlable_url(url)
+        if not normalized_url:
+            self.logger.warning("Reject invalid URL before human queue url=%s", url)
+            return FetchResult(
+                url=url,
+                text="",
+                links=[],
+                status_code=0,
+                block_reason="invalid_url",
+                link_signals=(),
+            )
+        url = normalized_url
         job = FetchJob(
             url=url,
             context=self._context,

@@ -73,6 +73,21 @@ async def test_fetch_returns_empty_on_fail():
     assert result.block_reason == "login required"
 
 
+async def test_fetch_rejects_invalid_url_without_queueing_job():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    bad_url = (
+        "https://example.edu.cn/szdw/"
+        "%3Cspan%20style='color:red;font-size:9pt'%3E"
+        "%E8%BD%AC%E6%8D%A2%E9%93%BE%E6%8E%A5%E9%94%99%E8%AF%AF%3C/span"
+    )
+
+    result = await bridge.fetch(bad_url)
+
+    assert result.status_code == 0
+    assert result.block_reason == "invalid_url"
+    assert await bridge.queue.next(timeout=0.01) is None
+
+
 async def test_fetch_timeout():
     bridge = HumanFetcherBridge(job_timeout_seconds=0.1)
     result = await bridge.fetch("https://example.edu.cn/")
