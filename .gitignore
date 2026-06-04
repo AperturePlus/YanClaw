@@ -28,3 +28,11 @@ pytest_foo/
 node_modules/
 
 .claude/
+
+# Doppler & Env Security
+.doppler.yaml
+.env
+.env.*
+!.env.example
+!.env.*.example
+
