@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 from agents.crawler.fetchers import Fetcher
 from agents.crawler.models import OrgUnit
@@ -1267,6 +1267,18 @@ _PAGINATION_RE = re.compile(
 
 def _is_pagination_link(url: str) -> bool:
     return bool(_PAGINATION_RE.search(url))
+
+
+def _is_query_profile_detail_url(url: str) -> bool:
+    """Return True for CMS detail URLs whose identity lives in query params."""
+    parsed = urlparse((url or "").strip())
+    if not parsed.query:
+        return False
+    params: dict[str, str] = {}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        params[key.lower()] = value.strip()
+    action = params.get("action", "").lower()
+    return action == "detailteam" and bool(params.get("uuinid"))
 
 
 _URL_RE = re.compile(r"https?://[^\s\)\]\"'>]+")

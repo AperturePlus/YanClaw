@@ -12,6 +12,7 @@ from agents.crawler.url_heuristics import (
     _allow_faculty_candidate_for_org_unit,
     _is_non_faculty_noise_url,
     _is_faculty_platform,
+    _is_query_profile_detail_url,
     _org_unit_exclusion_match,
     _should_exclude_org_unit,
     _looks_like_org_unit_listing_url,
@@ -146,6 +147,17 @@ def test_non_faculty_noise_url_ignores_news_token_in_query_string():
     # Path-based news pages must still be flagged.
     assert _is_non_faculty_noise_url(
         "https://soft.buaa.edu.cn/news_list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078"
+    )
+
+
+def test_query_profile_detail_url_detects_scu_teamlist_detail_only():
+    assert _is_query_profile_detail_url(
+        "https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854"
+    )
+    assert not _is_query_profile_detail_url("https://saa.scu.edu.cn/teamlist.htm")
+    assert not _is_query_profile_detail_url("https://saa.scu.edu.cn/teamlist.htm?uuinUuteId=1761503632748933")
+    assert not _is_query_profile_detail_url(
+        "https://saa.scu.edu.cn/list.htm?m=1351479452361353&c=661618903336591&currentPage=1"
     )
 
 
