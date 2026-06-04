@@ -3,6 +3,8 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agents.crawler.url_heuristics import DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS
+
 
 class CrawlerSettings(BaseSettings):
     """Configuration loaded from environment variables or a local .env file."""
@@ -49,3 +51,8 @@ class CrawlerSettings(BaseSettings):
     task_recovery_enabled: bool = True
     target_org_units: list[str] = Field(default_factory=list)
     org_unit_match_threshold: float = Field(default=0.60, ge=0.0, le=1.0)
+    org_unit_exclude_enabled: bool = True
+    org_unit_exclude_keywords: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS)
+    )
+    org_unit_llm_filter_enabled: bool = True
