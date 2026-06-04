@@ -41,8 +41,12 @@ class FetchScheduler:
 
         resume_mode = bool(getattr(agent, "resume_mode", False))
         cross_run_dedup_enabled = resume_mode or not agent._skip_cross_run_dedup
+        force_refetch_urls = getattr(agent, "_resume_force_refetch_urls", set())
+        force_refetch = url in force_refetch_urls or url.rstrip("/") in force_refetch_urls
+        if force_refetch:
+            agent.execution_log.append(f"force refetch url={url}")
 
-        if resume_mode:
+        if resume_mode and not force_refetch:
             async with agent.db.session() as session:
                 cached = await crawler_db.get_cached_fetch_result(session, url)
             if cached is not None and not cached.block_reason:
@@ -62,7 +66,7 @@ class FetchScheduler:
                     cached.block_reason,
                 )
 
-        if url in agent.visited_urls and cross_run_dedup_enabled:
+        if url in agent.visited_urls and cross_run_dedup_enabled and not force_refetch:
             cached = agent._fetch_cache.get(url)
             if cached is not None and url == _sanitize_url(agent.start_url):
                 agent.execution_log.append(f"fetch cache url={url} depth={depth}")
@@ -73,12 +77,12 @@ class FetchScheduler:
             return None
 
         cached = agent._fetch_cache.get(url)
-        if cached is not None:
+        if cached is not None and not force_refetch:
             agent.execution_log.append(f"fetch cache url={url} depth={depth}")
             agent.logger.debug("Using cached URL: %s", url)
             return cached
 
-        if cross_run_dedup_enabled and (resume_mode or url != agent.start_url):
+        if cross_run_dedup_enabled and not force_refetch and (resume_mode or url != agent.start_url):
             async with agent.db.session() as session:
                 if await crawler_db.is_url_crawled(session, url):
                     agent.visited_urls.add(url)
@@ -87,6 +91,12 @@ class FetchScheduler:
                     return None
 
         agent.visited_urls.add(url)
+        if force_refetch:
+            try:
+                force_refetch_urls.discard(url)
+                force_refetch_urls.discard(url.rstrip("/"))
+            except AttributeError:
+                pass
         try:
             fetched = await agent.fetcher.fetch(url)
         except Exception as error:
