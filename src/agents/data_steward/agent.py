@@ -58,6 +58,8 @@ class DataStewardAgent:
             unmatched_universities=resolution.unmatched_universities,
             unmatched_db_roots=resolution.unmatched_db_roots,
             runs=summaries,
+            total_excluded_org_units_detected=sum(item.excluded_org_units_detected for item in summaries),
+            total_excluded_org_units_deleted=sum(item.excluded_org_units_deleted for item in summaries),
         )
 
     async def _classify_uncertain_with_llm(

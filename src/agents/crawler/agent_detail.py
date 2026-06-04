@@ -364,6 +364,7 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
                 llm_queue=llm_queue,
                 detail_mode=True,
                 priority=1,
+                requested_url=url,
             )
             continue
         await self._extract_professors_from_page(
@@ -371,6 +372,7 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
             fetched,
             skills,
             detail_mode=True,
+            requested_url=url,
         )
 
 

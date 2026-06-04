@@ -188,6 +188,8 @@ async def _crawl_async(
             + f"targets={len(steward_summary.targets)} "
             + f"duplicates={steward_summary.total_duplicates_detected} "
             + f"deleted={steward_summary.total_duplicates_deleted} "
+            + f"excluded_org_units={getattr(steward_summary, 'total_excluded_org_units_detected', 0)} "
+            + f"excluded_org_units_deleted={getattr(steward_summary, 'total_excluded_org_units_deleted', 0)} "
             + f"missing_audits={steward_summary.total_missing_field_audits}"
         )
 
@@ -458,6 +460,8 @@ def steward_run(
         + f" targets={len(summary.targets)} "
         + f"duplicates={summary.total_duplicates_detected} "
         + f"deleted={summary.total_duplicates_deleted} "
+        + f"excluded_org_units={getattr(summary, 'total_excluded_org_units_detected', 0)} "
+        + f"excluded_org_units_deleted={getattr(summary, 'total_excluded_org_units_deleted', 0)} "
         + f"missing_audits={summary.total_missing_field_audits} "
         + f"recrawl_tasks={summary.total_recrawl_tasks_upserted}"
     )
