@@ -18,6 +18,7 @@ from agents.crawler.sanitizer import (
     normalize_org_unit_name,
     normalize_title,
 )
+from agents.crawler.url_heuristics import _is_query_profile_detail_url
 from agents.crawler.db.university import get_or_create_org_unit
 from agents.crawler.db.utils import (
     _merge_org_unit_names,
@@ -539,6 +540,8 @@ def _is_usable_profile_homepage(url: str) -> bool:
         return False
     tail = path.rsplit("/", 1)[-1]
     stem = tail.rsplit(".", 1)[0]
+    if _is_query_profile_detail_url(normalized):
+        return True
     directory_stems = {
         "faculty",
         "teacher",
@@ -551,6 +554,8 @@ def _is_usable_profile_homepage(url: str) -> bool:
         "szll",
         "jzg",
         "jsml",
+        "list",
+        "teamlist",
         "teacherlist",
         "facultylist",
         "tu-list",
@@ -578,6 +583,8 @@ def _profile_url_quality(url: str | None) -> int:
     detail_hints = ("/info/", "/profile", "/detail", "/show", "/mentor")
     list_hints = ("/szdw", "/szll", "/jsdw", "/team", "/staff", "/directory")
 
+    if _is_query_profile_detail_url(normalized):
+        score += 95
     if any(token in path for token in detail_hints):
         score += 70
     if re.search(r"/info/\d+/\d+(\.s?html?)?$", path):

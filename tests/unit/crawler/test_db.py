@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select, text
 
 from agents.crawler import db as crawler_db
+from agents.crawler.db.professors import normalize_professor_homepage
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
@@ -211,6 +212,51 @@ async def test_upsert_professor_dedupes_same_org_unit_by_name_key(tmp_path):
         assert professors[0].name_key == "王俊"
         assert professors[0].email == "wangjun@example.edu.cn"
         assert affiliations[0].source_url == "https://soft.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_upsert_professor_dedupes_latin_name_with_cjk_alias_in_same_org_unit(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "latin_cjk_alias_professor.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        first = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Keizo Fujimoto",
+                "org_unit_name": "空间与地球科学学院",
+                "org_unit_url": "https://sse.buaa.edu.cn/",
+                "source_url": "https://sse.buaa.edu.cn/szll/bssds.htm",
+                "enrollment_pref": "硕导",
+            },
+        )
+        second = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Keizo Fujimoto (藤本桂三)",
+                "org_unit_name": "空间与地球科学学院",
+                "org_unit_url": "https://sse.buaa.edu.cn/",
+                "source_url": "https://sse.buaa.edu.cn/info/1204/6490.htm",
+                "title": "研究员",
+                "email": "fujimoto@buaa.edu.cn",
+                "research_areas": "空间物理；计算物理",
+                "bio": "2017-present: 北京航空航天大学。",
+            },
+        )
+        assert first.id == second.id
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        affiliation = (await session.execute(select(ProfessorAffiliation))).scalar_one()
+        assert professor.name == "Keizo Fujimoto"
+        assert professor.name_key == "Keizo Fujimoto"
+        assert professor.title == "研究员"
+        assert professor.email == "fujimoto@buaa.edu.cn"
+        assert professor.research_areas == "空间物理；计算物理"
+        assert professor.bio == "2017-present: 北京航空航天大学。"
+        assert professor.homepage == "https://sse.buaa.edu.cn/info/1204/6490.htm"
+        assert affiliation.source_url == "https://sse.buaa.edu.cn/info/1204/6490.htm"
 
     await db.close()
 
@@ -455,6 +501,72 @@ async def test_ensure_runtime_schema_repairs_professor_name_key_pollution(tmp_pa
         assert professors[0].email == "wangjun@example.edu.cn"
         assert professors[0].bio == "研究软件工程"
         assert affiliations[0].source_url == "https://soft.example.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+async def test_ensure_runtime_schema_repairs_latin_name_with_cjk_alias_duplicate(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "schema_latin_cjk_alias_repair.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        org_unit = OrgUnit(name="空间与地球科学学院", url="https://sse.buaa.edu.cn/", kind="college")
+        session.add(org_unit)
+        await session.flush()
+        clean = Professor(
+            name="Keizo Fujimoto",
+            name_key="Keizo Fujimoto",
+            org_unit_name="空间与地球科学学院",
+            enrollment_pref="硕导",
+            homepage="https://sse.buaa.edu.cn/info/1202/7126.htm",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        alias = Professor(
+            name="Keizo Fujimoto (藤本桂三)",
+            name_key="Keizo Fujimoto (藤本桂三)",
+            org_unit_name="空间与地球科学学院",
+            title="研究员",
+            email="fujimoto@buaa.edu.cn",
+            research_areas="空间物理；计算物理",
+            bio="2017-present: 北京航空航天大学。",
+            homepage="https://sse.buaa.edu.cn/info/1204/6490.htm",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([clean, alias])
+        await session.flush()
+        session.add_all(
+            [
+                ProfessorAffiliation(
+                    professor_id=clean.id,
+                    org_unit_id=org_unit.id,
+                    source_url="https://sse.buaa.edu.cn/szll/bssds.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+                ProfessorAffiliation(
+                    professor_id=alias.id,
+                    org_unit_id=org_unit.id,
+                    source_url="https://sse.buaa.edu.cn/info/1204/6490.htm",
+                    created_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        affiliation = (await session.execute(select(ProfessorAffiliation))).scalar_one()
+        assert professor.name == "Keizo Fujimoto"
+        assert professor.name_key == "Keizo Fujimoto"
+        assert professor.title == "研究员"
+        assert professor.email == "fujimoto@buaa.edu.cn"
+        assert professor.research_areas == "空间物理；计算物理"
+        assert professor.bio == "2017-present: 北京航空航天大学。"
+        assert professor.homepage == "https://sse.buaa.edu.cn/info/1204/6490.htm"
+        assert affiliation.source_url == "https://sse.buaa.edu.cn/info/1204/6490.htm"
 
     await db.close()
 
@@ -831,6 +943,56 @@ async def test_upsert_professor_prefers_detail_homepage_and_prevents_downgrade_t
         assert professor.homepage == "https://cs.testu.edu.cn/info/1001/1.htm"
         affiliation = (await session.execute(select(ProfessorAffiliation))).scalar_one()
         assert affiliation.source_url == "https://cs.testu.edu.cn/info/1001/1.htm"
+
+    await db.close()
+
+
+def test_normalize_professor_homepage_accepts_scu_query_detail_and_rejects_rosters():
+    detail_url = "https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854"
+
+    assert normalize_professor_homepage(detail_url) == detail_url
+    assert normalize_professor_homepage("https://saa.scu.edu.cn/teamlist.htm") is None
+    assert normalize_professor_homepage("https://saa.scu.edu.cn/teamlist.htm?uuinUuteId=1761503632748932") is None
+    assert normalize_professor_homepage("https://saa.scu.edu.cn/list.htm?m=1351479452361353") is None
+    assert normalize_professor_homepage(
+        "https://saa.scu.edu.cn/list.htm?m=1351479452361353&c=661618903336591&currentPage=1"
+    ) is None
+
+
+async def test_upsert_professor_promotes_scu_query_detail_homepage_from_roster(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "scu_query_detail_homepage.db"))
+    await db.init_db()
+    roster_url = "https://saa.scu.edu.cn/teamlist.htm?uuinUuteId=1761503632748933"
+    detail_url = "https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854"
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王靖宇",
+                "org_unit_name": "空天科学与工程学院",
+                "org_unit_url": "https://saa.scu.edu.cn/",
+                "source_url": roster_url,
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "王靖宇",
+                "org_unit_name": "空天科学与工程学院",
+                "org_unit_url": "https://saa.scu.edu.cn/",
+                "source_url": detail_url,
+                "email": "wangjingyu@scu.edu.cn",
+                "research_areas": "航空发动机旋转机械数值模拟方法研究",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        affiliation = (await session.execute(select(ProfessorAffiliation))).scalar_one()
+        assert professor.homepage == detail_url
+        assert professor.email == "wangjingyu@scu.edu.cn"
+        assert affiliation.source_url == detail_url
 
     await db.close()
 
