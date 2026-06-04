@@ -4,12 +4,22 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from agents.crawler import db as crawler_db
 from agents.crawler.config import CrawlerSettings
-from agents.crawler.models import Professor
+from agents.crawler.models import OrgUnit, Professor
+from agents.crawler.org_unit_filter import (
+    ExcludedOrgUnit,
+    hard_filter_org_unit_payloads,
+    llm_filter_org_unit_payloads,
+    org_unit_filter_item_keys,
+)
 from . import repository
 from agents.data_steward.types import StewardRunSummary
 from runtime.database import DatabaseManager
+from runtime.context import ContextManager
+from runtime.llm import LLMClient
 from runtime.logger import get_logger
+from runtime.skills import SkillManager
 
 
 UncertainClassifier = Callable[[list[dict[str, Any]], int], Awaitable[dict[int, dict[str, Any]]]]
@@ -28,9 +38,12 @@ async def process_one_database(
     db = DatabaseManager(_sqlite_url(target_db))
     duplicates_detected = 0
     duplicates_deleted = 0
+    excluded_org_units_detected = 0
+    excluded_org_units_deleted = 0
     missing_field_audits = 0
     recrawl_tasks_upserted = 0
     audits_written = 0
+    org_unit_cleanup: dict[str, int] = {}
     run_id: int | None = None
     try:
         await db.init_db()
@@ -41,6 +54,24 @@ async def process_one_database(
                 mode=mode,
                 target_db=str(target_db),
             )
+
+            (
+                excluded_org_units_detected,
+                excluded_org_units_deleted,
+                org_unit_cleanup,
+                org_unit_audits,
+            ) = await process_excluded_org_units(
+                session,
+                settings=settings,
+                db=db,
+                run_id=run_id,
+                db_name=target_db.name,
+                target_db=target_db,
+                mode=mode,
+                max_context_tokens=max_context_tokens,
+                llm_enabled=uncertain_classifier is not None,
+            )
+            audits_written += org_unit_audits
 
             identity_candidates = await repository.list_identity_repair_candidates(session)
             for candidate in identity_candidates:
@@ -181,6 +212,9 @@ async def process_one_database(
                 summary={
                     "duplicates_detected": duplicates_detected,
                     "duplicates_deleted": duplicates_deleted,
+                    "excluded_org_units_detected": excluded_org_units_detected,
+                    "excluded_org_units_deleted": excluded_org_units_deleted,
+                    "org_unit_cleanup": org_unit_cleanup,
                     "missing_field_audits": missing_field_audits,
                     "recrawl_tasks_upserted": recrawl_tasks_upserted,
                     "audits_written": audits_written,
@@ -194,9 +228,12 @@ async def process_one_database(
             status="completed",
             duplicates_detected=duplicates_detected,
             duplicates_deleted=duplicates_deleted,
+            excluded_org_units_detected=excluded_org_units_detected,
+            excluded_org_units_deleted=excluded_org_units_deleted,
             missing_field_audits=missing_field_audits,
             recrawl_tasks_upserted=recrawl_tasks_upserted,
             audits_written=audits_written,
+            org_unit_cleanup=org_unit_cleanup,
             backup_audit=backup_audit,
         )
     except Exception as error:
@@ -211,6 +248,9 @@ async def process_one_database(
                         "error": str(error),
                         "duplicates_detected": duplicates_detected,
                         "duplicates_deleted": duplicates_deleted,
+                        "excluded_org_units_detected": excluded_org_units_detected,
+                        "excluded_org_units_deleted": excluded_org_units_deleted,
+                        "org_unit_cleanup": org_unit_cleanup,
                         "missing_field_audits": missing_field_audits,
                         "recrawl_tasks_upserted": recrawl_tasks_upserted,
                         "audits_written": audits_written,
@@ -222,13 +262,101 @@ async def process_one_database(
             status="failed",
             duplicates_detected=duplicates_detected,
             duplicates_deleted=duplicates_deleted,
+            excluded_org_units_detected=excluded_org_units_detected,
+            excluded_org_units_deleted=excluded_org_units_deleted,
             missing_field_audits=missing_field_audits,
             recrawl_tasks_upserted=recrawl_tasks_upserted,
             audits_written=audits_written,
+            org_unit_cleanup=org_unit_cleanup,
             warnings=[str(error)],
         )
     finally:
         await db.close()
+
+
+async def process_excluded_org_units(
+    session: Any,
+    *,
+    settings: CrawlerSettings,
+    db: DatabaseManager,
+    run_id: int,
+    db_name: str,
+    target_db: Path,
+    mode: str,
+    max_context_tokens: int,
+    llm_enabled: bool,
+) -> tuple[int, int, dict[str, int], int]:
+    if not settings.org_unit_exclude_enabled:
+        return 0, 0, {}, 0
+
+    org_units = await crawler_db.list_org_units(session)
+    if not org_units:
+        return 0, 0, {}, 0
+
+    payloads = [_org_unit_payload(row) for row in org_units]
+    hard_result = hard_filter_org_unit_payloads(
+        payloads,
+        exclude_enabled=True,
+        keywords=list(settings.org_unit_exclude_keywords or []),
+    )
+    llm_result = None
+    if llm_enabled and settings.openai_api_key and hard_result.kept:
+        skill_manager = SkillManager(Path(settings.crawler_skills_dir), db, "crawler")
+        llm_result = await llm_filter_org_unit_payloads(
+            hard_result.kept,
+            llm_client=LLMClient(
+                settings.openai_base_url,
+                settings.openai_api_key,
+                settings.openai_model,
+                timeout_seconds=settings.llm_timeout_seconds,
+                temperature=settings.llm_temperature,
+                top_p=settings.llm_top_p,
+                seed=settings.llm_seed,
+                max_rounds=1,
+            ),
+            context_manager=ContextManager(settings.openai_model),
+            skills_text=skill_manager.select_for_state("EXTRACT_ORG_UNITS", set()).rendered_text,
+            university=target_db.stem,
+            source_url=str(target_db),
+            source="data_steward",
+            model_max_tokens=max_context_tokens,
+            logger=get_logger("steward.db.pipeline"),
+        )
+
+    excluded = list(hard_result.hard_excluded)
+    if llm_result is not None:
+        excluded.extend(llm_result.llm_excluded)
+    excluded_pairs = _match_excluded_org_units(org_units, excluded)
+    if not excluded_pairs:
+        return 0, 0, {}, 0
+
+    audits_written = 0
+    for org_unit, excluded_unit in excluded_pairs:
+        await repository.add_audit(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            entity_type="org_unit",
+            entity_id=int(org_unit.id) if org_unit.id is not None else None,
+            issue_type="excluded_org_unit",
+            reason=excluded_unit.category,
+            confidence=1.0 if excluded_unit.source == "hard" else 0.75,
+            evidence=excluded_unit.to_evidence(),
+            action="hard_deleted" if mode == "apply" else "report_only",
+            before_snapshot=_org_unit_snapshot(org_unit),
+        )
+        audits_written += 1
+
+    cleanup_summary: dict[str, int] = {}
+    deleted = 0
+    if mode == "apply":
+        cleanup_summary = await crawler_db.cleanup_excluded_org_units(
+            session,
+            [org_unit for org_unit, _excluded_unit in excluded_pairs],
+        )
+        deleted = int(cleanup_summary.get("org_units_deleted", 0) or 0)
+
+    return len(excluded_pairs), deleted, cleanup_summary, audits_written
 
 
 async def infer_missing_reason(
@@ -388,6 +516,52 @@ def _professor_snapshot(professor: Professor) -> dict[str, Any]:
         "enrollment_pref": professor.enrollment_pref,
         "publications": professor.publications,
     }
+
+
+def _org_unit_payload(org_unit: OrgUnit) -> dict[str, Any]:
+    return {
+        "id": int(org_unit.id) if org_unit.id is not None else None,
+        "name": org_unit.name,
+        "url": org_unit.url,
+        "kind": org_unit.kind,
+    }
+
+
+def _org_unit_snapshot(org_unit: OrgUnit) -> dict[str, Any]:
+    return {
+        "id": org_unit.id,
+        "name": org_unit.name,
+        "url": org_unit.url,
+        "kind": org_unit.kind,
+        "status": org_unit.status,
+        "discovered_from_url": org_unit.discovered_from_url,
+    }
+
+
+def _match_excluded_org_units(
+    org_units: list[OrgUnit],
+    excluded: list[ExcludedOrgUnit],
+) -> list[tuple[OrgUnit, ExcludedOrgUnit]]:
+    excluded_by_key: dict[str, ExcludedOrgUnit] = {}
+    for item in excluded:
+        for key in org_unit_filter_item_keys(item.to_evidence()):
+            excluded_by_key[key] = item
+    if not excluded_by_key:
+        return []
+
+    result: list[tuple[OrgUnit, ExcludedOrgUnit]] = []
+    seen_ids: set[int] = set()
+    for org_unit in org_units:
+        keys = org_unit_filter_item_keys(_org_unit_payload(org_unit))
+        matched = keys & excluded_by_key.keys()
+        if not matched:
+            continue
+        if org_unit.id is not None and int(org_unit.id) in seen_ids:
+            continue
+        if org_unit.id is not None:
+            seen_ids.add(int(org_unit.id))
+        result.append((org_unit, excluded_by_key[sorted(matched)[0]]))
+    return result
 
 
 def _sqlite_url(path: Path) -> str:

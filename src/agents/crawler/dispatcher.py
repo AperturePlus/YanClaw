@@ -13,6 +13,11 @@ from agents.crawler.agent import AgentResult, CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.fetchers import Fetcher, _site_root
 from agents.crawler.models import CrawlLogStatus, CrawlStatus
+from agents.crawler.org_unit_filter import (
+    hard_filter_org_unit_payloads,
+    llm_filter_org_unit_payloads,
+    org_unit_filter_item_keys,
+)
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
@@ -92,6 +97,7 @@ class CrawlDispatcher:
         )
         self.fetcher_factory = fetcher_factory or self._default_fetcher_factory(settings)
         self.logger = get_logger("crawler.dispatcher")
+        self._resume_cleaned_db_paths: set[Path] = set()
 
     @staticmethod
     def _default_fetcher_factory(settings: CrawlerSettings) -> FetcherFactory:
@@ -106,6 +112,7 @@ class CrawlDispatcher:
     async def run(self, universities: list[str] | None = None, *, resume: bool = False) -> DispatcherSummary:
         university_db_dir = Path(self.settings.university_db_dir)
         university_db_dir.mkdir(parents=True, exist_ok=True)
+        self._resume_cleaned_db_paths.clear()
 
         all_targets = crawler_db.load_university_targets_from_csv(self.settings.websites_path)
         explicit_universities = bool(universities)
@@ -203,6 +210,7 @@ class CrawlDispatcher:
 
     async def _inspect_progress(self, targets: list[_UniversityTarget], *, force_existing: bool = False) -> None:
         for university in targets:
+            cleanup_summary = await self._cleanup_excluded_org_units_for_resume(university)
             progress = await self._get_university_progress(university)
             if not progress.has_db:
                 self.logger.info(
@@ -212,7 +220,7 @@ class CrawlDispatcher:
                 continue
             action = (
                 "crawl"
-                if force_existing
+                if force_existing or university.db_path in self._resume_cleaned_db_paths
                 else (
                     "skip"
                     if (
@@ -225,16 +233,23 @@ class CrawlDispatcher:
             )
             status_text = progress.status.value if progress.status else "unknown"
             self.logger.info(
-                "Resume progress university=%s status=%s professors=%s retryable_fetch_failures=%s action=%s db=%s",
+                "Resume progress university=%s status=%s professors=%s retryable_fetch_failures=%s action=%s db=%s cleanup=%s",
                 university.name,
                 status_text,
                 progress.professor_count,
                 progress.retryable_fetch_failure_count,
                 action,
                 university.db_path,
+                cleanup_summary or {},
             )
 
     async def _should_skip(self, university: _UniversityTarget) -> bool:
+        if university.db_path in self._resume_cleaned_db_paths:
+            self.logger.info(
+                "Re-crawling %s because resume cleanup removed excluded org units",
+                university.name,
+            )
+            return False
         progress = await self._get_university_progress(university)
         if not progress.has_db:
             return False
@@ -259,6 +274,101 @@ class CrawlDispatcher:
             progress.professor_count,
         )
         return True
+
+    async def _cleanup_excluded_org_units_for_resume(self, university: _UniversityTarget) -> dict[str, int]:
+        if not university.db_path.exists():
+            return {}
+        if not self.settings.org_unit_exclude_enabled or self.settings.target_org_units:
+            return {}
+
+        db = DatabaseManager(_sqlite_url(university.db_path))
+        try:
+            await db.init_db()
+            async with db.session() as session:
+                await crawler_db.ensure_runtime_schema(session)
+                await crawler_db.ensure_university_meta(
+                    session,
+                    name=university.name,
+                    start_url=university.url,
+                    location=university.location,
+                )
+                org_units = await crawler_db.list_org_units(session)
+                if not org_units:
+                    return {}
+
+                payloads = [
+                    {
+                        "id": int(unit.id) if unit.id is not None else None,
+                        "name": unit.name,
+                        "url": unit.url,
+                        "kind": unit.kind,
+                    }
+                    for unit in org_units
+                ]
+                hard_result = hard_filter_org_unit_payloads(
+                    payloads,
+                    exclude_enabled=True,
+                    keywords=list(self.settings.org_unit_exclude_keywords or []),
+                )
+                llm_result = None
+                if (
+                    self.settings.org_unit_llm_filter_enabled
+                    and self.settings.openai_api_key
+                    and hard_result.kept
+                ):
+                    skill_manager = SkillManager(
+                        Path(self.settings.crawler_skills_dir),
+                        db,
+                        "crawler",
+                    )
+                    llm_result = await llm_filter_org_unit_payloads(
+                        hard_result.kept,
+                        llm_client=self.llm_client_factory(),
+                        context_manager=ContextManager(self.settings.openai_model),
+                        skills_text=skill_manager.select_for_state("EXTRACT_ORG_UNITS", set()).rendered_text,
+                        university=university.name,
+                        source_url=university.url,
+                        source="dispatcher_resume",
+                        model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
+                        logger=self.logger,
+                    )
+
+                excluded = list(hard_result.hard_excluded)
+                if llm_result is not None:
+                    excluded.extend(llm_result.llm_excluded)
+                if not excluded:
+                    return {}
+
+                excluded_keys: set[str] = set()
+                for item in excluded:
+                    excluded_keys.update(org_unit_filter_item_keys(item.to_evidence()))
+                excluded_units = [
+                    unit
+                    for unit in org_units
+                    if org_unit_filter_item_keys(
+                        {
+                            "id": int(unit.id) if unit.id is not None else None,
+                            "name": unit.name,
+                            "url": unit.url,
+                        }
+                    )
+                    & excluded_keys
+                ]
+                if not excluded_units:
+                    return {}
+
+                cleanup_summary = await crawler_db.cleanup_excluded_org_units(session, excluded_units)
+                self._resume_cleaned_db_paths.add(university.db_path)
+                self.logger.info(
+                    "Resume cleaned excluded org units university=%s excluded=%s sample=%s summary=%s",
+                    university.name,
+                    len(excluded_units),
+                    [item.to_evidence() for item in excluded[:5]],
+                    cleanup_summary,
+                )
+                return {key: int(value or 0) for key, value in cleanup_summary.items()}
+        finally:
+            await db.close()
 
     async def _get_university_progress(self, university: _UniversityTarget) -> _UniversityProgress:
         if not university.db_path.exists():

@@ -25,6 +25,12 @@ from agents.crawler.models import (
     OrgUnitStatus,
     UniversityMeta,
 )
+from agents.crawler.org_unit_filter import (
+    hard_filter_org_unit_payloads,
+    llm_filter_org_unit_payloads,
+    normalize_org_unit_match_text,
+    org_unit_filter_item_keys,
+)
 from agents.crawler.prompt_builder import CrawlerPromptBuilder
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
@@ -55,7 +61,6 @@ from agents.crawler.url_heuristics import (
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
     _looks_like_retired_url,
-    _org_unit_exclusion_match,
     _org_unit_faculty_priority,
     _rank_faculty_page_candidates,
     _rank_org_unit_page_candidates,
@@ -893,10 +898,7 @@ class CrawlerAgent:
 
     @staticmethod
     def _normalize_org_unit_match_text(value: str) -> str:
-        text = str(value or "").strip().lower()
-        if not text:
-            return ""
-        return re.sub(r"[\s\-_·,，、/\\|:：;；\(\)（）\[\]【】{}<>《》]+", "", text)
+        return normalize_org_unit_match_text(value)
 
     @classmethod
     def _org_unit_match_score(cls, query: str, candidate: str) -> float:
@@ -953,31 +955,46 @@ class CrawlerAgent:
         )
 
     def _hard_excluded_org_units(self, org_units: list[OrgUnit]) -> tuple[list[OrgUnit], list[dict[str, str]]]:
-        excluded: list[OrgUnit] = []
-        preview: list[dict[str, str]] = []
         if not self.org_unit_exclude_enabled:
-            return excluded, preview
-        for unit in org_units:
-            name = str(getattr(unit, "name", "") or "").strip()
-            if not name or self._matches_target_org_unit_name(name):
-                continue
-            match = _org_unit_exclusion_match(
-                name=name,
-                kind=str(getattr(unit, "kind", "") or "").strip() or None,
-                url=str(getattr(unit, "url", "") or "").strip() or None,
-                keywords=self.org_unit_exclude_keywords,
+            return [], []
+        payloads = [
+            {
+                "id": int(unit.id) if unit.id is not None else None,
+                "name": unit.name,
+                "url": unit.url,
+                "kind": unit.kind,
+            }
+            for unit in org_units
+        ]
+        result = hard_filter_org_unit_payloads(
+            payloads,
+            exclude_enabled=True,
+            keywords=self.org_unit_exclude_keywords,
+            target_name_matcher=self._matches_target_org_unit_name,
+        )
+        excluded_keys = set()
+        for item in result.hard_excluded:
+            excluded_keys.update(org_unit_filter_item_keys(item.to_evidence()))
+        excluded = [
+            unit
+            for unit in org_units
+            if org_unit_filter_item_keys(
+                {
+                    "id": int(unit.id) if unit.id is not None else None,
+                    "name": unit.name,
+                    "url": unit.url,
+                }
             )
-            if match is None:
-                continue
-            excluded.append(unit)
-            if len(preview) < 10:
-                preview.append(
-                    {
-                        "name": name,
-                        "url": str(getattr(unit, "url", "") or ""),
-                        "reason": match.reason,
-                    }
-                )
+            & excluded_keys
+        ]
+        preview = [
+            {
+                "name": item.name,
+                "url": item.url,
+                "reason": item.reason,
+            }
+            for item in result.hard_excluded[:10]
+        ]
         return excluded, preview
 
     async def _filter_existing_org_units_for_discovery(
@@ -1029,44 +1046,24 @@ class CrawlerAgent:
         if not units or self.target_org_units or not self.org_unit_exclude_enabled:
             return units
 
-        hard_kept: list[dict[str, Any]] = []
-        hard_excluded: list[dict[str, str]] = []
-        for unit in units:
-            name = str(unit.get("name") or "").strip()
-            if not name:
-                continue
-            if self._matches_target_org_unit_name(name):
-                hard_kept.append(unit)
-                continue
-            match = _org_unit_exclusion_match(
-                name=name,
-                kind=str(unit.get("kind") or "").strip() or None,
-                url=str(unit.get("url") or "").strip() or None,
-                keywords=self.org_unit_exclude_keywords,
-            )
-            if match is None:
-                hard_kept.append(unit)
-                continue
-            hard_excluded.append(
-                {
-                    "name": name,
-                    "url": str(unit.get("url") or ""),
-                    "reason": match.reason,
-                }
-            )
-
-        if hard_excluded:
+        hard_result = hard_filter_org_unit_payloads(
+            units,
+            exclude_enabled=True,
+            keywords=self.org_unit_exclude_keywords,
+            target_name_matcher=self._matches_target_org_unit_name,
+        )
+        if hard_result.hard_excluded:
             self.logger.info(
                 "Org-unit hard exclusion university=%s source=%s page=%s excluded=%s sample=%s",
                 self.university_name,
                 source,
                 source_url,
-                len(hard_excluded),
-                hard_excluded[:5],
+                len(hard_result.hard_excluded),
+                [item.to_evidence() for item in hard_result.hard_excluded[:5]],
             )
 
         return await self._filter_org_unit_payloads_with_llm(
-            hard_kept,
+            hard_result.kept,
             source_url=source_url,
             source=source,
         )
@@ -1081,94 +1078,19 @@ class CrawlerAgent:
         if not units or not self.org_unit_llm_filter_enabled:
             return units
 
-        payload = {
-            "allowed_tools": [],
-            "filter_task": "org_unit_exclusion",
-            "instruction": (
-                "Filter only org units that clearly belong to excluded categories: arts, sports, "
-                "Sino-foreign/joint programs, or basic teaching centers. Do not apply a broad "
-                "academic whitelist. Return JSON with included_org_units and excluded_org_units."
-            ),
-            "org_units": [
-                {
-                    "name": str(unit.get("name") or ""),
-                    "url": str(unit.get("url") or ""),
-                    "kind": str(unit.get("kind") or ""),
-                }
-                for unit in units
-            ],
-            "source": source,
-            "state": CrawlerState.EXTRACT_ORG_UNITS.value,
-            "university": self.university_name,
-            "url": source_url,
-        }
-        user_content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        self._record_llm_payload(len(user_content.encode("utf-8", errors="ignore")))
         skills_text = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
-        batches = self.context_manager.build_messages(
-            "You are a cautious university org-unit filter. When uncertain, keep the org unit.",
-            [],
-            skills_text,
-            user_content,
-            min(int(self.model_max_tokens), 16000),
-            dynamic_system_content="Tool call policy: Do not call any tools.",
+        result = await llm_filter_org_unit_payloads(
+            units,
+            llm_client=self.llm_client,
+            context_manager=self.context_manager,
+            skills_text=skills_text,
+            university=self.university_name,
+            source_url=source_url,
+            source=source,
+            model_max_tokens=self.model_max_tokens,
+            logger=self.logger,
         )
-
-        try:
-            final_result = None
-            for batch in batches:
-                final_result = await self.llm_client.chat(batch, tools=None, tool_handlers={})
-        except Exception as error:
-            self.logger.warning(
-                "Org-unit LLM exclusion failed university=%s source=%s page=%s error=%s; keeping candidates",
-                self.university_name,
-                source,
-                source_url,
-                error,
-            )
-            return units
-
-        parsed = self._parse_json_from_text(getattr(final_result, "content", "") if final_result else "")
-        if not isinstance(parsed, dict):
-            self.logger.warning(
-                "Org-unit LLM exclusion returned invalid JSON university=%s source=%s page=%s; keeping candidates",
-                self.university_name,
-                source,
-                source_url,
-            )
-            return units
-
-        included = parsed.get("included_org_units")
-        excluded = parsed.get("excluded_org_units")
-        if not isinstance(included, list) or not isinstance(excluded, list):
-            self.logger.warning(
-                "Org-unit LLM exclusion missing included/excluded lists university=%s source=%s page=%s; keeping candidates",
-                self.university_name,
-                source,
-                source_url,
-            )
-            return units
-
-        excluded_keys: set[str] = set()
-        excluded_preview: list[Any] = []
-        for item in excluded:
-            keys = self._org_unit_filter_item_keys(item)
-            if not keys:
-                continue
-            excluded_keys.update(keys)
-            if len(excluded_preview) < 5:
-                excluded_preview.append(item)
-
-        if not excluded_keys:
-            return units
-
-        kept: list[dict[str, Any]] = []
-        for unit in units:
-            if self._org_unit_filter_item_keys(unit) & excluded_keys:
-                continue
-            kept.append(unit)
-
-        dropped = len(units) - len(kept)
+        dropped = len(units) - len(result.kept)
         if dropped:
             self.logger.info(
                 "Org-unit LLM exclusion university=%s source=%s page=%s excluded=%s sample=%s",
@@ -1176,35 +1098,12 @@ class CrawlerAgent:
                 source,
                 source_url,
                 dropped,
-                excluded_preview,
+                [item.to_evidence() for item in result.llm_excluded[:5]],
             )
-        return kept
+        return result.kept
 
     def _org_unit_filter_item_keys(self, item: Any) -> set[str]:
-        if isinstance(item, str):
-            name = item
-            url = ""
-            raw_id = None
-        elif isinstance(item, dict):
-            name = str(item.get("name") or item.get("org_unit_name") or "")
-            url = str(item.get("url") or item.get("org_unit_url") or "")
-            raw_id = item.get("id") or item.get("org_unit_id")
-        else:
-            return set()
-
-        keys: set[str] = set()
-        try:
-            if raw_id is not None:
-                keys.add(f"id:{int(raw_id)}")
-        except (TypeError, ValueError):
-            pass
-        normalized_name = self._normalize_org_unit_match_text(name)
-        if normalized_name:
-            keys.add(f"name:{normalized_name}")
-        normalized_url = _sanitize_url(url)
-        if normalized_url:
-            keys.add(f"url:{normalized_url}")
-        return keys
+        return org_unit_filter_item_keys(item)
 
     async def _set_org_unit_status(self, org_unit_id: int | None, status: OrgUnitStatus) -> None:
         if org_unit_id is None:
@@ -1873,6 +1772,63 @@ class CrawlerAgent:
                 float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
             )
 
+    @staticmethod
+    def _redirect_identity_key(url: str) -> tuple[str, str, str]:
+        clean = _sanitize_url(url) or url or ""
+        parsed = urlparse(clean)
+        path = (parsed.path or "/").lower()
+        path = re.sub(r"/(?:index|default)\.(?:html?|shtml|php|jsp|aspx?)$", "/", path)
+        if path != "/":
+            path = path.rstrip("/")
+        return ((parsed.hostname or "").lower(), path or "/", parsed.query)
+
+    @staticmethod
+    def _is_home_path(path: str) -> bool:
+        normalized = (path or "/").lower()
+        normalized = re.sub(r"/(?:index|default)\.(?:html?|shtml|php|jsp|aspx?)$", "/", normalized)
+        return normalized in {"", "/"}
+
+    def _should_skip_redirected_extraction(
+        self,
+        requested_url: str,
+        final_url: str,
+        *,
+        detail_mode: bool,
+    ) -> tuple[bool, str]:
+        requested = _sanitize_url(requested_url) or ""
+        final = _sanitize_url(final_url) or requested
+        if not requested or not final:
+            return False, ""
+        if self._redirect_identity_key(requested) == self._redirect_identity_key(final):
+            return False, ""
+
+        requested_path = urlparse(requested).path or "/"
+        final_path = urlparse(final).path or "/"
+        if self._is_home_path(final_path) and not self._is_home_path(requested_path):
+            return True, "redirect_to_home"
+
+        current_dir = self._derive_section_prefix(requested_path)
+        if not current_dir:
+            return False, ""
+        prefix = current_dir.rstrip("/")
+        normalized_final_path = (final_path or "/").lower().rstrip("/") or "/"
+        if normalized_final_path == prefix or normalized_final_path.startswith(prefix + "/"):
+            return False, ""
+        if detail_mode and agent_detail._looks_like_profile_detail_url(final):
+            return False, ""
+        if not detail_mode and _looks_like_faculty_page(final):
+            return False, ""
+        return True, "redirect_left_section"
+
+    def _record_redirected_extraction_skip(self, *, detail_mode: bool) -> None:
+        self._pipeline_stats["redirect_skipped"] = int(self._pipeline_stats.get("redirect_skipped", 0)) + 1
+        key = "detail_redirect_skipped" if detail_mode else "list_redirect_skipped"
+        self._pipeline_stats[key] = int(self._pipeline_stats.get(key, 0)) + 1
+        if detail_mode:
+            self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
+        else:
+            self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+
     async def _enqueue_extraction_task(
         self,
         current: _QueuedUrl,
@@ -1881,10 +1837,34 @@ class CrawlerAgent:
         llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
         detail_mode: bool,
         priority: int,
+        requested_url: str | None = None,
     ) -> None:
-        source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
+        source_url = _sanitize_url(requested_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return
+        final_url = _sanitize_url(fetched.url) or source_url
+        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
+            source_url,
+            final_url,
+            detail_mode=detail_mode,
+        )
+        if skip_redirect:
+            self._record_redirected_extraction_skip(detail_mode=detail_mode)
+            self.logger.warning(
+                "Skip extraction task after redirect source=%s final=%s detail_mode=%s reason=%s",
+                source_url,
+                final_url,
+                detail_mode,
+                redirect_reason,
+            )
+            return
+        if final_url != source_url:
+            self.logger.debug(
+                "Extraction task keeps requested URL after redirect source=%s final=%s detail_mode=%s",
+                source_url,
+                final_url,
+                detail_mode,
+            )
         text_limit = self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode)
         snapshot = self._compact_page_text(fetched.text or "", text_limit)
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
@@ -2757,11 +2737,35 @@ class CrawlerAgent:
         skills: str,
         *,
         detail_mode: bool,
+        requested_url: str | None = None,
     ) -> int:
         saved_before = self.saved_professors
-        source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
+        source_url = _sanitize_url(requested_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return 0
+        final_url = _sanitize_url(fetched.url) or source_url
+        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
+            source_url,
+            final_url,
+            detail_mode=detail_mode,
+        )
+        if skip_redirect:
+            self._record_redirected_extraction_skip(detail_mode=detail_mode)
+            self.logger.warning(
+                "Skip synchronous extraction after redirect source=%s final=%s detail_mode=%s reason=%s",
+                source_url,
+                final_url,
+                detail_mode,
+                redirect_reason,
+            )
+            return 0
+        if final_url != source_url:
+            self.logger.debug(
+                "Synchronous extraction keeps requested URL after redirect source=%s final=%s detail_mode=%s",
+                source_url,
+                final_url,
+                detail_mode,
+            )
         snapshot = self._compact_page_text(
             fetched.text or "",
             self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode),
