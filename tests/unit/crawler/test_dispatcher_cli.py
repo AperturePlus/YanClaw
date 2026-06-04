@@ -601,6 +601,71 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
     await db.close()
 
 
+async def test_dispatcher_resume_cleans_excluded_org_units_before_skip(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Continue A",
+                "title": "Professor",
+                "org_unit_name": "继续教育学院",
+                "org_unit_url": "https://jxjy.a.example.edu.cn/",
+                "source_url": "https://jxjy.a.example.edu.cn/faculty",
+            },
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        assert [unit.name for unit in org_units] == ["CS"]
+        assert [professor.name for professor in professors] == ["Ada"]
+    await db.close()
+
+
 async def test_dispatcher_resume_mode_reruns_completed_db_with_retryable_fetch_failure(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(

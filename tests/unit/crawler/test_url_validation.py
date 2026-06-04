@@ -89,7 +89,26 @@ def test_org_unit_exclusion_hard_rules_match_blacklisted_units():
     assert _should_exclude_org_unit(name="国际联合学院", url="https://joint.example.edu.cn/")
     assert _should_exclude_org_unit(name="基教中心", url="https://basic.example.edu.cn/")
     assert _should_exclude_org_unit(name="基础教学部", url="https://basic.example.edu.cn/")
+    assert _should_exclude_org_unit(name="继续教育学院", url="https://jxjy.example.edu.cn/")
+    assert _should_exclude_org_unit(name="成人教育学院", url="https://adult.example.edu.cn/")
+    assert _should_exclude_org_unit(name="网络教育学院", url="https://online.example.edu.cn/")
+    assert _should_exclude_org_unit(name="吴玉章书院", url="https://wyz.example.edu.cn/")
+    assert _should_exclude_org_unit(name="北航学院", url="https://bhxy.buaa.edu.cn/")
+    assert _should_exclude_org_unit(name="卓越工程师学院", url="https://engineer.example.edu.cn/")
+    assert _should_exclude_org_unit(name="卓工学院", url="https://elite.example.edu.cn/")
     assert _org_unit_exclusion_match(name="格拉斯哥学院", url="https://glasgow.example.edu.cn/").category == "joint_program"
+    assert (
+        _org_unit_exclusion_match(name="继续教育学院", url="https://jxjy.example.edu.cn/").category
+        == "continuing_education"
+    )
+    assert (
+        _org_unit_exclusion_match(name="吴玉章书院", url="https://wyz.example.edu.cn/").category
+        == "undergraduate_teaching_unit"
+    )
+    assert (
+        _org_unit_exclusion_match(name="卓越工程师学院", url="https://engineer.example.edu.cn/").category
+        == "excellent_engineer_program"
+    )
 
 
 def test_org_unit_exclusion_hard_rules_avoid_false_positives():
@@ -99,6 +118,10 @@ def test_org_unit_exclusion_hard_rules_avoid_false_positives():
     assert not _should_exclude_org_unit(name="医学院", url="https://med.example.edu.cn/")
     assert not _should_exclude_org_unit(name="农学院", url="https://agri.example.edu.cn/")
     assert not _should_exclude_org_unit(name="外国语学院", url="https://foreign.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="教育学院", url="https://edu.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="高等教育研究院", url="https://ihe.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="航空学院", url="https://aviation.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="软件学院", url="https://software.example.edu.cn/")
 
 
 def test_retired_content_not_triggered_on_mixed_faculty_tabs():
@@ -268,6 +291,45 @@ def test_select_balanced_candidates_drops_elite_when_full_exists():
     assert "https://scse.buaa.edu.cn/szdw/jsdw.htm" in selected_urls
     assert "https://scse.buaa.edu.cn/szdw/js.htm" in selected_urls
     assert "https://scse.buaa.edu.cn/szdw/jcrc.htm" not in selected_urls
+
+
+def test_buaa_active_teacher_roster_is_selected_before_elite_talent_page():
+    roster_url = "https://dept3.buaa.edu.cn/szjs/zzjs/znxtykzgcx.htm"
+    elite_url = "https://dept3.buaa.edu.cn/szjs/jcrc.htm"
+    mentor_url = "https://dept3.buaa.edu.cn/szjs/yjsds.htm"
+    assessed = _assess_structural_faculty_candidates(
+        [elite_url, mentor_url, roster_url],
+        link_signals=(
+            LinkSignal(
+                url=elite_url,
+                anchor_text="杰出人才",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=1,
+            ),
+            LinkSignal(
+                url=mentor_url,
+                anchor_text="研究生导师",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=2,
+            ),
+            LinkSignal(
+                url=roster_url,
+                anchor_text="在职教师",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=3,
+            ),
+        ),
+    )
+
+    roster = next(item for item in assessed if item.url == roster_url)
+    selected_urls = [item.url for item in _select_balanced_faculty_candidates(assessed, limit=4)]
+
+    assert roster.page_type == FACULTY_PAGE_TYPE_FULL
+    assert roster_url in selected_urls
+    assert elite_url not in selected_urls
 
 
 def test_assess_structural_candidates_tie_break_is_stable_without_signals():

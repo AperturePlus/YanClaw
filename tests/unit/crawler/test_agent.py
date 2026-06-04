@@ -785,6 +785,9 @@ async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp
                 "https://sports.example.edu.cn/",
                 "https://pitt.example.edu.cn/",
                 "https://basic.example.edu.cn/",
+                "https://jxjy.example.edu.cn/",
+                "https://wyz.example.edu.cn/",
+                "https://engineer.example.edu.cn/",
             ],
             200,
         ),
@@ -810,6 +813,9 @@ async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp
         "https://sports.example.edu.cn/": FetchResult("https://sports.example.edu.cn/", "体育学院", [], 200),
         "https://pitt.example.edu.cn/": FetchResult("https://pitt.example.edu.cn/", "匹兹堡学院", [], 200),
         "https://basic.example.edu.cn/": FetchResult("https://basic.example.edu.cn/", "基教中心", [], 200),
+        "https://jxjy.example.edu.cn/": FetchResult("https://jxjy.example.edu.cn/", "继续教育学院", [], 200),
+        "https://wyz.example.edu.cn/": FetchResult("https://wyz.example.edu.cn/", "吴玉章书院", [], 200),
+        "https://engineer.example.edu.cn/": FetchResult("https://engineer.example.edu.cn/", "卓越工程师学院", [], 200),
     }
 
     class OrgUnitFilterLLM(FakeLLM):
@@ -837,6 +843,9 @@ async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp
                                 {"name": "体育学院", "url": "https://sports.example.edu.cn/", "kind": "college"},
                                 {"name": "匹兹堡学院", "url": "https://pitt.example.edu.cn/", "kind": "college"},
                                 {"name": "基教中心", "url": "https://basic.example.edu.cn/", "kind": "center"},
+                                {"name": "继续教育学院", "url": "https://jxjy.example.edu.cn/", "kind": "college"},
+                                {"name": "吴玉章书院", "url": "https://wyz.example.edu.cn/", "kind": "college"},
+                                {"name": "卓越工程师学院", "url": "https://engineer.example.edu.cn/", "kind": "college"},
                             ]
                         },
                         ensure_ascii=False,
@@ -867,6 +876,9 @@ async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp
     assert "https://sports.example.edu.cn/" not in fetcher.calls
     assert "https://pitt.example.edu.cn/" not in fetcher.calls
     assert "https://basic.example.edu.cn/" not in fetcher.calls
+    assert "https://jxjy.example.edu.cn/" not in fetcher.calls
+    assert "https://wyz.example.edu.cn/" not in fetcher.calls
+    assert "https://engineer.example.edu.cn/" not in fetcher.calls
     await db.close()
 
 
@@ -886,6 +898,42 @@ async def test_agent_keeps_org_units_when_llm_filter_returns_invalid_json(tmp_pa
     )
 
     assert [unit["name"] for unit in units] == ["国际学院"]
+    await db.close()
+
+
+async def test_agent_excludes_person_named_teaching_units_from_llm_filter(tmp_path):
+    class PersonNamedFilterLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("filter_task") == "org_unit_exclusion":
+                org_units = payload.get("org_units") or []
+                excluded = [
+                    {**item, "reason": "person_named_teaching_unit"}
+                    for item in org_units
+                    if str(item.get("name") or "") in {"钱学森学院", "蔡元培学院"}
+                ]
+                included = [item for item in org_units if str(item.get("name") or "") not in {"钱学森学院", "蔡元培学院"}]
+                return LLMResult(
+                    json.dumps(
+                        {"included_org_units": included, "excluded_org_units": excluded},
+                        ensure_ascii=False,
+                    )
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(tmp_path, PersonNamedFilterLLM())
+    units = await agent._filter_org_unit_payloads_for_discovery(
+        [
+            {"name": "钱学森学院", "url": "https://qxs.example.edu.cn/", "kind": "college"},
+            {"name": "蔡元培学院", "url": "https://cyp.example.edu.cn/", "kind": "college"},
+            {"name": "航空学院", "url": "https://aviation.example.edu.cn/", "kind": "college"},
+            {"name": "软件学院", "url": "https://software.example.edu.cn/", "kind": "college"},
+        ],
+        source_url="https://www.example.edu.cn/orgs",
+        source="unit_test",
+    )
+
+    assert [unit["name"] for unit in units] == ["航空学院", "软件学院"]
     await db.close()
 
 
@@ -911,6 +959,9 @@ async def test_agent_resume_skips_existing_blacklisted_org_units(tmp_path):
         ),
         "https://art.example.edu.cn/": FetchResult("https://art.example.edu.cn/", "艺术学院", [], 200),
         "https://pitt.example.edu.cn/": FetchResult("https://pitt.example.edu.cn/", "匹兹堡学院", [], 200),
+        "https://jxjy.example.edu.cn/": FetchResult("https://jxjy.example.edu.cn/", "继续教育学院", [], 200),
+        "https://bhxy.example.edu.cn/": FetchResult("https://bhxy.example.edu.cn/", "北航学院", [], 200),
+        "https://engineer.example.edu.cn/": FetchResult("https://engineer.example.edu.cn/", "卓工学院", [], 200),
     }
 
     class ResumeFilterLLM(FakeLLM):
@@ -960,6 +1011,24 @@ async def test_agent_resume_skips_existing_blacklisted_org_units(tmp_path):
             url="https://pitt.example.edu.cn/",
             kind="college",
         )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="继续教育学院",
+            url="https://jxjy.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="北航学院",
+            url="https://bhxy.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="卓工学院",
+            url="https://engineer.example.edu.cn/",
+            kind="college",
+        )
 
     result = await agent.run()
 
@@ -967,6 +1036,9 @@ async def test_agent_resume_skips_existing_blacklisted_org_units(tmp_path):
     assert "https://cs.example.edu.cn/faculty" in fetcher.calls
     assert "https://art.example.edu.cn/" not in fetcher.calls
     assert "https://pitt.example.edu.cn/" not in fetcher.calls
+    assert "https://jxjy.example.edu.cn/" not in fetcher.calls
+    assert "https://bhxy.example.edu.cn/" not in fetcher.calls
+    assert "https://engineer.example.edu.cn/" not in fetcher.calls
     async with db.session() as session:
         remaining_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
         assert [unit.name for unit in remaining_units] == ["计算机学院"]
@@ -1292,6 +1364,31 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
     assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
     assert rows[1].page_hash == incoming_hash
     assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
+    await db.close()
+
+
+async def test_enqueue_extraction_task_skips_detail_redirect_to_home(tmp_path):
+    source_url = "https://dept3.buaa.edu.cn/info/1191/2837.htm"
+    final_url = "https://dept3.buaa.edu.cn/"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    agent.start_url = "https://www.buaa.edu.cn/"
+    llm_queue: asyncio.Queue = asyncio.Queue()
+
+    await agent._enqueue_extraction_task(
+        _QueuedUrl(url=source_url, depth=4, label="自动化科学与电气工程学院"),
+        FetchResult(final_url, "自动化科学与电气工程学院 首页 新闻资讯 师资建设", [], 200),
+        llm_queue=llm_queue,
+        detail_mode=True,
+        priority=0,
+    )
+
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("detail_redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("detail_skipped", 0)) == 1
+    async with db.session() as session:
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+    assert rows == []
     await db.close()
 
 
@@ -2873,6 +2970,130 @@ async def test_buaa_computer_subcategory_pages_enter_crawl_task_queue(tmp_path):
     assert "https://scse.buaa.edu.cn/szdw/qtjs/6.htm" in task_urls
     assert len(task_urls) >= 4
     assert org_unit.url == "https://scse.buaa.edu.cn"
+    await db.close()
+
+
+async def test_buaa_automation_active_teacher_roster_enters_task_queue(tmp_path):
+    from agents.crawler.fetchers.link_signals import LinkSignal
+
+    home_url = "https://dept3.buaa.edu.cn/"
+    roster_url = "https://dept3.buaa.edu.cn/szjs/zzjs/znxtykzgcx.htm"
+    followup_a = "https://dept3.buaa.edu.cn/szjs/zzjs/jcyzdhgcx.htm"
+    followup_b = "https://dept3.buaa.edu.cn/szjs/zzjs/dqgcx.htm"
+    elite_url = "https://dept3.buaa.edu.cn/szjs/jcrc.htm"
+    mentor_url = "https://dept3.buaa.edu.cn/szjs/yjsds.htm"
+    pages = {
+        "https://www.buaa.edu.cn/": FetchResult(
+            "https://www.buaa.edu.cn/",
+            "home",
+            ["https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"],
+            200,
+        ),
+        "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm": FetchResult(
+            "https://www.buaa.edu.cn/jgsz/jxkyjg02.htm",
+            "机构设置 自动化科学与电气工程学院",
+            [home_url],
+            200,
+        ),
+        "https://dept3.buaa.edu.cn": FetchResult(
+            home_url,
+            "自动化科学与电气工程学院 师资建设 在职教师 杰出人才 研究生导师",
+            [roster_url, elite_url, mentor_url],
+            200,
+            link_signals=(
+                LinkSignal(url=roster_url, anchor_text="在职教师", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=1),
+                LinkSignal(url=elite_url, anchor_text="杰出人才", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=2),
+                LinkSignal(url=mentor_url, anchor_text="研究生导师", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=3),
+            ),
+        ),
+        home_url: FetchResult(
+            home_url,
+            "自动化科学与电气工程学院 师资建设 在职教师 杰出人才 研究生导师",
+            [roster_url, elite_url, mentor_url],
+            200,
+            link_signals=(
+                LinkSignal(url=roster_url, anchor_text="在职教师", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=1),
+                LinkSignal(url=elite_url, anchor_text="杰出人才", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=2),
+                LinkSignal(url=mentor_url, anchor_text="研究生导师", heading_text="师资建设", parent_tags_or_classes=("nav.menu",), link_order=3),
+            ),
+        ),
+        roster_url: FetchResult(
+            roster_url,
+            "智能系统与控制工程系 教授 郭雷 副教授 张海",
+            [followup_a, followup_b, elite_url],
+            200,
+        ),
+        followup_a: FetchResult(
+            followup_a,
+            "检测与自动化工程系 教授 王强",
+            [],
+            200,
+        ),
+        followup_b: FetchResult(
+            followup_b,
+            "电气工程系 教授 李强",
+            [],
+            200,
+        ),
+    }
+
+    class BuaaAutomationLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_urls: list[str] = []
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            state = payload.get("state")
+            if state == "DISCOVER_ORG_UNIT_PAGES":
+                return LLMResult('{"links": ["https://www.buaa.edu.cn/jgsz/jxkyjg02.htm"]}')
+            if state == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "自动化科学与电气工程学院", "url": "https://dept3.buaa.edu.cn", "kind": "college"}]}'
+                )
+            if state == "FIND_FACULTY_PAGES":
+                raise AssertionError("structural roster detection should avoid LLM fallback")
+            if state == "EXTRACT_PROFESSORS":
+                self.extract_urls.append(payload["url"])
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="自动化科学与电气工程学院",
+                    org_unit_url=payload["url"],
+                    source_url=payload["url"],
+                    professors=[{"name": f"教师{len(self.extract_urls)}", "title": "教授"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return LLMResult("{}")
+
+    db = DatabaseManager(sqlite_url(tmp_path / "buaa_automation.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    agent = CrawlerAgent(
+        university_name="北京航空航天大学",
+        start_url="https://www.buaa.edu.cn/",
+        location="北京",
+        db=db,
+        llm_client=BuaaAutomationLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=FakeHumanFetcher(pages),
+        max_depth=5,
+        min_org_units=1,
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    task_urls = {task.page_url for task in tasks}
+
+    assert roster_url in task_urls
+    assert followup_a in task_urls
+    assert followup_b in task_urls
+    assert elite_url not in task_urls
     await db.close()
 
 
