@@ -37,6 +37,36 @@ async def upsert_crawl_task(
     if task_kind_value not in {item.value for item in CrawlTaskKind}:
         task_kind_value = CrawlTaskKind.LIST_PAGE.value
 
+    exact = (
+        await session.execute(
+            select(CrawlTask)
+            .where(
+                CrawlTask.source_url == source_url,
+                CrawlTask.org_unit_name == org_unit_name,
+                CrawlTask.page_hash == page_hash,
+            )
+            .order_by(CrawlTask.id.asc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if exact:
+        await _update_existing_crawl_task(
+            session,
+            exact,
+            page_url=page_url,
+            page_hash=page_hash,
+            page_text_snapshot=page_text_snapshot,
+            allowed_tools=allowed_tools,
+            task_kind_value=task_kind_value,
+            attempt=attempt,
+            priority=priority,
+            status_value=status_value,
+            last_error=last_error,
+            allow_page_hash_update=False,
+            allow_task_kind_update=False,
+        )
+        return exact
+
     existing_filters = [
         CrawlTask.source_url == source_url,
         CrawlTask.org_unit_name == org_unit_name,
@@ -49,47 +79,57 @@ async def upsert_crawl_task(
         await session.execute(select(CrawlTask).where(*existing_filters).order_by(CrawlTask.id.asc()).limit(1))
     ).scalars().first()
     if existing:
-        changed = False
-        if page_hash and existing.page_hash != page_hash and len(existing.page_text_snapshot or "") < len(page_text_snapshot or ""):
-            existing.page_hash = page_hash
-            changed = True
-        if page_text_snapshot and len(existing.page_text_snapshot or "") < len(page_text_snapshot):
-            existing.page_text_snapshot = page_text_snapshot
-            changed = True
-        if allowed_tools and existing.allowed_tools != allowed_tools:
-            existing.allowed_tools = allowed_tools
-            changed = True
-        if task_kind_value and getattr(existing, "task_kind", None) != task_kind_value:
-            existing.task_kind = task_kind_value
-            changed = True
-        protected_from_pending = {
-            CrawlTaskStatus.DONE.value,
-            CrawlTaskStatus.FAILED.value,
-            CrawlTaskStatus.IN_PROGRESS.value,
-            CrawlTaskStatus.RETRY.value,
-        }
-        status_would_reset_active_or_terminal = (
-            status_value == CrawlTaskStatus.PENDING.value
-            and existing.status in protected_from_pending
+        if (
+            page_hash
+            and existing.page_hash != page_hash
+            and len(existing.page_text_snapshot or "") < len(page_text_snapshot or "")
+        ):
+            conflict = (
+                await session.execute(
+                    select(CrawlTask)
+                    .where(
+                        CrawlTask.source_url == source_url,
+                        CrawlTask.org_unit_name == org_unit_name,
+                        CrawlTask.page_hash == page_hash,
+                        CrawlTask.id != existing.id,
+                    )
+                    .order_by(CrawlTask.id.asc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            if conflict is not None:
+                await _update_existing_crawl_task(
+                    session,
+                    conflict,
+                    page_url=page_url,
+                    page_hash=page_hash,
+                    page_text_snapshot=page_text_snapshot,
+                    allowed_tools=allowed_tools,
+                    task_kind_value=task_kind_value,
+                    attempt=attempt,
+                    priority=priority,
+                    status_value=status_value,
+                    last_error=last_error,
+                    allow_page_hash_update=False,
+                    allow_task_kind_update=False,
+                )
+                return conflict
+
+        await _update_existing_crawl_task(
+            session,
+            existing,
+            page_url=page_url,
+            page_hash=page_hash,
+            page_text_snapshot=page_text_snapshot,
+            allowed_tools=allowed_tools,
+            task_kind_value=task_kind_value,
+            attempt=attempt,
+            priority=priority,
+            status_value=status_value,
+            last_error=last_error,
+            allow_page_hash_update=True,
+            allow_task_kind_update=True,
         )
-        if status_value and existing.status != status_value and not status_would_reset_active_or_terminal:
-            existing.status = status_value
-            changed = True
-        if attempt > int(existing.attempt or 0):
-            existing.attempt = attempt
-            changed = True
-        if priority != int(existing.priority or 0):
-            existing.priority = priority
-            changed = True
-        if last_error is not None and existing.last_error != last_error:
-            existing.last_error = last_error
-            changed = True
-        if page_url and existing.page_url != page_url:
-            existing.page_url = page_url
-            changed = True
-        if changed:
-            existing.updated_at = _now_utc()
-        await session.flush()
         return existing
 
     row = CrawlTask(
@@ -112,6 +152,70 @@ async def upsert_crawl_task(
     session.add(row)
     await session.flush()
     return row
+
+
+async def _update_existing_crawl_task(
+    session: AsyncSession,
+    existing: CrawlTask,
+    *,
+    page_url: str,
+    page_hash: str,
+    page_text_snapshot: str,
+    allowed_tools: str | None,
+    task_kind_value: str,
+    attempt: int,
+    priority: int,
+    status_value: str,
+    last_error: str | None,
+    allow_page_hash_update: bool,
+    allow_task_kind_update: bool,
+) -> None:
+    changed = False
+    if (
+        allow_page_hash_update
+        and page_hash
+        and existing.page_hash != page_hash
+        and len(existing.page_text_snapshot or "") < len(page_text_snapshot or "")
+    ):
+        existing.page_hash = page_hash
+        changed = True
+    if page_text_snapshot and len(existing.page_text_snapshot or "") < len(page_text_snapshot):
+        existing.page_text_snapshot = page_text_snapshot
+        changed = True
+    if allowed_tools and existing.allowed_tools != allowed_tools:
+        existing.allowed_tools = allowed_tools
+        changed = True
+    if allow_task_kind_update and task_kind_value and getattr(existing, "task_kind", None) != task_kind_value:
+        existing.task_kind = task_kind_value
+        changed = True
+    protected_from_pending = {
+        CrawlTaskStatus.DONE.value,
+        CrawlTaskStatus.FAILED.value,
+        CrawlTaskStatus.IN_PROGRESS.value,
+        CrawlTaskStatus.RETRY.value,
+    }
+    status_would_reset_active_or_terminal = (
+        status_value == CrawlTaskStatus.PENDING.value
+        and existing.status in protected_from_pending
+    )
+    if status_value and existing.status != status_value and not status_would_reset_active_or_terminal:
+        existing.status = status_value
+        changed = True
+    if attempt > int(existing.attempt or 0):
+        existing.attempt = attempt
+        changed = True
+    if priority != int(existing.priority or 0):
+        existing.priority = priority
+        changed = True
+    if last_error is not None and existing.last_error != last_error:
+        existing.last_error = last_error
+        changed = True
+    if page_url and existing.page_url != page_url:
+        existing.page_url = page_url
+        changed = True
+    if changed:
+        existing.updated_at = _now_utc()
+    await session.flush()
 
 
 async def set_crawl_task_status(

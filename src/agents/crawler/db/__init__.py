@@ -42,13 +42,16 @@ from agents.crawler.db.tasks import (
     upsert_crawl_task,
 )
 from agents.crawler.db.university import (
+    cleanup_excluded_org_units,
     count_academicians,
     count_professors,
+    count_retryable_fetch_failure_urls,
     ensure_university_meta,
     get_or_create_org_unit,
     get_university_status,
     is_url_crawled,
     list_org_units,
+    list_retryable_fetch_failure_urls,
     load_university_targets_from_csv,
     log_crawl,
     set_org_unit_status,
@@ -56,8 +59,10 @@ from agents.crawler.db.university import (
 )
 
 __all__ = [
+    "cleanup_excluded_org_units",
     "count_academicians",
     "count_professors",
+    "count_retryable_fetch_failure_urls",
     "create_steward_run",
     "delete_professor_duplicates_for_academician",
     "finish_steward_run",
@@ -72,6 +77,7 @@ __all__ = [
     "list_org_units",
     "list_professor_academician_duplicates",
     "list_recoverable_crawl_tasks",
+    "list_retryable_fetch_failure_urls",
     "load_university_targets_from_csv",
     "log_crawl",
     "log_extraction_failure",
