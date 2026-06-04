@@ -1,13 +1,13 @@
 ---
 name: save-professors
 description: Extract public professor records and save them with strict field normalization.
-version: 5
+version: 6
 applies_to: EXTRACT_PROFESSORS
 allowed_tools: save_professors
 priority: 20
 token_budget: 1000
 created_at: 2026-04-26T00:00:00
-updated_at: 2026-06-03T00:00:00
+updated_at: 2026-06-04
 ---
 ## Goal
 
@@ -26,6 +26,8 @@ Use `save_professors` with:
 
 - `name`: required; use the teacher's real name only. Remove extra punctuation, numbering,
   and low-value role markers such as `（兼）`, `(兼)`, or `兼职`.
+- For foreign teachers shown as `Latin Name (中文名)` or `Latin Name（中文名）`, put only
+  the Latin name in `name`; do not include the parenthesized Chinese alias.
 - `title`: use only academic rank / role. Do not include honors.
 - `enrollment_pref`: put advisor information here (博导/硕导), not in `title`.
 - `email` / `phone` / `homepage` / `external_link` / `bio` / `research_areas` / `publications`: only if visible on the page.
