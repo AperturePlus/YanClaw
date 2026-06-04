@@ -1,13 +1,13 @@
 ---
 name: extract-links
 description: Select same-site links that maximize org-unit and faculty coverage.
-version: 7
+version: 8
 applies_to: DISCOVER_ORG_UNIT_PAGES,FIND_FACULTY_PAGES
 allowed_tools: extract_links
 priority: 20
 token_budget: 900
 created_at: 2026-04-26T00:00:00
-updated_at: 2026-04-28T20:10:00
+updated_at: 2026-06-03T00:00:00
 ---
 ## Goal
 
@@ -50,6 +50,12 @@ Prefer links containing:
 - Policy/rules/party pages (e.g. `policy`, `zcwj`, `dangjian`, `party`).
 - Login/SSO/mail/library/download pages.
 - External non-university domains.
+- Do not prioritize org-unit or faculty links for arts, sports, Sino-foreign/joint-program colleges,
+  or basic teaching centers when broader academic org-unit pages are available.
+- Examples to deprioritize: 艺术学院, 体育学院, 匹兹堡学院, 格拉斯哥学院, 巴黎卓越工程师学院,
+  中法工程师学院, 中德工程学院, 中英国际学院, 中美联合学院, 密西根学院, 爱丁堡学院,
+  莱斯特国际学院, 基教中心, 基础教学部.
+- Do not treat 人工智能学院 as an arts page.
 
 ## Anti-Noise Rule (Important)
 
