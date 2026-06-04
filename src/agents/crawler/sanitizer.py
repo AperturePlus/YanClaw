@@ -53,6 +53,10 @@ _ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
 _CJK_CHAR = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ebef"
 _CJK_INNER_SPACE_RE = re.compile(rf"(?<=[{_CJK_CHAR}])\s+(?=[{_CJK_CHAR}])")
 _TRAILING_LOW_VALUE_NAME_MARKER_RE = re.compile(r"\s*[\(（]\s*(?:兼|兼职)\s*[\)）]\s*$")
+_LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+_TRAILING_CJK_ALIAS_RE = re.compile(
+    rf"^(?P<base>.+?)\s*[\(（]\s*(?P<alias>[{_CJK_CHAR}][{_CJK_CHAR}\s·・]*)\s*[\)）]\s*$"
+)
 
 
 def sanitize_professor_payload(
@@ -110,11 +114,22 @@ def normalize_name(value: Any) -> str:
         if cleaned == text:
             break
         text = cleaned
+    text = _strip_trailing_latin_cjk_alias(text)
     return text.strip()
 
 
 def normalize_name_key(value: Any) -> str:
     return normalize_name(value)
+
+
+def _strip_trailing_latin_cjk_alias(text: str) -> str:
+    match = _TRAILING_CJK_ALIAS_RE.match(text)
+    if not match:
+        return text
+    base = match.group("base").strip()
+    if not _LATIN_CHAR_RE.search(base):
+        return text
+    return base
 
 
 def normalize_title(value: Any) -> str | None:
