@@ -3,10 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from agents.crawler.fetchers import Fetcher
 from agents.crawler.models import OrgUnit
+
 ORG_UNIT_PAGE_KEYWORDS = (
     "college",
     "school",
@@ -74,6 +75,184 @@ FACULTY_KEYWORDS = (
     "教工",
     "人才",
 )
+
+_ORG_UNIT_EXCLUDE_KEYWORD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "arts",
+        (
+            "艺术",
+            "美术",
+            "音乐",
+            "舞蹈",
+            "戏剧",
+            "戏曲",
+            "电影学院",
+            "影视学院",
+            "传媒艺术",
+            "艺术设计",
+            "fine arts",
+            "visual arts",
+            "performing arts",
+            "school of arts",
+            "college of arts",
+            "music",
+            "dance",
+            "drama",
+            "theater",
+            "theatre",
+            "film",
+            "cinema",
+        ),
+    ),
+    (
+        "sports",
+        (
+            "体育",
+            "运动训练",
+            "竞技体育",
+            "physical education",
+            "sports",
+            "sport science",
+            "kinesiology",
+            "athletics",
+        ),
+    ),
+    (
+        "joint_program",
+        (
+            "中外合作",
+            "中外合办",
+            "合作办学",
+            "国际联合",
+            "联合学院",
+            "联合培养",
+            "中法工程师",
+            "中德工程",
+            "中英国际",
+            "中美联合",
+            "匹兹堡",
+            "格拉斯哥",
+            "巴黎卓越",
+            "密西根",
+            "爱丁堡",
+            "莱斯特",
+            "pittsburgh",
+            "glasgow",
+            "paris elite",
+            "michigan",
+            "edinburgh",
+            "leicester",
+            "joint institute",
+            "joint college",
+            "international joint",
+            "cooperative education",
+            "sino-foreign",
+            "sino foreign",
+        ),
+    ),
+    (
+        "basic_teaching",
+        (
+            "基教中心",
+            "基础教学中心",
+            "基础教学部",
+            "基础课教学部",
+            "公共基础教学部",
+            "基础教育中心",
+            "公共课教学",
+        ),
+    ),
+)
+
+DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS: tuple[str, ...] = tuple(
+    dict.fromkeys(keyword for _, keywords in _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS for keyword in keywords)
+)
+
+
+@dataclass(frozen=True)
+class OrgUnitExclusionMatch:
+    category: str
+    keyword: str
+    reason: str
+
+
+def _org_unit_exclusion_match(
+    *,
+    name: str,
+    kind: str | None = None,
+    url: str | None = None,
+    keywords: tuple[str, ...] | list[str] | None = None,
+) -> OrgUnitExclusionMatch | None:
+    active_keywords = tuple(
+        str(keyword).strip()
+        for keyword in (DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS if keywords is None else keywords)
+        if str(keyword).strip()
+    )
+    if not active_keywords:
+        return None
+
+    text = _org_unit_exclusion_text(name=name, kind=kind, url=url)
+    active = {_normalize_exclude_keyword(keyword) for keyword in active_keywords}
+
+    for category, grouped_keywords in _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS:
+        for keyword in grouped_keywords:
+            normalized = _normalize_exclude_keyword(keyword)
+            if normalized not in active:
+                continue
+            if _matches_org_unit_exclude_keyword(text, normalized):
+                return OrgUnitExclusionMatch(
+                    category=category,
+                    keyword=keyword,
+                    reason=f"{category}:{keyword}",
+                )
+
+    grouped = {
+        _normalize_exclude_keyword(keyword)
+        for _, grouped_keywords in _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS
+        for keyword in grouped_keywords
+    }
+    for keyword in active_keywords:
+        normalized = _normalize_exclude_keyword(keyword)
+        if not normalized or normalized in grouped:
+            continue
+        if _matches_org_unit_exclude_keyword(text, normalized):
+            return OrgUnitExclusionMatch(
+                category="custom",
+                keyword=keyword,
+                reason=f"custom:{keyword}",
+            )
+    return None
+
+
+def _should_exclude_org_unit(
+    *,
+    name: str,
+    kind: str | None = None,
+    url: str | None = None,
+    keywords: tuple[str, ...] | list[str] | None = None,
+) -> bool:
+    return _org_unit_exclusion_match(name=name, kind=kind, url=url, keywords=keywords) is not None
+
+
+def _org_unit_exclusion_text(*, name: str, kind: str | None, url: str | None) -> str:
+    parsed = urlparse(str(url or ""))
+    host = parsed.hostname or ""
+    path = unquote(parsed.path or "")
+    return f"{name or ''} {kind or ''} {host} {path}".lower()
+
+
+def _normalize_exclude_keyword(keyword: str) -> str:
+    return re.sub(r"\s+", " ", str(keyword or "").strip().lower())
+
+
+def _matches_org_unit_exclude_keyword(text: str, keyword: str) -> bool:
+    if not keyword:
+        return False
+    if any(ord(char) > 127 for char in keyword):
+        return keyword in text
+    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
+
+
 def _keyword_filter(links: list[str], keywords: tuple[str, ...]) -> list[str]:
     lowered = [(keyword, keyword.lower()) for keyword in keywords]
     return [
