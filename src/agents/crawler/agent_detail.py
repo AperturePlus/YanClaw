@@ -12,6 +12,7 @@ from agents.crawler.url_heuristics import (
     _is_faculty_platform,
     _is_non_faculty_noise_url,
     _is_pagination_link,
+    _is_query_profile_detail_url,
     _looks_like_retired_content,
     _looks_like_retired_url,
     _sanitize_url,
@@ -196,6 +197,8 @@ def _url_path_stem(url: str) -> str:
 
 def _is_faculty_directory_or_category_link(url: str) -> bool:
     lowered = (url or "").lower()
+    if _is_query_profile_detail_url(lowered):
+        return False
     parsed = urlparse(lowered)
     path = parsed.path
     stem = _url_path_stem(lowered)
@@ -216,6 +219,8 @@ def _is_faculty_directory_or_category_link(url: str) -> bool:
 
 def _looks_like_profile_detail_url(url: str) -> bool:
     lowered = (url or "").lower()
+    if _is_query_profile_detail_url(lowered):
+        return True
     if any(token in lowered for token in _CLEAR_PROFILE_DETAIL_HINTS):
         return True
     path = urlparse(lowered).path
@@ -441,7 +446,7 @@ def extract_detail_profile_links(
         if current_dir:
             prefix = current_dir.rstrip("/")
             related_by_path = bool(prefix and path.startswith(prefix + "/"))
-        related_by_hint = any(token in lowered for token in detail_hints)
+        related_by_hint = looks_like_profile_detail or any(token in lowered for token in detail_hints)
         # If current page is noise, avoid same-directory fan-out unless target is explicit faculty directory.
         if current_is_noise and related_by_path and not _is_explicit_faculty_directory_url(link):
             dropped_parent_noise += 1
@@ -479,6 +484,8 @@ def extract_detail_profile_links(
         if current_dir and urlparse(url).path.lower().startswith(current_dir.rstrip("/") + "/"):
             score += 4
         if any(token in lowered for token in detail_hints):
+            score += 4
+        if _looks_like_profile_detail_url(url):
             score += 4
         if _link_signal_looks_like_person(signal):
             score += 3

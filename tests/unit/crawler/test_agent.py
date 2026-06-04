@@ -2441,6 +2441,83 @@ async def test_scu_computer_faculty_sections_stay_list_pages_and_info_links_are_
     await db.close()
 
 
+async def test_scu_query_teamlist_detail_links_are_detail_tasks(tmp_path):
+    list_url = "https://saa.scu.edu.cn/teamlist.htm"
+    detail_url = "https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854"
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "空天科学与工程学院 师资队伍 王靖宇",
+            [detail_url],
+            200,
+            link_signals=(
+                SimpleNamespace(
+                    url=detail_url,
+                    anchor_text="王靖宇",
+                    heading_text="师资队伍",
+                    parent_tags_or_classes=("team-list",),
+                    link_order=1,
+                ),
+            ),
+        ),
+        detail_url: FetchResult(
+            detail_url,
+            "王靖宇 副研究员 邮箱 wangjingyu@scu.edu.cn 研究方向 航空发动机旋转机械数值模拟方法研究",
+            [],
+            200,
+        ),
+    }
+
+    class ScuAerospaceLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") != "EXTRACT_PROFESSORS" or payload["url"] != detail_url:
+                return LLMResult("{}")
+            result = await tool_handlers["save_professors"](
+                org_unit_name="空天科学与工程学院",
+                org_unit_url=list_url,
+                source_url=payload["url"],
+                professors=[
+                    {
+                        "name": "王靖宇",
+                        "title": "副研究员",
+                        "email": "wangjingyu@scu.edu.cn",
+                        "research_areas": "航空发动机旋转机械数值模拟方法研究",
+                    }
+                ],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    db = DatabaseManager(sqlite_url(tmp_path / "scu_aerospace_query_detail.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    agent = CrawlerAgent(
+        university_name="四川大学",
+        start_url="https://www.scu.edu.cn/",
+        location="成都",
+        db=db,
+        llm_client=ScuAerospaceLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=FakeHumanFetcher(pages),
+        max_depth=3,
+        max_backtracks=3,
+        min_org_units=1,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="空天科学与工程学院")])
+
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    task_kind_by_url = {task.page_url: task.task_kind for task in tasks}
+    assert task_kind_by_url[list_url] == "list_page"
+    assert task_kind_by_url[detail_url] == "detail_page"
+    assert int(agent._pipeline_stats.get("followups_scheduled", 0)) == 0
+    await db.close()
+
+
 async def test_buaa_computer_category_pages_are_not_detail_profile_links(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
     agent.start_url = "https://www.buaa.edu.cn/"
