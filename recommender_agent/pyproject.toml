@@ -1,0 +1,21 @@
+[project]
+name = "light-graph-rec"
+version = "0.1.0"
+description = "Lightweight Knowledge Graph Enhanced Recommendation System for Tutor Matching"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["recommendation", "knowledge-graph", "fastapi", "chroma", "mentor-matching"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.26.0",
+    "ruff>=0.1.0",
+    "black>=23.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

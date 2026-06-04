@@ -28,6 +28,12 @@ pytest_foo/
 node_modules/
 
 .claude/
+# Local agent and Python build artifacts
+.omo/
+.playwright-mcp/
+*.egg-info/
+build/
+dist/
 
 # Doppler & Env Security
 .doppler.yaml
@@ -35,4 +41,3 @@ node_modules/
 .env.*
 !.env.example
 !.env.*.example
-
