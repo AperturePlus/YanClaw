@@ -12,6 +12,8 @@ from agents.crawler.url_heuristics import (
     _allow_faculty_candidate_for_org_unit,
     _is_non_faculty_noise_url,
     _is_faculty_platform,
+    _org_unit_exclusion_match,
+    _should_exclude_org_unit,
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
     _rank_faculty_page_candidates,
@@ -77,6 +79,25 @@ def test_real_college_name_accepted():
     assert not _is_category_name("法学院")
     assert not _is_category_name("华西临床医学院")
     assert not _is_category_name("信息与通信工程学院")
+
+
+def test_org_unit_exclusion_hard_rules_match_blacklisted_units():
+    assert _should_exclude_org_unit(name="艺术学院", url="https://art.example.edu.cn/")
+    assert _should_exclude_org_unit(name="体育学院", url="https://sports.example.edu.cn/")
+    assert _should_exclude_org_unit(name="中外合作办学学院", url="https://joint.example.edu.cn/")
+    assert _should_exclude_org_unit(name="国际联合学院", url="https://joint.example.edu.cn/")
+    assert _should_exclude_org_unit(name="基教中心", url="https://basic.example.edu.cn/")
+    assert _should_exclude_org_unit(name="基础教学部", url="https://basic.example.edu.cn/")
+    assert _org_unit_exclusion_match(name="格拉斯哥学院", url="https://glasgow.example.edu.cn/").category == "joint_program"
+
+
+def test_org_unit_exclusion_hard_rules_avoid_false_positives():
+    assert not _should_exclude_org_unit(name="人工智能学院", url="https://ai.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="工业设计学院", url="https://design.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="经济管理学院", url="https://sem.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="医学院", url="https://med.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="农学院", url="https://agri.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="外国语学院", url="https://foreign.example.edu.cn/")
 
 
 def test_retired_content_not_triggered_on_mixed_faculty_tabs():

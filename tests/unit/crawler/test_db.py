@@ -539,6 +539,245 @@ async def test_ensure_runtime_schema_repairs_professor_homepage_pollution(tmp_pa
     await db.close()
 
 
+async def test_cleanup_excluded_org_units_removes_related_records(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "excluded_org_cleanup.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        cs = await crawler_db.get_or_create_org_unit(
+            session,
+            name="计算机学院",
+            url="https://cs.example.edu.cn/",
+            kind="college",
+        )
+        art = await crawler_db.get_or_create_org_unit(
+            session,
+            name="艺术学院",
+            url="https://art.example.edu.cn/",
+            kind="college",
+        )
+        pitt = await crawler_db.get_or_create_org_unit(
+            session,
+            name="匹兹堡学院",
+            url="https://pitt.example.edu.cn/",
+            kind="college",
+        )
+        cs_id = int(cs.id)
+        art_id = int(art.id)
+        pitt_id = int(pitt.id)
+
+        cs_professor = Professor(
+            name="CS Only",
+            name_key="csonly",
+            org_unit_name="计算机学院",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        art_professor = Professor(
+            name="Art Only",
+            name_key="artonly",
+            org_unit_name="艺术学院",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        shared_professor = Professor(
+            name="Shared",
+            name_key="shared",
+            org_unit_name="计算机学院 / 艺术学院",
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([cs_professor, art_professor, shared_professor])
+        await session.flush()
+        session.add_all(
+            [
+                ProfessorAffiliation(professor_id=cs_professor.id, org_unit_id=cs_id),
+                ProfessorAffiliation(professor_id=art_professor.id, org_unit_id=art_id),
+                ProfessorAffiliation(professor_id=shared_professor.id, org_unit_id=cs_id),
+                ProfessorAffiliation(professor_id=shared_professor.id, org_unit_id=art_id),
+            ]
+        )
+        session.add_all(
+            [
+                Academician(
+                    name="CS Academician",
+                    name_key="csacademician",
+                    org_unit_id=cs_id,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                ),
+                Academician(
+                    name="Art Academician",
+                    name_key="artacademician",
+                    org_unit_id=art_id,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+        keep_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.example.edu.cn/",
+            source_url="https://cs.example.edu.cn/szdw.htm",
+            page_url="https://cs.example.edu.cn/szdw.htm",
+            page_hash="cs",
+            page_text_snapshot="cs",
+            allowed_tools="save_professors",
+        )
+        art_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="艺术学院",
+            org_unit_url="https://art.example.edu.cn/",
+            source_url="https://art.example.edu.cn/szdw.htm",
+            page_url="https://art.example.edu.cn/szdw.htm",
+            page_hash="art",
+            page_text_snapshot="art",
+            allowed_tools="save_professors",
+        )
+        pitt_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="匹兹堡学院",
+            org_unit_url="https://pitt.example.edu.cn/",
+            source_url="https://pitt.example.edu.cn/szdw.htm",
+            page_url="https://pitt.example.edu.cn/szdw.htm",
+            page_hash="pitt",
+            page_text_snapshot="pitt",
+            allowed_tools="save_professors",
+        )
+        await crawler_db.log_extraction_failure(
+            session,
+            task_id=int(art_task.id),
+            failure_type="invalid_json",
+            org_unit_name="艺术学院",
+            source_url="https://art.example.edu.cn/szdw.htm",
+        )
+        await crawler_db.log_extraction_failure(
+            session,
+            task_id=int(pitt_task.id),
+            failure_type="invalid_json",
+            org_unit_name="匹兹堡学院",
+            source_url="https://pitt.example.edu.cn/szdw.htm",
+        )
+
+        summary = await crawler_db.cleanup_excluded_org_units(session, [art, pitt])
+
+    assert summary["org_units_deleted"] == 2
+    assert summary["affiliations_deleted"] == 2
+    assert summary["professors_deleted"] == 1
+    assert summary["professors_updated"] == 1
+    assert summary["academicians_deleted"] == 1
+    assert summary["crawl_tasks_deleted"] == 2
+    assert summary["crawl_extraction_failures_deleted"] == 2
+
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        academicians = (await session.execute(select(Academician))).scalars().all()
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+
+        assert [row.name for row in org_units] == ["计算机学院"]
+        assert [row.name for row in professors] == ["CS Only", "Shared"]
+        assert next(row for row in professors if row.name == "Shared").org_unit_name == "计算机学院"
+        assert {row.org_unit_id for row in affiliations} == {cs_id}
+        assert [row.name for row in academicians] == ["CS Academician"]
+        assert [row.id for row in tasks] == [keep_task.id]
+        assert failures == []
+
+    await db.close()
+
+
+async def test_retryable_fetch_failure_urls_only_include_unresolved_fetch_failures(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "retryable_fetch_failures.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://timeout.example.edu.cn/",
+            fetched=FetchResult(
+                "https://timeout.example.edu.cn/",
+                "",
+                [],
+                0,
+                block_reason="timeout",
+            ),
+        )
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://skip.example.edu.cn/",
+            fetched=FetchResult(
+                "https://skip.example.edu.cn/",
+                "",
+                [],
+                0,
+                block_reason="human_skip",
+            ),
+        )
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://invalid.example.edu.cn/",
+            fetched=FetchResult(
+                "https://invalid.example.edu.cn/",
+                "",
+                [],
+                0,
+                block_reason="invalid_url",
+            ),
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://blocked.example.edu.cn/",
+            CrawlLogStatus.FAILED,
+            "depth=1 status_code=0 blocked=timeout links=0",
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://empty.example.edu.cn/",
+            CrawlLogStatus.FAILED,
+            "no_structured_data",
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://resolved.example.edu.cn/",
+            CrawlLogStatus.FAILED,
+            "depth=1 status_code=0 blocked=timeout links=0",
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://resolved.example.edu.cn/",
+            CrawlLogStatus.SUCCESS,
+            "depth=1 status_code=200",
+        )
+
+        urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+        count = await crawler_db.count_retryable_fetch_failure_urls(session)
+
+    assert urls == ["https://blocked.example.edu.cn", "https://timeout.example.edu.cn"]
+    assert count == 2
+
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://timeout.example.edu.cn/",
+            fetched=FetchResult(
+                "https://timeout.example.edu.cn/",
+                "ok",
+                [],
+                200,
+            ),
+        )
+        urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+
+    assert urls == ["https://blocked.example.edu.cn"]
+    await db.close()
+
+
 async def test_upsert_professor_assigns_external_link_without_overwriting_homepage_with_list_page(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "homepage_source.db"))
     await db.init_db()
@@ -855,4 +1094,103 @@ async def test_detail_crawl_task_dedupes_by_url_org_unit_and_kind(tmp_path):
     assert len(rows) == 1
     assert rows[0].page_hash == "hash-longer"
     assert "ada@testu.edu.cn" in rows[0].page_text_snapshot
+    await db.close()
+
+
+async def test_crawl_task_upsert_returns_conflicting_unique_task_without_integrity_error(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "task_unique_conflict.db"))
+    await db.init_db()
+    source_url = "https://cs.testu.edu.cn/szdw.htm"
+
+    async with db.session() as session:
+        detail = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="detail-old",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="short",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.FAILED,
+        )
+        conflict = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="list-current",
+            task_kind=CrawlTaskKind.LIST_PAGE,
+            page_text_snapshot="faculty list current",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.DONE,
+        )
+        returned = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="list-current",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="faculty list current with a longer browser overlay snapshot",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        rows = (await session.execute(select(CrawlTask).order_by(CrawlTask.id))).scalars().all()
+
+    assert returned.id == conflict.id
+    assert len(rows) == 2
+    assert rows[0].id == detail.id
+    assert rows[0].page_hash == "detail-old"
+    assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
+    assert rows[1].id == conflict.id
+    assert rows[1].page_hash == "list-current"
+    assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
+    assert rows[1].status == CrawlTaskStatus.DONE.value
+    await db.close()
+
+
+async def test_crawl_task_upsert_exact_match_does_not_rewrite_task_kind(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "task_kind_exact_match.db"))
+    await db.init_db()
+    source_url = "https://cs.testu.edu.cn/info/1001/1.htm"
+
+    async with db.session() as session:
+        list_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="same-content-hash",
+            task_kind=CrawlTaskKind.LIST_PAGE,
+            page_text_snapshot="same page text",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.DONE,
+        )
+        returned = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="Computer Science",
+            org_unit_url="https://cs.testu.edu.cn/",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="same-content-hash",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="same page text",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+        row = (await session.execute(select(CrawlTask))).scalar_one()
+
+    assert returned.id == list_task.id
+    assert row.task_kind == CrawlTaskKind.LIST_PAGE.value
+    assert row.status == CrawlTaskStatus.DONE.value
     await db.close()

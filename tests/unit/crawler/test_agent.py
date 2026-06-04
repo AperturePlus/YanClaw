@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -26,6 +27,7 @@ from agents.crawler.models import (
     CrawlLogStatus,
     CrawlStatus,
     CrawlTask,
+    CrawlTaskKind,
     CrawlTaskStatus,
     OrgUnit,
     OrgUnitStatus,
@@ -268,6 +270,35 @@ async def test_resume_mode_uses_page_cache_without_fetching_start_url(tmp_path):
     await db.close()
 
 
+async def test_resume_mode_cleans_excluded_org_units_before_cached_homepage_flow(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/",
+            fetched=FetchResult(
+                "https://www.example.edu.cn/",
+                "home",
+                ["https://www.example.edu.cn/orgs"],
+                200,
+            ),
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="艺术学院",
+            url="https://art.example.edu.cn/",
+            kind="college",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    async with db.session() as session:
+        units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        assert "艺术学院" not in [unit.name for unit in units]
+    await db.close()
+
+
 async def test_resume_mode_recovers_tasks_without_refetching_historical_start_url(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages={}, resume_mode=True)
     async with db.session() as session:
@@ -296,6 +327,167 @@ async def test_resume_mode_recovers_tasks_without_refetching_historical_start_ur
     assert result.saved_professors == 1
     assert fetcher.calls == []
     assert "skip already_crawled url=https://www.example.edu.cn/" in agent.execution_log
+    await db.close()
+
+
+async def test_resume_force_existing_refetches_no_faculty_org_unit_despite_success_log(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "计算机学院",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+        resume_force_existing=True,
+    )
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/",
+            CrawlLogStatus.SUCCESS,
+            "seeded-start-history",
+        )
+        org_unit = await crawler_db.get_or_create_org_unit(
+            session,
+            name="CS",
+            url="https://www.example.edu.cn/cs",
+            kind="college",
+            status=OrgUnitStatus.NO_FACULTY_PAGE,
+        )
+        await crawler_db.log_crawl(
+            session,
+            org_unit.url,
+            CrawlLogStatus.SUCCESS,
+            "seeded-org-history",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://www.example.edu.cn/cs" in fetcher.calls
+    assert "force refetch url=https://www.example.edu.cn/cs" in agent.execution_log
+    async with db.session() as session:
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == "CS"))).scalar_one()
+        assert org_unit.status == OrgUnitStatus.IN_PROGRESS.value
+    await db.close()
+
+
+async def test_resume_refetches_retryable_failure_url_despite_success_log(tmp_path):
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/cs",
+            fetched=FetchResult(
+                "https://www.example.edu.cn/cs",
+                "",
+                [],
+                0,
+                block_reason="timeout",
+            ),
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/cs",
+            CrawlLogStatus.SUCCESS,
+            "seeded-success-history",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://www.example.edu.cn/cs" in fetcher.calls
+    assert "force refetch url=https://www.example.edu.cn/cs" in agent.execution_log
+    async with db.session() as session:
+        assert await crawler_db.list_retryable_fetch_failure_urls(session) == []
+    await db.close()
+
+
+async def test_resume_keeps_university_failed_when_retryable_fetch_failure_remains(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "",
+            [],
+            0,
+            block_reason="timeout",
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Existing",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "source_url": "https://www.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/cs",
+            fetched=FetchResult(
+                "https://www.example.edu.cn/cs",
+                "",
+                [],
+                0,
+                block_reason="timeout",
+            ),
+        )
+        await crawler_db.log_crawl(
+            session,
+            "https://www.example.edu.cn/cs",
+            CrawlLogStatus.SUCCESS,
+            "seeded-success-history",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.FAILED.value
+    assert any("retryable_fetch_failures_remaining" in message for message in result.messages)
+    assert "https://www.example.edu.cn/cs" in fetcher.calls
+    async with db.session() as session:
+        meta = (await session.execute(select(UniversityMeta))).scalar_one()
+        assert meta.crawl_status == CrawlStatus.FAILED.value
+        assert await crawler_db.list_retryable_fetch_failure_urls(session) == ["https://www.example.edu.cn/cs"]
     await db.close()
 
 
@@ -576,6 +768,211 @@ async def test_agent_target_org_units_unmatched_fails_early(tmp_path):
     await db.close()
 
 
+async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            [
+                "https://cs.example.edu.cn/",
+                "https://art.example.edu.cn/",
+                "https://sports.example.edu.cn/",
+                "https://pitt.example.edu.cn/",
+                "https://basic.example.edu.cn/",
+            ],
+            200,
+        ),
+        "https://cs.example.edu.cn/": FetchResult(
+            "https://cs.example.edu.cn/",
+            "计算机学院",
+            ["https://cs.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://cs.example.edu.cn": FetchResult(
+            "https://cs.example.edu.cn/",
+            "计算机学院",
+            ["https://cs.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://cs.example.edu.cn/faculty": FetchResult(
+            "https://cs.example.edu.cn/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+        "https://art.example.edu.cn/": FetchResult("https://art.example.edu.cn/", "艺术学院", [], 200),
+        "https://sports.example.edu.cn/": FetchResult("https://sports.example.edu.cn/", "体育学院", [], 200),
+        "https://pitt.example.edu.cn/": FetchResult("https://pitt.example.edu.cn/", "匹兹堡学院", [], 200),
+        "https://basic.example.edu.cn/": FetchResult("https://basic.example.edu.cn/", "基教中心", [], 200),
+    }
+
+    class OrgUnitFilterLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("filter_task") == "org_unit_exclusion":
+                org_units = payload.get("org_units") or []
+                excluded = [
+                    item for item in org_units if str(item.get("name") or "") in {"匹兹堡学院", "格拉斯哥学院", "中法工程师学院"}
+                ]
+                included = [item for item in org_units if item not in excluded]
+                return LLMResult(
+                    json.dumps(
+                        {"included_org_units": included, "excluded_org_units": excluded},
+                        ensure_ascii=False,
+                    )
+                )
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    json.dumps(
+                        {
+                            "org_units": [
+                                {"name": "计算机学院", "url": "https://cs.example.edu.cn/", "kind": "college"},
+                                {"name": "艺术学院", "url": "https://art.example.edu.cn/", "kind": "college"},
+                                {"name": "体育学院", "url": "https://sports.example.edu.cn/", "kind": "college"},
+                                {"name": "匹兹堡学院", "url": "https://pitt.example.edu.cn/", "kind": "college"},
+                                {"name": "基教中心", "url": "https://basic.example.edu.cn/", "kind": "center"},
+                            ]
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="计算机学院",
+                    org_unit_url="https://cs.example.edu.cn/",
+                    source_url=payload["url"],
+                    professors=[{"name": "Ada", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        OrgUnitFilterLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+    )
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+    assert "https://cs.example.edu.cn/faculty" in fetcher.calls
+    assert "https://art.example.edu.cn/" not in fetcher.calls
+    assert "https://sports.example.edu.cn/" not in fetcher.calls
+    assert "https://pitt.example.edu.cn/" not in fetcher.calls
+    assert "https://basic.example.edu.cn/" not in fetcher.calls
+    await db.close()
+
+
+async def test_agent_keeps_org_units_when_llm_filter_returns_invalid_json(tmp_path):
+    class InvalidFilterLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("filter_task") == "org_unit_exclusion":
+                return LLMResult("not json")
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(tmp_path, InvalidFilterLLM())
+    units = await agent._filter_org_unit_payloads_for_discovery(
+        [{"name": "国际学院", "url": "https://intl.example.edu.cn/", "kind": "college"}],
+        source_url="https://www.example.edu.cn/orgs",
+        source="unit_test",
+    )
+
+    assert [unit["name"] for unit in units] == ["国际学院"]
+    await db.close()
+
+
+async def test_agent_resume_skips_existing_blacklisted_org_units(tmp_path):
+    pages = {
+        "https://cs.example.edu.cn/": FetchResult(
+            "https://cs.example.edu.cn/",
+            "计算机学院",
+            ["https://cs.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://cs.example.edu.cn": FetchResult(
+            "https://cs.example.edu.cn/",
+            "计算机学院",
+            ["https://cs.example.edu.cn/faculty"],
+            200,
+        ),
+        "https://cs.example.edu.cn/faculty": FetchResult(
+            "https://cs.example.edu.cn/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+        "https://art.example.edu.cn/": FetchResult("https://art.example.edu.cn/", "艺术学院", [], 200),
+        "https://pitt.example.edu.cn/": FetchResult("https://pitt.example.edu.cn/", "匹兹堡学院", [], 200),
+    }
+
+    class ResumeFilterLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("filter_task") == "org_unit_exclusion":
+                org_units = payload.get("org_units") or []
+                return LLMResult(
+                    json.dumps(
+                        {"included_org_units": org_units, "excluded_org_units": []},
+                        ensure_ascii=False,
+                    )
+                )
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="计算机学院",
+                    org_unit_url="https://cs.example.edu.cn/",
+                    source_url=payload["url"],
+                    professors=[{"name": "Ada", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        ResumeFilterLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="计算机学院",
+            url="https://cs.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="艺术学院",
+            url="https://art.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="匹兹堡学院",
+            url="https://pitt.example.edu.cn/",
+            kind="college",
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://cs.example.edu.cn/faculty" in fetcher.calls
+    assert "https://art.example.edu.cn/" not in fetcher.calls
+    assert "https://pitt.example.edu.cn/" not in fetcher.calls
+    async with db.session() as session:
+        remaining_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        assert [unit.name for unit in remaining_units] == ["计算机学院"]
+    await db.close()
+
+
 async def test_agent_marks_org_unit_status_no_faculty_page_when_no_faculty_links(tmp_path):
     pages = {
         "https://www.example.edu.cn/": FetchResult(
@@ -837,6 +1234,64 @@ async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path
     assert detail_url in llm.extract_urls
     assert int(agent._pipeline_stats.get("detail_enqueued", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_processed", 0)) == 1
+    await db.close()
+
+
+async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_path):
+    source_url = "https://www.example.edu.cn/cs/faculty"
+    page_text = "faculty list current with browser overlay Ada Professor"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    text_limit = agent._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=True)
+    snapshot = agent._compact_page_text(page_text, text_limit)
+    incoming_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+
+    async with db.session() as session:
+        detail_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash="detail-old",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="short detail snapshot",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.FAILED,
+        )
+        list_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=source_url,
+            page_url=source_url,
+            page_hash=incoming_hash,
+            task_kind=CrawlTaskKind.LIST_PAGE,
+            page_text_snapshot=snapshot,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.DONE,
+        )
+
+    llm_queue: asyncio.Queue = asyncio.Queue()
+    await agent._enqueue_extraction_task(
+        _QueuedUrl(url=source_url, depth=1, label="CS"),
+        FetchResult(source_url, page_text, [], 200),
+        llm_queue=llm_queue,
+        detail_mode=True,
+        priority=0,
+    )
+
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("duplicate_tasks_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("detail_skipped", 0)) == 1
+    async with db.session() as session:
+        rows = (await session.execute(select(CrawlTask).order_by(CrawlTask.id))).scalars().all()
+    assert [row.id for row in rows] == [detail_task.id, list_task.id]
+    assert rows[0].page_hash == "detail-old"
+    assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
+    assert rows[1].page_hash == incoming_hash
+    assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
     await db.close()
 
 
