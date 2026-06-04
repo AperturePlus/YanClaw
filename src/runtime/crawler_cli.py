@@ -28,6 +28,21 @@ def cli() -> None:
     type=float,
     help="Fuzzy-match threshold in [0,1] for --org-units.",
 )
+@click.option(
+    "--no-org-unit-exclude",
+    is_flag=True,
+    help="Disable default org-unit exclusion for arts/sports/joint programs/basic teaching units.",
+)
+@click.option(
+    "--org-unit-exclude-keywords",
+    default="",
+    help="Comma-separated org-unit exclusion keywords overriding the defaults.",
+)
+@click.option(
+    "--no-org-unit-llm-filter",
+    is_flag=True,
+    help="Disable LLM second-pass org-unit exclusion filtering.",
+)
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency.")
 @click.option("--log-dir", default=None, type=click.Path(path_type=Path), help="Log directory.")
 @click.option(
@@ -63,6 +78,9 @@ def crawl(
     universities: str,
     org_units: str,
     org_unit_match_threshold: float | None,
+    no_org_unit_exclude: bool,
+    org_unit_exclude_keywords: str,
+    no_org_unit_llm_filter: bool,
     concurrency: int | None,
     log_dir: Path | None,
     university_timeout_seconds: float | None,
@@ -80,6 +98,13 @@ def crawl(
         overrides["target_org_units"] = target_org_units
     if org_unit_match_threshold is not None:
         overrides["org_unit_match_threshold"] = org_unit_match_threshold
+    if no_org_unit_exclude:
+        overrides["org_unit_exclude_enabled"] = False
+    exclude_keywords = [item.strip() for item in org_unit_exclude_keywords.split(",") if item.strip()]
+    if exclude_keywords:
+        overrides["org_unit_exclude_keywords"] = exclude_keywords
+    if no_org_unit_llm_filter:
+        overrides["org_unit_llm_filter_enabled"] = False
     if concurrency is not None:
         overrides["max_concurrency"] = concurrency
     if log_dir is not None:
@@ -91,7 +116,7 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s",
+        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
         settings.max_concurrency,
         settings.human_server_host,
         settings.human_server_port,
@@ -102,6 +127,8 @@ def crawl(
         ",".join(selected) if selected else "*",
         ",".join(settings.target_org_units) if settings.target_org_units else "*",
         settings.org_unit_match_threshold,
+        settings.org_unit_exclude_enabled,
+        settings.org_unit_llm_filter_enabled,
     )
     asyncio.run(
         _crawl_async(

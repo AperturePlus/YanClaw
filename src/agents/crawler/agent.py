@@ -32,6 +32,7 @@ from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_NOISE,
     FacultyCandidateAssessment,
     FACULTY_KEYWORDS,
+    DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS,
     ORG_UNIT_PAGE_KEYWORDS,
     _COMMON_FACULTY_PATHS,
     _INTERMEDIATE_ORG_PATHS,
@@ -54,6 +55,7 @@ from agents.crawler.url_heuristics import (
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
     _looks_like_retired_url,
+    _org_unit_exclusion_match,
     _org_unit_faculty_priority,
     _rank_faculty_page_candidates,
     _rank_org_unit_page_candidates,
@@ -157,8 +159,12 @@ class CrawlerAgent:
         invalid_json_max_retry: int = 1,
         task_recovery_enabled: bool = True,
         resume_mode: bool = False,
+        resume_force_existing: bool = False,
         target_org_units: list[str] | None = None,
         org_unit_match_threshold: float = 0.60,
+        org_unit_exclude_enabled: bool = True,
+        org_unit_exclude_keywords: list[str] | None = None,
+        org_unit_llm_filter_enabled: bool = True,
     ) -> None:
         self.university_name = university_name
         self.start_url = start_url
@@ -183,8 +189,19 @@ class CrawlerAgent:
         self.invalid_json_max_retry = max(0, int(invalid_json_max_retry))
         self.task_recovery_enabled = bool(task_recovery_enabled)
         self.resume_mode = bool(resume_mode)
+        self.resume_force_existing = bool(resume_force_existing)
         self.target_org_units = [str(item).strip() for item in (target_org_units or []) if str(item).strip()]
         self.org_unit_match_threshold = min(1.0, max(0.0, float(org_unit_match_threshold)))
+        self.org_unit_exclude_enabled = bool(org_unit_exclude_enabled)
+        configured_exclude_keywords = (
+            list(DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS)
+            if org_unit_exclude_keywords is None
+            else list(org_unit_exclude_keywords)
+        )
+        self.org_unit_exclude_keywords = [
+            str(item).strip() for item in configured_exclude_keywords if str(item).strip()
+        ]
+        self.org_unit_llm_filter_enabled = bool(org_unit_llm_filter_enabled)
         self.session_state = CrawlSessionState.create(pipeline_enabled=self.pipeline_enabled)
         self.visited_urls = self.session_state.visited_urls
         self._fetch_cache = self.session_state.fetch_cache
@@ -202,6 +219,8 @@ class CrawlerAgent:
         self._target_org_unit_ids = self.session_state.target_org_unit_ids
         self._org_units_marked_no_faculty = self.session_state.org_units_marked_no_faculty
         self._pipeline_stats = self.session_state.pipeline_stats
+        self._last_org_unit_validated_count = 0
+        self._resume_force_refetch_urls: set[str] = set()
         self.extraction_pipeline = ExtractionPipeline(self._pipeline_stats)
         self.fetch_scheduler = FetchScheduler(self)
         self.faculty_discovery = FacultyDiscoveryService(self)
@@ -240,6 +259,10 @@ class CrawlerAgent:
                 self.university_name,
                 self.resume_mode,
             )
+            resume_seed_org_units: list[OrgUnit] = []
+            if self.resume_mode:
+                resume_seed_org_units = await self._prepare_resume_start()
+
             initial_professor_count = await self._professor_count()
             home = await self._fetch_url(self.start_url, 0)
             if home is None:
@@ -250,8 +273,10 @@ class CrawlerAgent:
                 return self._result(CrawlStatus.FAILED, ["Failed to fetch start URL"])
 
             # Retry loop: re-attempt the pipeline when a phase fails.
-            org_unit_pages: list[_QueuedUrl] = []
-            org_units: list[OrgUnit] = []
+            org_unit_pages: list[_QueuedUrl] = (
+                [_QueuedUrl(home.url, 0, label="resume_seed")] if resume_seed_org_units else []
+            )
+            org_units: list[OrgUnit] = list(resume_seed_org_units)
             faculty_links: list[_QueuedUrl] = []
 
             while self.backtrack_count <= self.max_backtracks:
@@ -313,7 +338,8 @@ class CrawlerAgent:
                         [unit.name for unit in org_units],
                         self.org_unit_match_threshold,
                     )
-                if (not self.target_org_units) and len(org_units) < self.min_org_units:
+                org_unit_count_for_minimum = max(len(org_units), self._last_org_unit_validated_count)
+                if (not self.target_org_units) and org_unit_count_for_minimum < self.min_org_units:
                     self.logger.info(
                         "Only %s org units found (min=%s), likely category pages; retrying",
                         len(org_units),
@@ -327,6 +353,18 @@ class CrawlerAgent:
                     org_units = []
                     self._skip_cross_run_dedup = True
                     continue
+                if not self.target_org_units:
+                    org_units = await self._filter_existing_org_units_for_discovery(
+                        org_units,
+                        source="crawl",
+                    )
+                    if not org_units:
+                        if self._too_many_backtracks("all org units excluded by scope filter"):
+                            break
+                        org_unit_pages = []
+                        org_units = []
+                        self._skip_cross_run_dedup = True
+                        continue
 
                 if self._is_interactive:
                     # Interactive (human) mode: find faculty + extract professors
@@ -369,6 +407,11 @@ class CrawlerAgent:
                     self._all_target_org_units_marked_no_faculty()
                 ):
                     message = "No professors saved: all targeted org units are marked no_faculty_page"
+                    retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                        context="target_no_faculty_completion",
+                    )
+                    if retryable_failure_result is not None:
+                        return retryable_failure_result
                     await self._set_status(CrawlStatus.COMPLETED)
                     self.logger.warning(
                         "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
@@ -390,6 +433,11 @@ class CrawlerAgent:
                     self.saved_professors,
                 )
 
+            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                context="crawl_completion",
+            )
+            if retryable_failure_result is not None:
+                return retryable_failure_result
             await self._set_status(CrawlStatus.COMPLETED)
             self.logger.info(
                 "Completed crawl for %s professors_total=%s professors_new=%s",
@@ -442,6 +490,24 @@ class CrawlerAgent:
             )
 
         if org_units:
+            if self.target_org_units:
+                org_units, unmatched = self._filter_target_org_units(org_units)
+                if unmatched:
+                    self.logger.warning(
+                        "Strict resume target org units unmatched university=%s requested=%s unmatched=%s threshold=%.2f",
+                        self.university_name,
+                        self.target_org_units,
+                        unmatched,
+                        self.org_unit_match_threshold,
+                    )
+                    org_units = []
+            else:
+                org_units = await self._filter_existing_org_units_for_discovery(
+                    org_units,
+                    source="strict_resume",
+                )
+
+        if org_units:
             self.logger.info(
                 "Strict resume seeding from existing org_units university=%s org_units=%s",
                 self.university_name,
@@ -476,6 +542,11 @@ class CrawlerAgent:
         total_professor_count = await self._professor_count()
         newly_saved_count = max(0, total_professor_count - initial_professor_count)
         if total_professor_count > 0:
+            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                context="strict_resume_completion",
+            )
+            if retryable_failure_result is not None:
+                return retryable_failure_result
             await self._set_status(CrawlStatus.COMPLETED)
             self.logger.info(
                 "Strict resume completed university=%s professors_total=%s professors_new=%s",
@@ -496,6 +567,84 @@ class CrawlerAgent:
             recoverable_tasks,
         )
         await self._set_status(CrawlStatus.FAILED)
+        return self._result(CrawlStatus.FAILED, [message])
+
+    async def _prepare_resume_start(self) -> list[OrgUnit]:
+        async with self.db.session() as session:
+            org_units = await crawler_db.list_org_units(session)
+            retryable_failure_urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+            if retryable_failure_urls:
+                self._add_resume_force_refetch_urls(retryable_failure_urls)
+                self.logger.info(
+                    "Strict resume will retry fetch failures university=%s urls=%s sample=%s",
+                    self.university_name,
+                    len(retryable_failure_urls),
+                    retryable_failure_urls[:5],
+                )
+            if self.org_unit_exclude_enabled and not self.target_org_units:
+                excluded_units, excluded_preview = self._hard_excluded_org_units(org_units)
+                if excluded_units:
+                    cleanup_summary = await crawler_db.cleanup_excluded_org_units(session, excluded_units)
+                    self.logger.info(
+                        "Strict resume cleaned excluded org units university=%s excluded=%s sample=%s summary=%s",
+                        self.university_name,
+                        len(excluded_units),
+                        excluded_preview[:5],
+                        cleanup_summary,
+                    )
+                    org_units = await crawler_db.list_org_units(session)
+
+            if self.resume_force_existing:
+                reset_count = 0
+                forced_urls: list[str] = []
+                for unit in org_units:
+                    if unit.status != OrgUnitStatus.NO_FACULTY_PAGE.value:
+                        continue
+                    if self.target_org_units and not self._matches_target_org_unit_name(unit.name):
+                        continue
+                    await crawler_db.set_org_unit_status(session, int(unit.id), OrgUnitStatus.PENDING)
+                    reset_count += 1
+                    url = _sanitize_url(unit.url or "")
+                    if url:
+                        self._resume_force_refetch_urls.add(url)
+                        self._resume_force_refetch_urls.add(url.rstrip("/"))
+                        forced_urls.append(url)
+                if reset_count:
+                    self.logger.info(
+                        "Strict resume reset no_faculty org units university=%s reset=%s forced_refetch_sample=%s",
+                        self.university_name,
+                        reset_count,
+                        forced_urls[:5],
+                    )
+                    org_units = await crawler_db.list_org_units(session)
+
+            if self.resume_force_existing:
+                return org_units[: self.max_org_units_per_university]
+            return []
+
+    def _add_resume_force_refetch_urls(self, urls: list[str]) -> None:
+        for raw_url in urls:
+            url = _sanitize_url(str(raw_url or ""))
+            if not url:
+                continue
+            self._resume_force_refetch_urls.add(url)
+            self._resume_force_refetch_urls.add(url.rstrip("/"))
+
+    async def _fail_if_retryable_fetch_failures_remain(self, *, context: str) -> AgentResult | None:
+        async with self.db.session() as session:
+            urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+        if not urls:
+            return None
+
+        message = f"retryable_fetch_failures_remaining: {len(urls)} fetch failures still need retry"
+        await self._set_status(CrawlStatus.FAILED)
+        self.logger.warning(
+            "Crawler finished with retryable fetch failures university=%s context=%s count=%s sample=%s",
+            self.university_name,
+            context,
+            len(urls),
+            urls[:5],
+        )
         return self._result(CrawlStatus.FAILED, [message])
 
     @staticmethod
@@ -569,6 +718,7 @@ class CrawlerAgent:
     async def _extract_org_units(self, org_unit_pages: list[_QueuedUrl]) -> list[OrgUnit]:
         self._log_state(CrawlerState.EXTRACT_ORG_UNITS)
         skills = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
+        self._last_org_unit_validated_count = 0
 
         max_pages = min(max(8, len(org_unit_pages)), 20)
         pending = list(org_unit_pages[:max_pages])
@@ -640,33 +790,52 @@ class CrawlerAgent:
             extracted_any = True
             validated = 0
             hallucinated = 0
+            validated_units: list[dict[str, Any]] = []
+            for unit in units:
+                name = str(unit.get("name") or "").strip()
+                raw_url = _sanitize_url(str(unit.get("url") or "").strip())
+                url = urljoin(fetched.url, raw_url) if raw_url and not urlparse(raw_url).scheme else raw_url
+                kind = str(unit.get("kind") or "").strip() or None
+                if not name or not url:
+                    continue
+                if _is_category_name(name):
+                    continue
+                if not _same_site(url, self.start_url):
+                    continue
+                if _is_faculty_platform(url):
+                    continue
+                # Validate: URL must appear in page links or page text.
+                if not _url_found_on_page(url, page_urls, page_text_lower):
+                    hallucinated += 1
+                    continue
+                validated += 1
+                validated_units.append(
+                    {
+                        "name": name,
+                        "url": url,
+                        "kind": kind,
+                        "discovered_from_url": fetched.url,
+                    }
+                )
+
+            self._last_org_unit_validated_count += len(validated_units)
+            filtered_units = await self._filter_org_unit_payloads_for_discovery(
+                validated_units,
+                source_url=fetched.url,
+                source="extract_org_units",
+            )
+
             async with self.db.session() as session:
-                for unit in units:
-                    name = str(unit.get("name") or "").strip()
-                    raw_url = _sanitize_url(str(unit.get("url") or "").strip())
-                    url = urljoin(fetched.url, raw_url) if raw_url and not urlparse(raw_url).scheme else raw_url
+                for unit in filtered_units:
                     kind = str(unit.get("kind") or "").strip() or None
-                    if not name or not url:
-                        continue
-                    if _is_category_name(name):
-                        continue
-                    if not _same_site(url, self.start_url):
-                        continue
-                    if _is_faculty_platform(url):
-                        continue
-                    # Validate: URL must appear in page links or page text.
-                    if not _url_found_on_page(url, page_urls, page_text_lower):
-                        hallucinated += 1
-                        continue
-                    validated += 1
                     if _is_core_academic_kind(kind):
                         core_validated_total += 1
                     await crawler_db.get_or_create_org_unit(
                         session,
-                        name=name,
-                        url=url,
+                        name=str(unit.get("name") or ""),
+                        url=str(unit.get("url") or ""),
                         kind=kind,
-                        discovered_from_url=fetched.url,
+                        discovered_from_url=str(unit.get("discovered_from_url") or fetched.url),
                     )
 
             if hallucinated:
@@ -774,6 +943,268 @@ class CrawlerAgent:
             )
             selected[key] = best_unit
         return list(selected.values()), unmatched
+
+    def _matches_target_org_unit_name(self, name: str) -> bool:
+        if not self.target_org_units:
+            return False
+        return any(
+            self._org_unit_match_score(target, name) >= self.org_unit_match_threshold
+            for target in self.target_org_units
+        )
+
+    def _hard_excluded_org_units(self, org_units: list[OrgUnit]) -> tuple[list[OrgUnit], list[dict[str, str]]]:
+        excluded: list[OrgUnit] = []
+        preview: list[dict[str, str]] = []
+        if not self.org_unit_exclude_enabled:
+            return excluded, preview
+        for unit in org_units:
+            name = str(getattr(unit, "name", "") or "").strip()
+            if not name or self._matches_target_org_unit_name(name):
+                continue
+            match = _org_unit_exclusion_match(
+                name=name,
+                kind=str(getattr(unit, "kind", "") or "").strip() or None,
+                url=str(getattr(unit, "url", "") or "").strip() or None,
+                keywords=self.org_unit_exclude_keywords,
+            )
+            if match is None:
+                continue
+            excluded.append(unit)
+            if len(preview) < 10:
+                preview.append(
+                    {
+                        "name": name,
+                        "url": str(getattr(unit, "url", "") or ""),
+                        "reason": match.reason,
+                    }
+                )
+        return excluded, preview
+
+    async def _filter_existing_org_units_for_discovery(
+        self,
+        org_units: list[OrgUnit],
+        *,
+        source: str,
+    ) -> list[OrgUnit]:
+        if not org_units or self.target_org_units or not self.org_unit_exclude_enabled:
+            return org_units
+
+        payloads = [
+            {
+                "id": int(unit.id) if unit.id is not None else None,
+                "name": unit.name,
+                "url": unit.url,
+                "kind": unit.kind,
+            }
+            for unit in org_units
+        ]
+        filtered_payloads = await self._filter_org_unit_payloads_for_discovery(
+            payloads,
+            source_url=self.start_url,
+            source=source,
+        )
+        kept_keys: set[str] = set()
+        for payload in filtered_payloads:
+            kept_keys.update(self._org_unit_filter_item_keys(payload))
+        return [
+            unit
+            for unit in org_units
+            if self._org_unit_filter_item_keys(
+                {
+                    "id": int(unit.id) if unit.id is not None else None,
+                    "name": unit.name,
+                    "url": unit.url,
+                }
+            )
+            & kept_keys
+        ]
+
+    async def _filter_org_unit_payloads_for_discovery(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        source_url: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        if not units or self.target_org_units or not self.org_unit_exclude_enabled:
+            return units
+
+        hard_kept: list[dict[str, Any]] = []
+        hard_excluded: list[dict[str, str]] = []
+        for unit in units:
+            name = str(unit.get("name") or "").strip()
+            if not name:
+                continue
+            if self._matches_target_org_unit_name(name):
+                hard_kept.append(unit)
+                continue
+            match = _org_unit_exclusion_match(
+                name=name,
+                kind=str(unit.get("kind") or "").strip() or None,
+                url=str(unit.get("url") or "").strip() or None,
+                keywords=self.org_unit_exclude_keywords,
+            )
+            if match is None:
+                hard_kept.append(unit)
+                continue
+            hard_excluded.append(
+                {
+                    "name": name,
+                    "url": str(unit.get("url") or ""),
+                    "reason": match.reason,
+                }
+            )
+
+        if hard_excluded:
+            self.logger.info(
+                "Org-unit hard exclusion university=%s source=%s page=%s excluded=%s sample=%s",
+                self.university_name,
+                source,
+                source_url,
+                len(hard_excluded),
+                hard_excluded[:5],
+            )
+
+        return await self._filter_org_unit_payloads_with_llm(
+            hard_kept,
+            source_url=source_url,
+            source=source,
+        )
+
+    async def _filter_org_unit_payloads_with_llm(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        source_url: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        if not units or not self.org_unit_llm_filter_enabled:
+            return units
+
+        payload = {
+            "allowed_tools": [],
+            "filter_task": "org_unit_exclusion",
+            "instruction": (
+                "Filter only org units that clearly belong to excluded categories: arts, sports, "
+                "Sino-foreign/joint programs, or basic teaching centers. Do not apply a broad "
+                "academic whitelist. Return JSON with included_org_units and excluded_org_units."
+            ),
+            "org_units": [
+                {
+                    "name": str(unit.get("name") or ""),
+                    "url": str(unit.get("url") or ""),
+                    "kind": str(unit.get("kind") or ""),
+                }
+                for unit in units
+            ],
+            "source": source,
+            "state": CrawlerState.EXTRACT_ORG_UNITS.value,
+            "university": self.university_name,
+            "url": source_url,
+        }
+        user_content = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        self._record_llm_payload(len(user_content.encode("utf-8", errors="ignore")))
+        skills_text = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
+        batches = self.context_manager.build_messages(
+            "You are a cautious university org-unit filter. When uncertain, keep the org unit.",
+            [],
+            skills_text,
+            user_content,
+            min(int(self.model_max_tokens), 16000),
+            dynamic_system_content="Tool call policy: Do not call any tools.",
+        )
+
+        try:
+            final_result = None
+            for batch in batches:
+                final_result = await self.llm_client.chat(batch, tools=None, tool_handlers={})
+        except Exception as error:
+            self.logger.warning(
+                "Org-unit LLM exclusion failed university=%s source=%s page=%s error=%s; keeping candidates",
+                self.university_name,
+                source,
+                source_url,
+                error,
+            )
+            return units
+
+        parsed = self._parse_json_from_text(getattr(final_result, "content", "") if final_result else "")
+        if not isinstance(parsed, dict):
+            self.logger.warning(
+                "Org-unit LLM exclusion returned invalid JSON university=%s source=%s page=%s; keeping candidates",
+                self.university_name,
+                source,
+                source_url,
+            )
+            return units
+
+        included = parsed.get("included_org_units")
+        excluded = parsed.get("excluded_org_units")
+        if not isinstance(included, list) or not isinstance(excluded, list):
+            self.logger.warning(
+                "Org-unit LLM exclusion missing included/excluded lists university=%s source=%s page=%s; keeping candidates",
+                self.university_name,
+                source,
+                source_url,
+            )
+            return units
+
+        excluded_keys: set[str] = set()
+        excluded_preview: list[Any] = []
+        for item in excluded:
+            keys = self._org_unit_filter_item_keys(item)
+            if not keys:
+                continue
+            excluded_keys.update(keys)
+            if len(excluded_preview) < 5:
+                excluded_preview.append(item)
+
+        if not excluded_keys:
+            return units
+
+        kept: list[dict[str, Any]] = []
+        for unit in units:
+            if self._org_unit_filter_item_keys(unit) & excluded_keys:
+                continue
+            kept.append(unit)
+
+        dropped = len(units) - len(kept)
+        if dropped:
+            self.logger.info(
+                "Org-unit LLM exclusion university=%s source=%s page=%s excluded=%s sample=%s",
+                self.university_name,
+                source,
+                source_url,
+                dropped,
+                excluded_preview,
+            )
+        return kept
+
+    def _org_unit_filter_item_keys(self, item: Any) -> set[str]:
+        if isinstance(item, str):
+            name = item
+            url = ""
+            raw_id = None
+        elif isinstance(item, dict):
+            name = str(item.get("name") or item.get("org_unit_name") or "")
+            url = str(item.get("url") or item.get("org_unit_url") or "")
+            raw_id = item.get("id") or item.get("org_unit_id")
+        else:
+            return set()
+
+        keys: set[str] = set()
+        try:
+            if raw_id is not None:
+                keys.add(f"id:{int(raw_id)}")
+        except (TypeError, ValueError):
+            pass
+        normalized_name = self._normalize_org_unit_match_text(name)
+        if normalized_name:
+            keys.add(f"name:{normalized_name}")
+        normalized_url = _sanitize_url(url)
+        if normalized_url:
+            keys.add(f"url:{normalized_url}")
+        return keys
 
     async def _set_org_unit_status(self, org_unit_id: int | None, status: OrgUnitStatus) -> None:
         if org_unit_id is None:

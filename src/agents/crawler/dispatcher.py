@@ -41,6 +41,7 @@ class _UniversityProgress:
     has_db: bool
     status: CrawlStatus | None
     professor_count: int
+    retryable_fetch_failure_count: int = 0
 
 
 AgentFactory = Callable[..., CrawlerAgent]
@@ -107,6 +108,7 @@ class CrawlDispatcher:
         university_db_dir.mkdir(parents=True, exist_ok=True)
 
         all_targets = crawler_db.load_university_targets_from_csv(self.settings.websites_path)
+        explicit_universities = bool(universities)
         selected = set(universities or [])
         targets: list[_UniversityTarget] = []
         for item in all_targets:
@@ -124,7 +126,7 @@ class CrawlDispatcher:
 
         if resume:
             self.logger.info("Run mode=resume; preserving existing per-university databases")
-            await self._inspect_progress(targets)
+            await self._inspect_progress(targets, force_existing=explicit_universities)
         else:
             self.logger.info("Run mode=fresh; backing up and rebuilding selected per-university databases")
             self._prepare_fresh_run(targets)
@@ -136,10 +138,18 @@ class CrawlDispatcher:
         async with self.fetcher_factory() as fetcher:
             tasks = []
             for university in targets:
-                if resume and await self._should_skip(university):
+                if resume and not explicit_universities and await self._should_skip(university):
                     skipped += 1
                     continue
-                tasks.append(self._run_one(university, fetcher, semaphore, resume_mode=resume))
+                tasks.append(
+                    self._run_one(
+                        university,
+                        fetcher,
+                        semaphore,
+                        resume_mode=resume,
+                        resume_force_existing=resume and explicit_universities,
+                    )
+                )
             if tasks:
                 results = list(await asyncio.gather(*tasks))
 
@@ -191,7 +201,7 @@ class CrawlDispatcher:
             index += 1
         return candidate
 
-    async def _inspect_progress(self, targets: list[_UniversityTarget]) -> None:
+    async def _inspect_progress(self, targets: list[_UniversityTarget], *, force_existing: bool = False) -> None:
         for university in targets:
             progress = await self._get_university_progress(university)
             if not progress.has_db:
@@ -200,13 +210,26 @@ class CrawlDispatcher:
                     university.name,
                 )
                 continue
-            action = "skip" if progress.status == CrawlStatus.COMPLETED and progress.professor_count > 0 else "crawl"
+            action = (
+                "crawl"
+                if force_existing
+                else (
+                    "skip"
+                    if (
+                        progress.status == CrawlStatus.COMPLETED
+                        and progress.professor_count > 0
+                        and progress.retryable_fetch_failure_count <= 0
+                    )
+                    else "crawl"
+                )
+            )
             status_text = progress.status.value if progress.status else "unknown"
             self.logger.info(
-                "Resume progress university=%s status=%s professors=%s action=%s db=%s",
+                "Resume progress university=%s status=%s professors=%s retryable_fetch_failures=%s action=%s db=%s",
                 university.name,
                 status_text,
                 progress.professor_count,
+                progress.retryable_fetch_failure_count,
                 action,
                 university.db_path,
             )
@@ -221,6 +244,13 @@ class CrawlDispatcher:
             self.logger.info(
                 "Re-crawling %s because it is marked completed but has no professors",
                 university.name,
+            )
+            return False
+        if progress.retryable_fetch_failure_count > 0:
+            self.logger.info(
+                "Re-crawling %s because %s retryable fetch failures remain",
+                university.name,
+                progress.retryable_fetch_failure_count,
             )
             return False
         self.logger.info(
@@ -246,10 +276,12 @@ class CrawlDispatcher:
                 )
                 status = await crawler_db.get_university_status(session)
                 professor_count = await crawler_db.count_professors(session)
+                retryable_fetch_failure_count = await crawler_db.count_retryable_fetch_failure_urls(session)
                 return _UniversityProgress(
                     has_db=True,
                     status=status,
                     professor_count=int(professor_count),
+                    retryable_fetch_failure_count=int(retryable_fetch_failure_count),
                 )
         finally:
             await db.close()
@@ -261,6 +293,7 @@ class CrawlDispatcher:
         semaphore: asyncio.Semaphore,
         *,
         resume_mode: bool,
+        resume_force_existing: bool = False,
     ) -> AgentResult:
         async with semaphore:
             timeout_seconds = float(self.settings.university_timeout_seconds)
@@ -311,8 +344,12 @@ class CrawlDispatcher:
                         invalid_json_max_retry=self.settings.invalid_json_max_retry,
                         task_recovery_enabled=self.settings.task_recovery_enabled,
                         resume_mode=resume_mode,
+                        resume_force_existing=resume_force_existing,
                         target_org_units=list(self.settings.target_org_units or []),
                         org_unit_match_threshold=self.settings.org_unit_match_threshold,
+                        org_unit_exclude_enabled=self.settings.org_unit_exclude_enabled,
+                        org_unit_exclude_keywords=list(self.settings.org_unit_exclude_keywords or []),
+                        org_unit_llm_filter_enabled=self.settings.org_unit_llm_filter_enabled,
                     )
                     return await agent.run()
 
