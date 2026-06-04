@@ -58,6 +58,8 @@ FACULTY_KEYWORDS = (
     "mentor",
     "directory",
     "list",
+    "szjs",
+    "zzjs",
     "szdw",
     "szll",
     "jsdw",
@@ -160,6 +162,58 @@ _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "公共基础教学部",
             "基础教育中心",
             "公共课教学",
+        ),
+    ),
+    (
+        "continuing_education",
+        (
+            "继续教育学院",
+            "继续教育",
+            "成人教育学院",
+            "成人教育",
+            "成人高等教育",
+            "网络教育学院",
+            "网络教育",
+            "开放教育学院",
+            "开放教育",
+            "职业与继续教育学院",
+            "继续教育与培训",
+            "继续教育培训",
+            "continuing education",
+            "adult education",
+            "online education",
+        ),
+    ),
+    (
+        "undergraduate_teaching_unit",
+        (
+            "书院",
+            "本科生院",
+            "本科生学院",
+            "本科教育学院",
+            "本科教育",
+            "荣誉学院",
+            "荣誉书院",
+            "通识教育学院",
+            "通识教育",
+            "新生学院",
+            "北航学院",
+            "residential college",
+            "undergraduate college",
+            "honors college",
+            "honours college",
+            "general education",
+        ),
+    ),
+    (
+        "excellent_engineer_program",
+        (
+            "卓工",
+            "卓越工程师",
+            "卓越工程师学院",
+            "卓越工程师培养",
+            "excellent engineer",
+            "elite engineer",
         ),
     ),
 )
@@ -521,6 +575,9 @@ _FACULTY_FULL_TEXT_HINTS = (
     "师资队伍",
     "教师队伍",
     "专任教师",
+    "在职教师",
+    "在岗教师",
+    "现任教师",
     "faculty list",
     "teacher list",
     "all teachers",
@@ -533,6 +590,9 @@ _FACULTY_FULL_STRONG_TEXT_HINTS = (
     "师资队伍",
     "教师队伍",
     "专任教师",
+    "在职教师",
+    "在岗教师",
+    "现任教师",
     "faculty list",
     "all teachers",
     "teaching staff",
@@ -604,6 +664,20 @@ def _contains_any(text: str, hints: tuple[str, ...]) -> bool:
     return any(hint.lower() in lowered for hint in hints)
 
 
+def _looks_like_active_roster_url(url: str) -> bool:
+    tokens = set(_iter_url_noise_tokens(url))
+    if not tokens or tokens.intersection({"djgz", "dqjs", "dangjian", "party"}):
+        return False
+    if "zzjs" not in tokens:
+        return False
+    return bool(tokens.intersection({"szjs", "szdw", "jsdw", "faculty", "teacher", "teachers"}))
+
+
+def _looks_like_generic_faculty_section_url(url: str) -> bool:
+    tokens = set(_iter_url_noise_tokens(url))
+    return "szjs" in tokens and not _looks_like_active_roster_url(url)
+
+
 def _assess_faculty_candidate(
     url: str,
     *,
@@ -639,7 +713,8 @@ def _assess_faculty_candidate(
         ]
     )
 
-    full_hit = _contains_any(signal_text, _FACULTY_FULL_TEXT_HINTS)
+    active_roster_url_hit = _looks_like_active_roster_url(url)
+    full_hit = _contains_any(signal_text, _FACULTY_FULL_TEXT_HINTS) or active_roster_url_hit
     full_strong_hit = _contains_any(signal_text, _FACULTY_FULL_STRONG_TEXT_HINTS)
     category_hit = _contains_any(signal_text, _FACULTY_CATEGORY_TEXT_HINTS)
     elite_hit = _contains_any(signal_text, _FACULTY_ELITE_TEXT_HINTS)
@@ -649,7 +724,7 @@ def _assess_faculty_candidate(
     score = 0
     if full_hit:
         score += 12
-        reasons.append("full_hit")
+        reasons.append("active_roster_url_hit" if active_roster_url_hit else "full_hit")
     if category_hit:
         score += 7
         reasons.append("category_hit")
@@ -659,7 +734,12 @@ def _assess_faculty_candidate(
     if nav_hit:
         score += 2
         reasons.append("nav_hit")
-    if _looks_like_faculty_page(url):
+    if _looks_like_faculty_page(url) and (
+        active_roster_url_hit
+        or category_hit
+        or elite_hit
+        or not _looks_like_generic_faculty_section_url(url)
+    ):
         score += 3
         reasons.append("url_faculty_hit")
     if _is_pagination_link(url):
