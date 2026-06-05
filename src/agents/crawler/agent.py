@@ -26,6 +26,7 @@ from agents.crawler.models import (
     UniversityMeta,
 )
 from agents.crawler.org_unit_filter import (
+    ORG_UNIT_FILTER_STATE,
     hard_filter_org_unit_payloads,
     is_teaching_experiment_center_name,
     llm_filter_org_unit_payloads,
@@ -126,6 +127,7 @@ class _ExtractionTaskItem:
     strict_retry: bool = False
     detail_mode: bool = False
     task_kind: str = CrawlTaskKind.LIST_PAGE.value
+    recovered: bool = False
 
 
 @dataclass
@@ -770,7 +772,9 @@ class CrawlerAgent:
             result = await self._ask_llm(
                 CrawlerState.EXTRACT_ORG_UNITS,
                 "Extract academic org units (colleges/schools/departments/research institutes). "
-                "Exclude admin offices. Return JSON: {\"org_units\": [{\"name\": ..., \"url\": ..., \"kind\": ...}]}",
+                "Exclude admin offices. Return only JSON with top-level key "
+                "{\"org_units\": [{\"name\": ..., \"url\": ..., \"kind\": ...}]}. "
+                "Do not return included_org_units or excluded_org_units for this extraction task.",
                 fetched,
                 skills,
             )
@@ -1094,7 +1098,7 @@ class CrawlerAgent:
         if not units or not self.org_unit_llm_filter_enabled:
             return units
 
-        skills_text = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
+        skills_text = self.skill_manager.select_for_state(ORG_UNIT_FILTER_STATE, set()).rendered_text
         result = await llm_filter_org_unit_payloads(
             units,
             llm_client=self.llm_client,
@@ -1684,13 +1688,14 @@ class CrawlerAgent:
             if self.pipeline_enabled and self.task_recovery_enabled:
                 default_recovery_limit = self.pipeline_queue_cap * 4
                 effective_recovery_limit = max(default_recovery_limit, int(recovery_limit or 0))
-                recovered = await self._recover_pipeline_tasks(limit=effective_recovery_limit)
-                for task in recovered:
-                    await llm_queue.put(task)
-                if recovered:
+                recovered_count = await self._recover_pipeline_tasks(
+                    llm_queue=llm_queue,
+                    limit=effective_recovery_limit,
+                )
+                if recovered_count:
                     self.logger.info(
                         "Recovered %s pending extraction tasks from DB queue_cap=%s recovery_limit=%s",
-                        len(recovered),
+                        recovered_count,
                         self.pipeline_queue_cap,
                         effective_recovery_limit,
                     )
@@ -1757,7 +1762,7 @@ class CrawlerAgent:
             await asyncio.gather(*db_workers, return_exceptions=False)
 
             self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s deduped_by_homepage=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
+                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s deduped_by_homepage=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s recovery_refetched=%s recovery_enqueued=%s recovery_consumed=%s recovery_refetch_skipped_with_snapshot=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
                 self._pipeline_stats.get("queue_depth", 0),
                 self._pipeline_stats.get("processed_tasks", 0),
                 self._pipeline_stats.get("retries", 0),
@@ -1776,6 +1781,10 @@ class CrawlerAgent:
                 self._pipeline_stats.get("deduped_by_homepage", 0),
                 self._pipeline_stats.get("list_roster_overlap_high", 0),
                 self._pipeline_stats.get("stale_in_progress_recovered", 0),
+                self._pipeline_stats.get("recovery_refetched", 0),
+                self._pipeline_stats.get("recovery_enqueued", 0),
+                self._pipeline_stats.get("recovery_consumed", 0),
+                self._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0),
                 float(self._pipeline_stats.get("average_task_ms", 0.0)),
                 self._pipeline_stats.get("llm_calls_total", 0),
                 self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
@@ -1941,7 +1950,12 @@ class CrawlerAgent:
             self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
         self._pipeline_stats["queue_depth"] = llm_queue.qsize()
 
-    async def _recover_pipeline_tasks(self, *, limit: int) -> list[_ExtractionTaskItem]:
+    async def _recover_pipeline_tasks(
+        self,
+        *,
+        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
+        limit: int,
+    ) -> int:
         async with self.db.session() as session:
             stale_count = await crawler_db.recover_stale_in_progress_crawl_tasks(session)
             rows = await crawler_db.list_recoverable_crawl_tasks(session, limit=limit)
@@ -1950,7 +1964,7 @@ class CrawlerAgent:
                 self._pipeline_stats.get("stale_in_progress_recovered", 0)
             ) + int(stale_count)
             self.logger.info("Recovered %s stale in_progress extraction tasks", stale_count)
-        recovered: list[_ExtractionTaskItem] = []
+        recovered_count = 0
         for row in rows:
             allowed_tools = ["save_professors"]
             task_kind = str(getattr(row, "task_kind", None) or CrawlTaskKind.LIST_PAGE.value)
@@ -1981,23 +1995,22 @@ class CrawlerAgent:
                         allowed_tools = [str(item) for item in parsed]
                 except Exception:
                     pass
-            recovered.append(
-                _ExtractionTaskItem(
-                    task_id=int(row_data["id"]),
-                    university=str(row_data["university"] or self.university_name),
-                    org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
-                    org_unit_url=row_data["org_unit_url"],
-                    source_url=str(row_data["source_url"] or ""),
-                    page_url=str(row_data["page_url"] or row_data["source_url"] or ""),
-                    page_hash=str(row_data["page_hash"] or ""),
-                    page_text_snapshot=str(row_data["page_text_snapshot"] or ""),
-                    allowed_tools=allowed_tools,
-                    attempt=int(row_data["attempt"] or 0),
-                    priority=int(row_data["priority"] or 0),
-                    strict_retry=(int(row_data["attempt"] or 0) > 0),
-                    detail_mode=detail_mode,
-                    task_kind=task_kind,
-                )
+            task = _ExtractionTaskItem(
+                task_id=int(row_data["id"]),
+                university=str(row_data["university"] or self.university_name),
+                org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
+                org_unit_url=row_data["org_unit_url"],
+                source_url=str(row_data["source_url"] or ""),
+                page_url=str(row_data["page_url"] or row_data["source_url"] or ""),
+                page_hash=str(row_data["page_hash"] or ""),
+                page_text_snapshot=str(row_data["page_text_snapshot"] or ""),
+                allowed_tools=allowed_tools,
+                attempt=int(row_data["attempt"] or 0),
+                priority=int(row_data["priority"] or 0),
+                strict_retry=(int(row_data["attempt"] or 0) > 0),
+                detail_mode=detail_mode,
+                task_kind=task_kind,
+                recovered=True,
             )
             if row_data["status"] == CrawlTaskStatus.RETRY.value:
                 self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
@@ -2007,15 +2020,27 @@ class CrawlerAgent:
                 self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
             else:
                 self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
-        return recovered
+            await llm_queue.put(task)
+            recovered_count += 1
+            self._pipeline_stats["recovery_enqueued"] = int(
+                self._pipeline_stats.get("recovery_enqueued", 0)
+            ) + 1
+            self._pipeline_stats["queue_depth"] = llm_queue.qsize()
+        return recovered_count
 
-    @staticmethod
-    def _recovered_task_needs_refetch(row_data: dict[str, Any], *, detail_mode: bool) -> bool:
+    def _recovered_task_needs_refetch(self, row_data: dict[str, Any], *, detail_mode: bool) -> bool:
         if not detail_mode:
             return False
         last_error = str(row_data.get("last_error") or "")
         snapshot = str(row_data.get("page_text_snapshot") or "")
-        return not snapshot.strip() or last_error.startswith(_COMPLETION_RECRAWL_LAST_ERROR_PREFIX)
+        if not snapshot.strip():
+            return True
+        if last_error == "completion_recrawl_refetched":
+            self._pipeline_stats["recovery_refetch_skipped_with_snapshot"] = int(
+                self._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0)
+            ) + 1
+            return False
+        return last_error.startswith(_COMPLETION_RECRAWL_LAST_ERROR_PREFIX)
 
     async def _refetch_recovered_detail_task(self, row_data: dict[str, Any]) -> dict[str, Any] | None:
         task_id = int(row_data["id"])
@@ -2093,6 +2118,17 @@ class CrawlerAgent:
                 status=CrawlTaskStatus.RETRY,
                 last_error="completion_recrawl_refetched",
             )
+            refreshed.page_text_snapshot = snapshot
+            refreshed.page_hash = page_hash
+            refreshed.page_url = source_url
+            refreshed.allowed_tools = allowed_tools
+            refreshed.task_kind = CrawlTaskKind.DETAIL_PAGE.value
+            refreshed.status = CrawlTaskStatus.RETRY.value
+            refreshed.last_error = "completion_recrawl_refetched"
+            await session.flush()
+            self._pipeline_stats["recovery_refetched"] = int(
+                self._pipeline_stats.get("recovery_refetched", 0)
+            ) + 1
             return {
                 "id": int(refreshed.id),
                 "university": refreshed.university or self.university_name,
@@ -2131,6 +2167,10 @@ class CrawlerAgent:
                 return
 
             started = time.perf_counter()
+            if task.recovered:
+                self._pipeline_stats["recovery_consumed"] = int(
+                    self._pipeline_stats.get("recovery_consumed", 0)
+                ) + 1
             self._pipeline_stats["in_progress"] = int(self._pipeline_stats.get("in_progress", 0)) + 1
             self._pipeline_stats["pending"] = max(0, int(self._pipeline_stats.get("pending", 0)) - 1)
             async with self.db.session() as session:

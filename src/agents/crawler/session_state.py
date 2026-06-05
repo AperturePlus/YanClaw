@@ -69,6 +69,10 @@ class CrawlSessionState:
                 "detail_pending_empty_with_candidates": 0,
                 "list_roster_overlap_high": 0,
                 "stale_in_progress_recovered": 0,
+                "recovery_refetched": 0,
+                "recovery_enqueued": 0,
+                "recovery_consumed": 0,
+                "recovery_refetch_skipped_with_snapshot": 0,
             }
         )
         return state
