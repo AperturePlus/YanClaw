@@ -35,6 +35,7 @@ from agents.crawler.models import (
     Professor,
     UniversityMeta,
 )
+from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMResult, ToolCallErrorRecord, ToolCallRecord
@@ -697,6 +698,150 @@ async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_
     assert all(task.status == CrawlTaskStatus.DONE.value for task in tasks)
     assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
     assert int(agent._pipeline_stats.get("records_created", 0)) == 1
+    await db.close()
+
+
+async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_serializes(tmp_path):
+    class ParallelLLM:
+        def __init__(self, *, release_after: int):
+            self.release_after = release_after
+            self.started = 0
+            self.active = 0
+            self.max_active = 0
+            self.all_started = asyncio.Event()
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            self.started += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.started >= self.release_after:
+                self.all_started.set()
+            try:
+                await self.all_started.wait()
+                payload = json.loads(messages[-1]["content"])
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="CS",
+                    org_unit_url="https://www.example.edu.cn/cs",
+                    source_url=payload["url"],
+                    professors=[{"name": f"Ada {payload['url'].rsplit('/', 1)[-1]}", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            finally:
+                self.active -= 1
+
+    llm = ParallelLLM(release_after=4)
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        llm,
+        pages={},
+        pipeline_queue_cap=4,
+        pipeline_llm_workers=4,
+        pipeline_db_workers=1,
+    )
+    save_active = 0
+    max_save_active = 0
+
+    async def fake_save_payloads_to_db(payloads, *, task):
+        nonlocal save_active, max_save_active
+        save_active += 1
+        max_save_active = max(max_save_active, save_active)
+        try:
+            await asyncio.sleep(0.01)
+            return {
+                "accepted": 1,
+                "created": 1,
+                "updated": 0,
+                "unchanged": 0,
+                "deduped_by_name_key": 0,
+                "deduped_by_homepage": 0,
+            }
+        finally:
+            save_active -= 1
+
+    agent._save_payloads_to_db = fake_save_payloads_to_db
+
+    async with db.session() as session:
+        for index in range(4):
+            await crawler_db.upsert_crawl_task(
+                session,
+                university="TestU",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_hash=f"parallel-task-{index}",
+                page_text_snapshot=f"faculty list Ada {index}",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=4), timeout=10)
+
+    async with db.session() as session:
+        summary = await crawler_db.summarize_crawl_task_status(session)
+    assert llm.max_active == 4
+    assert max_save_active == 1
+    assert summary[CrawlTaskStatus.DONE.value] == 4
+    await db.close()
+
+
+async def test_pipeline_invalid_json_retry_does_not_deadlock_when_queue_is_full(tmp_path):
+    class QueueSaturationRetryLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.invalid_returned = False
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") != "EXTRACT_PROFESSORS":
+                return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+            if not self.invalid_returned:
+                self.invalid_returned = True
+                return LLMResult(
+                    "",
+                    [],
+                    [ToolCallErrorRecord("save_professors", '{"org_unit_name":"CS","professors":[', "invalid_json")],
+                )
+            result = await tool_handlers["save_professors"](
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
+                professors=[{"name": f"Ada {payload['url'].rsplit('/', 1)[-1]}", "title": "Professor"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        QueueSaturationRetryLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        for index in range(5):
+            await crawler_db.upsert_crawl_task(
+                session,
+                university="TestU",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                page_hash=f"invalid-retry-task-{index}",
+                page_text_snapshot=f"faculty list Ada {index}",
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.PENDING,
+            )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
+
+    async with db.session() as session:
+        summary = await crawler_db.summarize_crawl_task_status(session)
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert summary[CrawlTaskStatus.DONE.value] == 5
+    assert summary[CrawlTaskStatus.PENDING.value] == 0
+    assert summary[CrawlTaskStatus.RETRY.value] == 0
+    assert any(failure.failure_type == "invalid_json" and failure.resolver == "retry" for failure in failures)
     await db.close()
 
 
@@ -1467,6 +1612,108 @@ async def test_agent_pipeline_retries_invalid_json_once_then_saves(tmp_path):
         failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
         assert any(f.failure_type == "invalid_json" and f.resolver == "retry" for f in failures)
     await db.close()
+
+
+async def test_agent_keeps_invalid_json_exhausted_task_recoverable_and_fails_completion(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty profile list",
+            [],
+            200,
+        ),
+    }
+
+    class AlwaysInvalidProfessorLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                return LLMResult(
+                    "",
+                    [],
+                    [ToolCallErrorRecord("save_professors", '{"org_unit_name":"CS","professors":[', "invalid_json")],
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    fetcher = FakeFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "invalid_exhausted.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("extract-links", "## Goal\nlinks\n", "links")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+
+    agent = CrawlerAgent(
+        university_name="InvalidExhaustedU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=AlwaysInvalidProfessorLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        min_org_units=1,
+        invalid_json_max_retry=1,
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.FAILED.value
+    assert any("recoverable_extraction_tasks_remaining" in message for message in result.messages)
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.RETRY.value
+    assert task.attempt == 1
+    assert task.last_error == "invalid_json_retry_exhausted"
+    assert any(failure.failure_type == "invalid_json" and failure.resolver == "retry" for failure in failures)
+    await db.close()
+
+
+def test_professor_prompt_templates_include_retry_constraints():
+    detail_instruction = CrawlerPromptBuilder.build_professor_instruction(
+        "计算机学院",
+        detail_mode=True,
+        strict_retry=False,
+    )
+    list_instruction = CrawlerPromptBuilder.build_professor_instruction(
+        "计算机学院",
+        detail_mode=False,
+        strict_retry=False,
+    )
+    retry_instruction = CrawlerPromptBuilder.build_professor_instruction(
+        "计算机学院",
+        detail_mode=True,
+        strict_retry=True,
+    )
+    dynamic_policy = CrawlerPromptBuilder.build_dynamic_system_content(
+        {"save_professors"},
+        strict_json=True,
+    )
+
+    assert CRAWLER_SYSTEM_PROMPT.startswith("You are a cautious university faculty crawler")
+    assert "Only save records that include at least one of email/phone/research_areas" in detail_instruction
+    assert "save visible names and academic titles" in list_instruction
+    assert "avoid bio, publications, long arrays, and extra keys" in retry_instruction
+    assert dynamic_policy == "Tool call policy: Only call save_professors. Do not invent tool names. Keep output short and strict JSON."
 
 
 async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path):

@@ -143,6 +143,33 @@ def test_crawler_settings_removed_human_only_fake_knobs():
         assert not hasattr(settings, name)
 
 
+def test_crawler_settings_default_llm_parallelism_has_no_rate_limit():
+    settings = CrawlerSettings(_env_file=None)
+
+    assert settings.pipeline_llm_workers == 4
+    assert settings.pipeline_db_workers == 1
+    assert settings.llm_max_concurrent == 8
+    assert settings.llm_min_interval_seconds == 0.0
+
+
+def test_dispatcher_default_llm_client_uses_concurrency_settings(tmp_path):
+    settings = CrawlerSettings(
+        _env_file=None,
+        websites_path=tmp_path / "websites.csv",
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        openai_api_key="key",
+        llm_max_concurrent=11,
+        llm_min_interval_seconds=0.25,
+    )
+
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    client = dispatcher.llm_client_factory()
+
+    assert client.max_concurrent == 11
+    assert client.min_interval == 0.25
+
+
 async def test_dispatcher_enforces_university_timeout(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(

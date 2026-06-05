@@ -5,7 +5,7 @@ from pathlib import Path
 from sqlalchemy import select
 
 from agents.crawler.models import Academician, Professor
-from agents.crawler.tools import get_crawler_tools
+from agents.crawler.tools import SAVE_PROFESSORS_TOOL, get_crawler_tools
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
 from tests.conftest import sqlite_url
@@ -282,6 +282,55 @@ def test_save_professors_skill_documents_name_and_homepage_rules():
     assert "is_academician" in text
     assert "研究方向" in text
     assert "父级学院" in text
+
+
+async def test_save_professors_batches_payload_in_one_session_and_allows_empty_list(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "tools_batch.db"))
+    await db.init_db()
+    manager = SkillManager(tmp_path / "skills", db, "crawler")
+    tools = get_crawler_tools(db, manager)
+    original_session = db.session
+    session_calls = 0
+
+    def counted_session():
+        nonlocal session_calls
+        session_calls += 1
+        return original_session()
+
+    db.session = counted_session
+    empty = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/empty",
+        professors=[],
+    )
+    assert empty["accepted"] == 0
+    assert session_calls == 0
+
+    result = await tools["save_professors"](
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/faculty",
+        professors=[
+            {"name": "Ada", "title": "Professor"},
+            {"name": "Grace", "title": "Associate Professor"},
+            {"name": "Ada", "email": "ada@example.edu.cn"},
+        ],
+    )
+
+    assert session_calls == 1
+    assert result["accepted"] == 3
+    assert result["created"] == 2
+    assert result["updated"] == 1
+    assert result["deduped_by_name_key"] == 1
+    async with original_session() as session:
+        professors = (await session.execute(select(Professor).order_by(Professor.name.asc()))).scalars().all()
+    assert [professor.name for professor in professors] == ["Ada", "Grace"]
+    assert next(professor for professor in professors if professor.name == "Ada").email == "ada@example.edu.cn"
+
+    professors_schema = SAVE_PROFESSORS_TOOL["parameters"]["properties"]["professors"]
+    assert "minItems" not in professors_schema
+    await db.close()
 
 
 def test_org_unit_filter_skill_documents_teaching_center_and_sub_department_rules():
