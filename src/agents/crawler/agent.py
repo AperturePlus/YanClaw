@@ -34,7 +34,7 @@ from agents.crawler.org_unit_filter import (
     normalize_org_unit_match_text,
     org_unit_filter_item_keys,
 )
-from agents.crawler.prompt_builder import CrawlerPromptBuilder
+from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
 from agents.crawler.sanitizer import contains_academician_hint, contains_self_academician_hint, normalize_name
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
@@ -413,6 +413,10 @@ class CrawlerAgent:
                     await self._extract_professors(faculty_links)
 
 
+            recoverable_task_result = await self._fail_if_recoverable_tasks_remain(context="crawl_completion")
+            if recoverable_task_result is not None:
+                return recoverable_task_result
+
             total_professor_count = await self._professor_count()
             newly_saved_count = max(0, total_professor_count - initial_professor_count)
             if total_professor_count <= 0:
@@ -667,6 +671,28 @@ class CrawlerAgent:
             context,
             len(urls),
             urls[:5],
+        )
+        return self._result(CrawlStatus.FAILED, [message])
+
+    async def _fail_if_recoverable_tasks_remain(self, *, context: str) -> AgentResult | None:
+        async with self.db.session() as session:
+            task_summary = await crawler_db.summarize_crawl_task_status(session)
+        recoverable_tasks = self._recoverable_task_count(task_summary)
+        if recoverable_tasks <= 0:
+            return None
+
+        message = (
+            "recoverable_extraction_tasks_remaining: "
+            f"{recoverable_tasks} pending/retry/in_progress crawl tasks still need resume"
+        )
+        await self._set_status(CrawlStatus.FAILED)
+        self.logger.warning(
+            "Crawler finished with recoverable extraction tasks university=%s context=%s pending=%s retry=%s in_progress=%s",
+            self.university_name,
+            context,
+            task_summary.get(CrawlTaskStatus.PENDING.value, 0),
+            task_summary.get(CrawlTaskStatus.RETRY.value, 0),
+            task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0),
         )
         return self._result(CrawlStatus.FAILED, [message])
 
@@ -1520,12 +1546,14 @@ class CrawlerAgent:
         skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
         max_pages = min(max(40, len(faculty_links)), 120)
         self.logger.info(
-            "Extraction pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s",
+            "Extraction pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s llm_max_concurrent=%s llm_min_interval_seconds=%s",
             self.pipeline_enabled,
             self.pipeline_llm_workers,
             self.pipeline_db_workers,
             self.pipeline_queue_cap,
             self.invalid_json_max_retry,
+            getattr(self.llm_client, "max_concurrent", "unknown"),
+            getattr(self.llm_client, "min_interval", "unknown"),
         )
 
         scheduled_urls: set[str] = set()
@@ -2173,23 +2201,37 @@ class CrawlerAgent:
                 ) + 1
             self._pipeline_stats["in_progress"] = int(self._pipeline_stats.get("in_progress", 0)) + 1
             self._pipeline_stats["pending"] = max(0, int(self._pipeline_stats.get("pending", 0)) - 1)
-            async with self.db.session() as session:
-                await crawler_db.set_crawl_task_status(
-                    session,
-                    task.task_id,
-                    status=CrawlTaskStatus.IN_PROGRESS,
-                    attempt=task.attempt,
-                )
+            current_task = task
+            retry_exhausted = False
+            while True:
+                async with self.db.session() as session:
+                    await crawler_db.set_crawl_task_status(
+                        session,
+                        current_task.task_id,
+                        status=CrawlTaskStatus.IN_PROGRESS,
+                        attempt=current_task.attempt,
+                    )
 
-            outcome = await self._run_extraction_task(task, skills)
-            invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
-            if invalid_events:
-                await self._handle_invalid_json_retry(task, invalid_events, llm_queue)
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                self._update_pipeline_timing(elapsed_ms)
-                self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
-                llm_queue.task_done()
+                outcome = await self._run_extraction_task(current_task, skills)
+                invalid_events = [
+                    event for event in outcome.invalid_json_events if event.get("name") == "save_professors"
+                ]
+                if not invalid_events:
+                    break
+
+                retry_task = await self._handle_invalid_json_retry(current_task, invalid_events)
+                if retry_task is None:
+                    elapsed_ms = (time.perf_counter() - started) * 1000
+                    self._update_pipeline_timing(elapsed_ms)
+                    self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
+                    llm_queue.task_done()
+                    retry_exhausted = True
+                    break
+                current_task = retry_task
+            if retry_exhausted:
                 continue
+
+            task = current_task
 
             if not outcome.payloads:
                 async with self.db.session() as session:
@@ -2286,8 +2328,7 @@ class CrawlerAgent:
         self,
         task: _ExtractionTaskItem,
         invalid_events: list[dict[str, Any]],
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
-    ) -> None:
+    ) -> _ExtractionTaskItem | None:
         preview = (invalid_events[0].get("raw_args_preview") or "")[:5000] if invalid_events else None
         if task.attempt < self.invalid_json_max_retry:
             next_attempt = task.attempt + 1
@@ -2306,6 +2347,7 @@ class CrawlerAgent:
                 strict_retry=True,
                 detail_mode=task.detail_mode,
                 task_kind=task.task_kind,
+                recovered=task.recovered,
             )
             async with self.db.session() as session:
                 await crawler_db.set_crawl_task_status(
@@ -2326,18 +2368,15 @@ class CrawlerAgent:
                     resolver="retry",
                 )
             self._pipeline_stats["retries"] += 1
-            self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
-            self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
-            await llm_queue.put(retry_task)
-            return
+            return retry_task
 
         async with self.db.session() as session:
             await crawler_db.set_crawl_task_status(
                 session,
                 task.task_id,
-                status=CrawlTaskStatus.FAILED,
+                status=CrawlTaskStatus.RETRY,
                 attempt=task.attempt,
-                last_error="invalid_json_dropped",
+                last_error="invalid_json_retry_exhausted",
             )
             await crawler_db.log_extraction_failure(
                 session,
@@ -2347,12 +2386,12 @@ class CrawlerAgent:
                 source_url=task.source_url,
                 raw_arguments_preview=preview,
                 attempt=task.attempt,
-                resolver="dropped",
+                resolver="retry",
             )
-        self._pipeline_stats["failed"] += 1
+        self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
         self._increment_task_kind_stat(task, "failed")
         self._pipeline_stats["invalid_json_failures"] += 1
-        self._pipeline_stats["retry"] = max(0, int(self._pipeline_stats.get("retry", 0)) - 1)
+        return None
 
     async def _run_extraction_task(self, task: _ExtractionTaskItem, skills: str) -> _ExtractionOutcome:
         instruction = self._build_professor_instruction(task.org_unit_name, detail_mode=task.detail_mode, strict_retry=task.strict_retry)
@@ -2378,14 +2417,13 @@ class CrawlerAgent:
             payload_meta.get("links_kept", 0),
             payload_meta.get("payload_bytes", 0),
         )
-        dynamic_system_content = (
-            "Tool call policy: "
-            + self._build_tool_call_policy(allowed_tools)
-            + " Keep output short and strict JSON."
+        dynamic_system_content = CrawlerPromptBuilder.build_dynamic_system_content(
+            allowed_tools,
+            strict_json=True,
         )
         prompt_max_tokens = min(int(self.model_max_tokens), 16000)
         batches = self.context_manager.build_messages(
-            "You are a cautious university faculty crawler. Stay on the same university domain.",
+            CRAWLER_SYSTEM_PROMPT,
             tool_defs,
             skills,
             user_content,
@@ -3219,10 +3257,10 @@ class CrawlerAgent:
         self._record_llm_payload(int(payload_meta.get("payload_bytes", 0)))
         tool_defs = get_crawler_tool_definitions()
         tool_defs = [tool for tool in tool_defs if tool.get("name") in allowed_tools] if allowed_tools else []
-        dynamic_system_content = "Tool call policy: " + self._build_tool_call_policy(allowed_tools)
+        dynamic_system_content = CrawlerPromptBuilder.build_dynamic_system_content(allowed_tools)
 
         batches = self.context_manager.build_messages(
-            "You are a cautious university faculty crawler. Stay on the same university domain.",
+            CRAWLER_SYSTEM_PROMPT,
             tool_defs,
             skills_text,
             user_content,
