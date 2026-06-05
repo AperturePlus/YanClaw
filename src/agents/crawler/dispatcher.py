@@ -12,7 +12,7 @@ from agents.crawler import db as crawler_db
 from agents.crawler.agent import AgentResult, CrawlerAgent
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.fetchers import Fetcher, _site_root
-from agents.crawler.models import CrawlLogStatus, CrawlStatus
+from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus
 from agents.crawler.org_unit_filter import (
     hard_filter_org_unit_payloads,
     llm_filter_org_unit_payloads,
@@ -47,6 +47,7 @@ class _UniversityProgress:
     status: CrawlStatus | None
     professor_count: int
     retryable_fetch_failure_count: int = 0
+    recoverable_task_count: int = 0
 
 
 AgentFactory = Callable[..., CrawlerAgent]
@@ -227,17 +228,19 @@ class CrawlDispatcher:
                         progress.status == CrawlStatus.COMPLETED
                         and progress.professor_count > 0
                         and progress.retryable_fetch_failure_count <= 0
+                        and progress.recoverable_task_count <= 0
                     )
                     else "crawl"
                 )
             )
             status_text = progress.status.value if progress.status else "unknown"
             self.logger.info(
-                "Resume progress university=%s status=%s professors=%s retryable_fetch_failures=%s action=%s db=%s cleanup=%s",
+                "Resume progress university=%s status=%s professors=%s retryable_fetch_failures=%s recoverable_tasks=%s action=%s db=%s cleanup=%s",
                 university.name,
                 status_text,
                 progress.professor_count,
                 progress.retryable_fetch_failure_count,
+                progress.recoverable_task_count,
                 action,
                 university.db_path,
                 cleanup_summary or {},
@@ -266,6 +269,13 @@ class CrawlDispatcher:
                 "Re-crawling %s because %s retryable fetch failures remain",
                 university.name,
                 progress.retryable_fetch_failure_count,
+            )
+            return False
+        if progress.recoverable_task_count > 0:
+            self.logger.info(
+                "Re-crawling %s because %s recoverable extraction tasks remain",
+                university.name,
+                progress.recoverable_task_count,
             )
             return False
         self.logger.info(
@@ -402,11 +412,18 @@ class CrawlDispatcher:
                 status = await crawler_db.get_university_status(session)
                 professor_count = await crawler_db.count_professors(session)
                 retryable_fetch_failure_count = await crawler_db.count_retryable_fetch_failure_urls(session)
+                task_summary = await crawler_db.summarize_crawl_task_status(session)
+                recoverable_task_count = (
+                    int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
+                    + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
+                    + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
+                )
                 return _UniversityProgress(
                     has_db=True,
                     status=status,
                     professor_count=int(professor_count),
                     retryable_fetch_failure_count=int(retryable_fetch_failure_count),
+                    recoverable_task_count=int(recoverable_task_count),
                 )
         finally:
             await db.close()
