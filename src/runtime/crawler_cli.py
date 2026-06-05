@@ -8,7 +8,6 @@ import click
 
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError
-from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
 from runtime.logger import get_logger, setup_logging
 from runtime.skills import SkillManager
@@ -179,7 +178,7 @@ async def _crawl_async(
             universities_file=None,
             db_roots=None,
             apply=steward_after_crawl_mode.strip().lower() == "apply",
-            llm_enabled=False,
+            llm_enabled=_resolve_steward_llm_enabled(settings, None),
             max_context_tokens=256000,
             include_backup_audit=False,
         )
@@ -298,42 +297,26 @@ def cookie_clear(url: str) -> None:
 
 
 @cli.group()
-def skills() -> None:
-    """Manage crawler skills."""
+@click.option(
+    "--agent",
+    "skills_agent",
+    default="crawler",
+    type=click.Choice(["crawler", "data_steward"], case_sensitive=False),
+    help="Skill owner to manage. Defaults to crawler.",
+)
+@click.pass_context
+def skills(ctx: click.Context, skills_agent: str) -> None:
+    """Manage agent skills."""
+
+    ctx.obj = {**(ctx.obj or {}), "skills_agent": skills_agent.strip().lower()}
 
 
 @skills.command("list")
-def list_skills() -> None:
+@click.pass_context
+def list_skills(ctx: click.Context) -> None:
     """List skills."""
 
-    asyncio.run(_list_skills_async())
-
-
-@skills.command("history")
-@click.argument("name")
-def skill_history(name: str) -> None:
-    """Show skill version history."""
-
-    asyncio.run(_history_async(name))
-
-
-@skills.command("diff")
-@click.argument("name")
-@click.argument("v1", type=int)
-@click.argument("v2", type=int)
-def skill_diff(name: str, v1: int, v2: int) -> None:
-    """Show unified diff between two skill versions."""
-
-    asyncio.run(_diff_async(name, v1, v2))
-
-
-@skills.command("rollback")
-@click.argument("name")
-@click.argument("version", type=int)
-def skill_rollback(name: str, version: int) -> None:
-    """Rollback a skill to a stored version."""
-
-    asyncio.run(_rollback_async(name, version))
+    asyncio.run(_list_skills_async(_skills_agent_from_context(ctx)))
 
 
 @cli.group()
@@ -425,7 +408,11 @@ def recommend(
 @click.option("--universities-file", default=None, type=click.Path(exists=True, path_type=Path), help="File with one university name per line.")
 @click.option("--db-roots", default="", help="Comma-separated DB roots (e.g. pku.edu.cn,tsinghua.edu.cn).")
 @click.option("--apply", is_flag=True, help="Apply mutations (delete/update/enqueue). Default is dry-run.")
-@click.option("--llm-enabled", is_flag=True, help="Enable LLM classification for uncertain missing-field reasons.")
+@click.option(
+    "--llm-enabled/--no-llm",
+    default=None,
+    help="Enable or disable DataSteward LLM cleanup. Default: enabled when API key is set.",
+)
 @click.option("--max-context-tokens", default=128000, type=int, help="LLM context cap (hard-limited to <=256000).")
 @click.option("--include-backup-audit", is_flag=True, help="Read-only compare with latest backup DB snapshot.")
 def steward_run(
@@ -433,7 +420,7 @@ def steward_run(
     universities_file: Path | None,
     db_roots: str,
     apply: bool,
-    llm_enabled: bool,
+    llm_enabled: bool | None,
     max_context_tokens: int,
     include_backup_audit: bool,
 ) -> None:
@@ -444,6 +431,7 @@ def steward_run(
     setup_logging(settings.log_dir)
     university_items = _split_csv(universities)
     root_items = _split_csv(db_roots)
+    resolved_llm_enabled = _resolve_steward_llm_enabled(settings, llm_enabled)
     summary = asyncio.run(
         _steward_run_async(
             settings=settings,
@@ -451,7 +439,7 @@ def steward_run(
             universities_file=universities_file,
             db_roots=root_items or None,
             apply=apply,
-            llm_enabled=llm_enabled,
+            llm_enabled=resolved_llm_enabled,
             max_context_tokens=max_context_tokens,
             include_backup_audit=include_backup_audit,
         )
@@ -476,54 +464,35 @@ def steward_run(
     click.echo(json.dumps([run.__dict__ for run in summary.runs], ensure_ascii=False))
 
 
-async def _manager() -> tuple[DatabaseManager, SkillManager]:
-    settings = CrawlerSettings()
-    db = DatabaseManager(settings.database_url)
-    await db.init_db()
-    return db, SkillManager(settings.crawler_skills_dir, db, "crawler")
+def _skills_agent_from_context(ctx: click.Context) -> str:
+    current: click.Context | None = ctx
+    obj: dict[str, object] = {}
+    while current is not None:
+        if isinstance(current.obj, dict) and "skills_agent" in current.obj:
+            obj = current.obj
+            break
+        current = current.parent
+    value = str(obj.get("skills_agent") or "crawler").strip().lower()
+    return value if value in {"crawler", "data_steward"} else "crawler"
 
 
-async def _list_skills_async() -> None:
-    db, manager = await _manager()
-    try:
-        for meta in manager.list_skills():
-            applies_to = ",".join(meta.applies_to) if meta.applies_to else "*"
-            allowed_tools = ",".join(meta.allowed_tools) if meta.allowed_tools else "-"
-            token_budget = str(meta.token_budget) if meta.token_budget is not None else "-"
-            click.echo(
-                f"{meta.name}\tv{meta.version}\tpriority={meta.priority}\t"
-                f"applies_to={applies_to}\tallowed_tools={allowed_tools}\t"
-                f"token_budget={token_budget}\t{meta.description}"
-            )
-    finally:
-        await db.close()
+def _skill_manager_for_settings(settings: CrawlerSettings, agent_name: str) -> SkillManager:
+    if agent_name == "data_steward":
+        return SkillManager(settings.data_steward_skills_dir)
+    return SkillManager(settings.crawler_skills_dir)
 
 
-async def _history_async(name: str) -> None:
-    db, manager = await _manager()
-    try:
-        for item in await manager.get_history(name):
-            marker = " current" if item.is_current else ""
-            click.echo(f"v{item.version}\t{item.created_at.isoformat(timespec='seconds')}\t{item.change_summary}{marker}")
-    finally:
-        await db.close()
-
-
-async def _diff_async(name: str, v1: int, v2: int) -> None:
-    db, manager = await _manager()
-    try:
-        click.echo(await manager.diff_skill(name, v1, v2))
-    finally:
-        await db.close()
-
-
-async def _rollback_async(name: str, version: int) -> None:
-    db, manager = await _manager()
-    try:
-        await manager.rollback_skill(name, version)
-        click.echo(f"Rolled back {name} to v{version}")
-    finally:
-        await db.close()
+async def _list_skills_async(agent_name: str = "crawler") -> None:
+    manager = _skill_manager_for_settings(CrawlerSettings(), agent_name)
+    for meta in manager.list_skills():
+        applies_to = ",".join(meta.applies_to) if meta.applies_to else "*"
+        allowed_tools = ",".join(meta.allowed_tools) if meta.allowed_tools else "-"
+        token_budget = str(meta.token_budget) if meta.token_budget is not None else "-"
+        click.echo(
+            f"{meta.name}\tv{meta.version}\tpriority={meta.priority}\t"
+            f"applies_to={applies_to}\tallowed_tools={allowed_tools}\t"
+            f"token_budget={token_budget}\t{meta.description}"
+        )
 
 
 async def _steward_run_async(
@@ -626,3 +595,9 @@ def _format_recommendation_text(result) -> str:
 
 def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _resolve_steward_llm_enabled(settings: CrawlerSettings, override: bool | None) -> bool:
+    if override is not None:
+        return bool(override)
+    return bool((settings.openai_api_key or "").strip())

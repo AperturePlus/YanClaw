@@ -1,10 +1,10 @@
 """Shared runtime primitives for Yanclaw agents."""
 
 from runtime.context import ContextManager
-from runtime.database import DatabaseManager, SkillVersion
+from runtime.database import DatabaseManager
 from runtime.llm import LLMClient, LLMResult, ToolCallRecord
 from runtime.logger import get_logger, setup_logging
-from runtime.skills import CompiledSkillSet, SkillManager, SkillMeta, SkillSpec, VersionInfo
+from runtime.skills import CompiledSkillSet, SkillManager, SkillMeta, SkillSpec
 
 __all__ = [
     "ContextManager",
@@ -15,9 +15,7 @@ __all__ = [
     "SkillManager",
     "SkillMeta",
     "SkillSpec",
-    "SkillVersion",
     "ToolCallRecord",
-    "VersionInfo",
     "get_logger",
     "setup_logging",
 ]

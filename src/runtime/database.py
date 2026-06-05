@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -13,26 +11,11 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
     pass
-
-
-class SkillVersion(Base):
-    __tablename__ = "skill_versions"
-    __table_args__ = (
-        UniqueConstraint("agent_name", "skill_name", "version", name="uq_skill_version"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    skill_name: Mapped[str] = mapped_column(String(255), index=True)
-    version: Mapped[int] = mapped_column(Integer)
-    content: Mapped[str] = mapped_column(Text)
-    change_summary: Mapped[str] = mapped_column(Text, default="")
-    agent_name: Mapped[str] = mapped_column(String(255), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class DatabaseManager:

@@ -239,7 +239,7 @@ def test_cli_help_outputs_commands():
 
     result = runner.invoke(cli, ["skills", "--help"])
     assert result.exit_code == 0
-    assert "rollback" in result.output
+    assert "list" in result.output
 
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
@@ -248,10 +248,6 @@ def test_cli_help_outputs_commands():
 
 
 async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys):
-    class _FakeDb:
-        async def close(self):
-            return None
-
     class _FakeManager:
         def list_skills(self):
             return [
@@ -267,10 +263,12 @@ async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys)
                 )
             ]
 
-    async def _fake_manager():
-        return _FakeDb(), _FakeManager()
+    def _fake_skill_manager_for_settings(settings, agent_name):
+        _ = settings
+        assert agent_name == "crawler"
+        return _FakeManager()
 
-    monkeypatch.setattr(crawler_cli, "_manager", _fake_manager)
+    monkeypatch.setattr(crawler_cli, "_skill_manager_for_settings", _fake_skill_manager_for_settings)
 
     await crawler_cli._list_skills_async()
     output = capsys.readouterr().out
@@ -278,6 +276,20 @@ async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys)
     assert "applies_to=FIND_FACULTY_PAGES" in output
     assert "allowed_tools=extract_links" in output
     assert "token_budget=500" in output
+
+
+def test_skills_cli_accepts_data_steward_agent(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def _fake_list(agent_name="crawler"):
+        captured["agent_name"] = agent_name
+
+    monkeypatch.setattr(crawler_cli, "_list_skills_async", _fake_list)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["skills", "--agent", "data_steward", "list"])
+    assert result.exit_code == 0, result.output
+    assert captured["agent_name"] == "data_steward"
 
 
 def test_runtime_cli_exposes_crawler_commands():
@@ -450,6 +462,12 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
     assert captured["universities"] == ["A", "B"]
     assert captured["db_roots"] == ["pku.edu.cn", "tsinghua.edu.cn"]
     assert captured["apply"] is False
+
+
+def test_steward_llm_default_depends_on_api_key():
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key="key"), None) is True
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key=""), None) is False
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key="key"), False) is False
 
 
 def test_dispatcher_factory_uses_human_backend(tmp_path):

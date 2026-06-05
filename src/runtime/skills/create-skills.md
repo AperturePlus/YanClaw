@@ -1,6 +1,6 @@
 ---
 name: create-skills
-description: Guidance for creating and updating markdown skills with version history.
+description: 创建和维护 Markdown 技能文件的规则。
 version: 1
 applies_to: "*"
 allowed_tools:
@@ -11,16 +11,18 @@ updated_at: 2026-04-26T00:00:00
 ---
 
 ## Goal
-Create and improve agent skills as durable markdown instructions.
+创建和维护可长期复用的 Markdown 技能说明，让后续智能体在相同场景下能稳定采用正确规则。
 
 ## Rules
 
-- A skill file must start with frontmatter containing `name`, `description`, `version`, `created_at`, and `updated_at`.
-- Before updating a skill, call `update_skill`; the runtime stores the current file content in the database before writing the new version.
-- Prefer narrow, operational guidance that helps the agent make better decisions on later runs.
-- Do not overwrite unrelated guidance.
+- 技能文件必须以 frontmatter 开头，至少保留 `name`、`description`、`version`、`created_at`、`updated_at`。
+- 运行时选择技能依赖 `applies_to`、`allowed_tools`、`priority`、`token_budget`；修改时不要随意删除这些字段。
+- 更新技能时直接编辑当前 Markdown 文件即可，不再记录数据库历史版本。
+- 技能内容应聚焦具体、可执行的决策规则，避免写成宽泛原则。
+- 只修改与当前需求相关的说明，不要覆盖无关规则。
 
-## Tool Usage
+## Usage
 
-- Use `create_skill` only when no existing skill covers the repeated pattern.
-- Use `update_skill` when a current skill is correct in scope but needs a better rule, example, or edge case.
+- 只有当现有技能无法覆盖重复出现的模式时，才创建新技能。
+- 如果已有技能范围正确，只需要补充规则、示例或边界情况，就编辑该技能文件。
+- 新技能应保持短小，明确说明适用状态、允许工具、输出格式和不能做的事。
