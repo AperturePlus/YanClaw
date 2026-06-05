@@ -277,15 +277,16 @@ def test_save_professors_skill_documents_name_and_homepage_rules():
     text = Path("src/agents/crawler/skills/save-professors.md").read_text(encoding="utf-8")
     assert "（兼）" in text
     assert "external_link" in text
-    assert "Do not use roster/list pages" in text
+    assert "不要把名单页、列表页、学院主页或师资目录页作为教师 `homepage`" in text
     assert "教学实验中心" in text
     assert "is_academician" in text
     assert "研究方向" in text
-    assert "parent college/school" in text
+    assert "父级学院" in text
 
 
 def test_org_unit_filter_skill_documents_teaching_center_and_sub_department_rules():
     text = Path("src/agents/crawler/skills/org-unit-filter.md").read_text(encoding="utf-8")
+    assert "applies_to: ORG_UNIT_FILTER" in text
     assert "teaching_experiment_center" in text
     assert "教学实验中心" in text
     assert "sub_department_section" in text

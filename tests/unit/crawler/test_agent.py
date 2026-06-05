@@ -700,6 +700,63 @@ async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_
     await db.close()
 
 
+async def test_pipeline_refetches_and_consumes_completion_recrawl_tasks_over_queue_cap(tmp_path):
+    pages = {
+        f"https://www.example.edu.cn/cs/info/ada-{index}.htm": FetchResult(
+            f"https://www.example.edu.cn/cs/info/ada-{index}.htm",
+            f"Ada 教授\n研究方向: systems {index}",
+            [],
+            200,
+        )
+        for index in range(5)
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        for index, homepage in enumerate(pages):
+            stale_snapshot = (
+                "stale profile without research " + ("x" * 400)
+                if index == 0
+                else ""
+            )
+            await crawler_db.upsert_crawl_task(
+                session,
+                university="TestU",
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=homepage,
+                page_url=homepage,
+                page_hash=f"empty-homepage-{index}",
+                task_kind=CrawlTaskKind.DETAIL_PAGE,
+                page_text_snapshot=stale_snapshot,
+                allowed_tools='["save_professors"]',
+                status=CrawlTaskStatus.RETRY,
+                priority=-10,
+                last_error="completion_recrawl_missing_profile_fields",
+            )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
+
+    assert fetcher.calls == list(pages)
+    assert int(agent._pipeline_stats.get("recovery_refetched", 0)) == 5
+    assert int(agent._pipeline_stats.get("recovery_enqueued", 0)) == 5
+    assert int(agent._pipeline_stats.get("recovery_consumed", 0)) == 5
+    async with db.session() as session:
+        summary = await crawler_db.summarize_crawl_task_status(session)
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    assert summary[CrawlTaskStatus.DONE.value] == 5
+    assert all("研究方向" in task.page_text_snapshot for task in tasks)
+    await db.close()
+
+
 async def test_strict_resume_recovers_more_tasks_than_queue_cap_without_fetching(tmp_path):
     agent, fetcher, db = await _agent(
         tmp_path,
@@ -1727,6 +1784,43 @@ async def test_recovery_uses_existing_nonempty_snapshot_without_refetch(tmp_path
     await db.close()
 
 
+async def test_recovery_uses_refetched_snapshot_without_repeating_refetch(tmp_path):
+    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages={},
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="refetched-homepage",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="Ada 教授\n研究方向: systems",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            priority=-10,
+            last_error="completion_recrawl_refetched",
+        )
+
+    await agent._extract_professors([], recovery_limit=1)
+
+    assert fetcher.calls == []
+    assert int(agent._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0)) == 1
+    assert int(agent._pipeline_stats.get("recovery_consumed", 0)) == 1
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        assert task.status == CrawlTaskStatus.DONE.value
+    await db.close()
+
+
 async def test_enqueue_extraction_task_skips_detail_redirect_to_home(tmp_path):
     source_url = "https://dept3.buaa.edu.cn/info/1191/2837.htm"
     final_url = "https://dept3.buaa.edu.cn/"
@@ -1861,6 +1955,8 @@ async def test_professor_instruction_distinguishes_list_and_detail_field_strictn
     assert "save visible names and academic titles" in list_instruction
     assert "email/phone/research_areas are absent" in list_instruction
     assert "Only save records that include at least one of email/phone/research_areas" in detail_instruction
+    assert "linked anchor text" in detail_instruction
+    assert "个人简介/简介/个人概况" in detail_instruction
     await db.close()
 
 
@@ -2755,6 +2851,68 @@ async def test_extract_org_units_keeps_processing_candidates_after_minimum_core_
     assert {"CS", "EE", "Math"} <= names
     # Do not stop after only reaching a low minimum; continue scanning candidates for better coverage.
     assert "https://www.example.edu.cn/xxgk/xxjj.htm" in fetcher.calls
+    await db.close()
+
+
+async def test_extract_org_units_accepts_included_org_units_fallback(tmp_path):
+    org_page = "https://www.example.edu.cn/xybm/jxkydw_yjjg.htm"
+    pages = {
+        org_page: FetchResult(
+            org_page,
+            "信息与通信工程学院 电子科学与工程学院 财务处",
+            [
+                "https://www.example.edu.cn/sice",
+                "https://www.example.edu.cn/ese",
+                "https://www.example.edu.cn/cwc",
+            ],
+            200,
+        ),
+    }
+
+    class IncludedOrgUnitsLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    json.dumps(
+                        {
+                            "included_org_units": [
+                                {
+                                    "name": "信息与通信工程学院",
+                                    "url": "https://www.example.edu.cn/sice",
+                                    "kind": "college",
+                                },
+                                {
+                                    "name": "电子科学与工程学院",
+                                    "url": "https://www.example.edu.cn/ese",
+                                    "kind": "college",
+                                },
+                            ],
+                            "excluded_org_units": [
+                                {
+                                    "name": "财务处",
+                                    "url": "https://www.example.edu.cn/cwc",
+                                    "kind": "admin",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        IncludedOrgUnitsLLM(),
+        pages=pages,
+        org_unit_llm_filter_enabled=False,
+    )
+
+    units = await agent._extract_org_units([_QueuedUrl(url=org_page, depth=1)])
+
+    names = {unit.name for unit in units}
+    assert {"信息与通信工程学院", "电子科学与工程学院"} <= names
+    assert "财务处" not in names
     await db.close()
 
 
