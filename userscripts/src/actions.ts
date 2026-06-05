@@ -2,13 +2,16 @@ import * as api from './api';
 import { addHistory, clearJob, notify, setJob, state } from './state';
 import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
-import { isErrorPage, sameHost, urlMatches } from './utils';
+import { isErrorPage, urlMatches } from './utils';
 
-const POLL_INTERVAL = 2500;
-const FAST_POLL_INTERVAL = 600;
+const POLL_INTERVAL = 2000;
+const FAST_POLL_INTERVAL = 500;
 const FAST_POLL_ROUNDS = 4;
 const AUTO_CHECK_INTERVAL = 1500;
-const AUTO_SUBMIT_DELAY = 2000;
+const AUTO_SUBMIT_DELAY = 1500;
+const CAPTURE_STABLE_INTERVAL = 200;
+const CAPTURE_STABLE_ROUNDS = 3;
+const CAPTURE_MAX_WAIT = 8000;
 const DECISION_POLL_INTERVAL = 5000;
 const ERROR_RETRY_DELAY = 5000;
 const MAX_ERROR_RETRIES = 3;
@@ -122,7 +125,7 @@ function autoCheck(): void {
 
   errorRetries = 0;
 
-  if (sameHost(window.location.href, job.url)) {
+  if (urlMatches(window.location.href, job.url)) {
     if (matchedSince === null) {
       matchedSince = Date.now();
     } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -247,8 +250,8 @@ export async function submitCurrent(): Promise<void> {
     return;
   }
   submitting = true;
-  const html = document.documentElement.outerHTML;
   try {
+    const html = await captureCurrentHtml();
     const res = await api.completeJob(job.id, html, window.location.href, document.title);
     addHistory(job, 'completed');
     clearJob();
@@ -263,6 +266,57 @@ export async function submitCurrent(): Promise<void> {
   }
   submitting = false;
   notify();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function captureCurrentHtml(): Promise<string> {
+  await waitForCaptureReady();
+  return serializePageWithoutOverlay();
+}
+
+async function waitForCaptureReady(): Promise<void> {
+  const started = Date.now();
+  let lastSignature = '';
+  let stableRounds = 0;
+  let scrolled = false;
+
+  while (Date.now() - started < CAPTURE_MAX_WAIT) {
+    if (document.readyState === 'complete') {
+      if (!scrolled && Date.now() - started >= Math.floor(AUTO_SUBMIT_DELAY / 2)) {
+        scrolled = true;
+        window.scrollTo({ top: document.body?.scrollHeight ?? 0, behavior: 'auto' });
+      }
+
+      const signature = captureSignature();
+      if (signature === lastSignature) {
+        stableRounds += 1;
+      } else {
+        lastSignature = signature;
+        stableRounds = 0;
+      }
+
+      if (Date.now() - started >= AUTO_SUBMIT_DELAY && stableRounds >= CAPTURE_STABLE_ROUNDS) {
+        return;
+      }
+    }
+    await sleep(CAPTURE_STABLE_INTERVAL);
+  }
+}
+
+function captureSignature(): string {
+  const textLength = document.body?.innerText?.length ?? 0;
+  const nodeCount = document.getElementsByTagName('*').length;
+  const imageCount = document.images.length;
+  return `${textLength}:${nodeCount}:${imageCount}`;
+}
+
+function serializePageWithoutOverlay(): string {
+  const clone = document.documentElement.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll('#ycl-panel,#ycl-toast,[data-yanclaw-overlay]').forEach((node) => node.remove());
+  return clone.outerHTML;
 }
 
 export async function skipCurrent(): Promise<void> {

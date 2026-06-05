@@ -355,19 +355,18 @@
     try {
       const u1 = new URL(a);
       const u2 = new URL(b);
-      return u1.hostname === u2.hostname && u1.pathname.replace(/\/+$/, "") === u2.pathname.replace(/\/+$/, "");
+      return u1.hostname === u2.hostname && u1.pathname.replace(/\/+$/, "") === u2.pathname.replace(/\/+$/, "") && normalizedSearch(u1) === normalizedSearch(u2);
     } catch {
       return false;
     }
   }
-  function sameHost(a, b) {
-    try {
-      const h1 = new URL(a).hostname.replace(/^www\./, "");
-      const h2 = new URL(b).hostname.replace(/^www\./, "");
-      return h1 === h2;
-    } catch {
-      return false;
-    }
+  function normalizedSearch(url) {
+    if (!url.search) return "";
+    const params = [...url.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) => {
+      const keyOrder = aKey.localeCompare(bKey);
+      return keyOrder || aValue.localeCompare(bValue);
+    });
+    return params.map(([key, value]) => `${key}=${value}`).join("&");
   }
   function truncUrl(url, max = 40) {
     try {
@@ -397,11 +396,14 @@
     if (bodyText.length < 2e3 && ERROR_PATTERNS.test(title + " " + bodyText)) return true;
     return false;
   }
-  const POLL_INTERVAL = 2500;
-  const FAST_POLL_INTERVAL = 600;
+  const POLL_INTERVAL = 2e3;
+  const FAST_POLL_INTERVAL = 500;
   const FAST_POLL_ROUNDS = 4;
   const AUTO_CHECK_INTERVAL = 1500;
-  const AUTO_SUBMIT_DELAY = 2e3;
+  const AUTO_SUBMIT_DELAY = 1500;
+  const CAPTURE_STABLE_INTERVAL = 200;
+  const CAPTURE_STABLE_ROUNDS = 3;
+  const CAPTURE_MAX_WAIT = 8e3;
   const DECISION_POLL_INTERVAL = 5e3;
   const ERROR_RETRY_DELAY = 5e3;
   const MAX_ERROR_RETRIES = 3;
@@ -500,7 +502,7 @@
       return;
     }
     errorRetries = 0;
-    if (sameHost(window.location.href, job.url)) {
+    if (urlMatches(window.location.href, job.url)) {
       if (matchedSince === null) {
         matchedSince = Date.now();
       } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -615,8 +617,8 @@
       return;
     }
     submitting = true;
-    const html = document.documentElement.outerHTML;
     try {
+      const html = await captureCurrentHtml();
       const res = await completeJob(job.id, html, window.location.href, document.title);
       addHistory(job, "completed");
       clearJob();
@@ -630,6 +632,51 @@
     }
     submitting = false;
     notify();
+  }
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  async function captureCurrentHtml() {
+    await waitForCaptureReady();
+    return serializePageWithoutOverlay();
+  }
+  async function waitForCaptureReady() {
+    var _a;
+    const started2 = Date.now();
+    let lastSignature = "";
+    let stableRounds = 0;
+    let scrolled = false;
+    while (Date.now() - started2 < CAPTURE_MAX_WAIT) {
+      if (document.readyState === "complete") {
+        if (!scrolled && Date.now() - started2 >= Math.floor(AUTO_SUBMIT_DELAY / 2)) {
+          scrolled = true;
+          window.scrollTo({ top: ((_a = document.body) == null ? void 0 : _a.scrollHeight) ?? 0, behavior: "auto" });
+        }
+        const signature = captureSignature();
+        if (signature === lastSignature) {
+          stableRounds += 1;
+        } else {
+          lastSignature = signature;
+          stableRounds = 0;
+        }
+        if (Date.now() - started2 >= AUTO_SUBMIT_DELAY && stableRounds >= CAPTURE_STABLE_ROUNDS) {
+          return;
+        }
+      }
+      await sleep(CAPTURE_STABLE_INTERVAL);
+    }
+  }
+  function captureSignature() {
+    var _a, _b;
+    const textLength = ((_b = (_a = document.body) == null ? void 0 : _a.innerText) == null ? void 0 : _b.length) ?? 0;
+    const nodeCount = document.getElementsByTagName("*").length;
+    const imageCount = document.images.length;
+    return `${textLength}:${nodeCount}:${imageCount}`;
+  }
+  function serializePageWithoutOverlay() {
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelectorAll("#ycl-panel,#ycl-toast,[data-yanclaw-overlay]").forEach((node) => node.remove());
+    return clone.outerHTML;
   }
   async function skipCurrent() {
     if (state.instanceRole !== "owner") return;
