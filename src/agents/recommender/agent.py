@@ -193,6 +193,8 @@ class RecommendationAgent:
             self.settings.openai_base_url,
             self.settings.openai_api_key,
             self.settings.openai_model,
+            max_concurrent=self.settings.llm_max_concurrent,
+            min_interval=self.settings.llm_min_interval_seconds,
             timeout_seconds=self.settings.llm_timeout_seconds,
             temperature=self.settings.llm_temperature,
             top_p=self.settings.llm_top_p,

@@ -59,8 +59,8 @@ class LLMClient:
         max_rounds: int = 5,
         max_retries: int = 3,
         retry_base_delay: float = 5.0,
-        max_concurrent: int = 2,
-        min_interval: float = 0.5,
+        max_concurrent: int = 8,
+        min_interval: float = 0.0,
         timeout_seconds: float = 120.0,
         temperature: float = 0.0,
         top_p: float = 1.0,
@@ -77,8 +77,10 @@ class LLMClient:
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.seed = int(seed) if seed is not None else None
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._min_interval = min_interval
+        self.max_concurrent = max(1, int(max_concurrent))
+        self.min_interval = max(0.0, float(min_interval))
+        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        self._min_interval = self.min_interval
         self._last_call_time: float = 0
         self._rate_lock = asyncio.Lock()
         self.client = client or AsyncOpenAI(
@@ -232,6 +234,8 @@ class LLMClient:
         raise last_error  # unreachable but satisfies type checker
 
     async def _rate_limit(self) -> None:
+        if self._min_interval <= 0:
+            return
         async with self._rate_lock:
             now = time.monotonic()
             wait = self._min_interval - (now - self._last_call_time)

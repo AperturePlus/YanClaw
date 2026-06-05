@@ -91,6 +91,8 @@ class CrawlDispatcher:
                 settings.openai_base_url,
                 settings.openai_api_key,
                 settings.openai_model,
+                max_concurrent=settings.llm_max_concurrent,
+                min_interval=settings.llm_min_interval_seconds,
                 timeout_seconds=settings.llm_timeout_seconds,
                 temperature=settings.llm_temperature,
                 top_p=settings.llm_top_p,
@@ -441,13 +443,16 @@ class CrawlDispatcher:
         async with semaphore:
             timeout_seconds = float(self.settings.university_timeout_seconds)
             self.logger.info(
-                "Dispatching %s (timeout=%ss human_bridge=%s:%s human_job_timeout=%ss llm_timeout=%ss)",
+                "Dispatching %s (timeout=%ss human_bridge=%s:%s human_job_timeout=%ss llm_timeout=%ss llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s)",
                 university.name,
                 timeout_seconds,
                 self.settings.human_server_host,
                 self.settings.human_server_port,
                 self.settings.human_job_timeout_seconds,
                 self.settings.llm_timeout_seconds,
+                self.settings.llm_max_concurrent,
+                self.settings.llm_min_interval_seconds,
+                self.settings.pipeline_llm_workers,
             )
 
             db = DatabaseManager(_sqlite_url(university.db_path))

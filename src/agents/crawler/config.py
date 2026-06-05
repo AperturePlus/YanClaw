@@ -21,6 +21,8 @@ class CrawlerSettings(BaseSettings):
     llm_temperature: float = Field(default=0.0, ge=0.0)
     llm_top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     llm_seed: int | None = None
+    llm_max_concurrent: int = Field(default=8, ge=1)
+    llm_min_interval_seconds: float = Field(default=0.0, ge=0.0)
     max_concurrency: int = Field(default=3, ge=1)
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
     university_timeout_seconds: float = Field(default=36000.0, gt=0)
@@ -42,7 +44,7 @@ class CrawlerSettings(BaseSettings):
     detail_enrich_enabled: bool = True
     detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
     pipeline_enabled: bool = True
-    pipeline_llm_workers: int = Field(default=1, ge=1)
+    pipeline_llm_workers: int = Field(default=4, ge=1)
     pipeline_db_workers: int = Field(default=1, ge=1)
     pipeline_queue_cap: int = Field(default=64, ge=1)
     invalid_json_max_retry: int = Field(default=1, ge=0)

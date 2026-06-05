@@ -115,13 +115,16 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
+        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
         settings.max_concurrency,
         settings.human_server_host,
         settings.human_server_port,
         settings.human_job_timeout_seconds,
         settings.university_timeout_seconds,
         settings.llm_timeout_seconds,
+        settings.llm_max_concurrent,
+        settings.llm_min_interval_seconds,
+        settings.pipeline_llm_workers,
         resume,
         ",".join(selected) if selected else "*",
         ",".join(settings.target_org_units) if settings.target_org_units else "*",
@@ -206,6 +209,8 @@ async def _check_llm(settings: CrawlerSettings) -> None:
         settings.openai_api_key,
         settings.openai_model,
         max_rounds=1,
+        max_concurrent=settings.llm_max_concurrent,
+        min_interval=settings.llm_min_interval_seconds,
         timeout_seconds=settings.llm_timeout_seconds,
         temperature=settings.llm_temperature,
         top_p=settings.llm_top_p,
@@ -239,6 +244,8 @@ def llm_check() -> None:
     click.echo(f"model={settings.openai_model}")
     click.echo(f"api_key_set={bool(settings.openai_api_key)}")
     click.echo(f"timeout_seconds={settings.llm_timeout_seconds}")
+    click.echo(f"max_concurrent={settings.llm_max_concurrent}")
+    click.echo(f"min_interval_seconds={settings.llm_min_interval_seconds}")
     click.echo(f"temperature={settings.llm_temperature}")
     click.echo(f"top_p={settings.llm_top_p}")
     click.echo(f"seed={settings.llm_seed}")

@@ -27,6 +27,8 @@ class DataStewardLLMService:
             settings.openai_base_url,
             settings.openai_api_key,
             settings.openai_model,
+            max_concurrent=settings.llm_max_concurrent,
+            min_interval=settings.llm_min_interval_seconds,
             timeout_seconds=settings.llm_timeout_seconds,
             temperature=settings.llm_temperature,
             top_p=settings.llm_top_p,
