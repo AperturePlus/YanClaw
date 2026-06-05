@@ -17,6 +17,8 @@ class StewardRunSummary:
     audits_written: int
     excluded_org_units_detected: int = 0
     excluded_org_units_deleted: int = 0
+    sub_department_sections_detected: int = 0
+    sub_department_sections_merged: int = 0
     org_unit_cleanup: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     backup_audit: dict[str, Any] = field(default_factory=dict)
@@ -36,6 +38,8 @@ class StewardBatchSummary:
     runs: list[StewardRunSummary]
     total_excluded_org_units_detected: int = 0
     total_excluded_org_units_deleted: int = 0
+    total_sub_department_sections_detected: int = 0
+    total_sub_department_sections_merged: int = 0
 
 
 @dataclass(frozen=True)

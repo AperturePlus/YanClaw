@@ -190,6 +190,8 @@ async def _crawl_async(
             + f"deleted={steward_summary.total_duplicates_deleted} "
             + f"excluded_org_units={getattr(steward_summary, 'total_excluded_org_units_detected', 0)} "
             + f"excluded_org_units_deleted={getattr(steward_summary, 'total_excluded_org_units_deleted', 0)} "
+            + f"sub_department_sections={getattr(steward_summary, 'total_sub_department_sections_detected', 0)} "
+            + f"sub_department_sections_merged={getattr(steward_summary, 'total_sub_department_sections_merged', 0)} "
             + f"missing_audits={steward_summary.total_missing_field_audits}"
         )
 
@@ -462,6 +464,8 @@ def steward_run(
         + f"deleted={summary.total_duplicates_deleted} "
         + f"excluded_org_units={getattr(summary, 'total_excluded_org_units_detected', 0)} "
         + f"excluded_org_units_deleted={getattr(summary, 'total_excluded_org_units_deleted', 0)} "
+        + f"sub_department_sections={getattr(summary, 'total_sub_department_sections_detected', 0)} "
+        + f"sub_department_sections_merged={getattr(summary, 'total_sub_department_sections_merged', 0)} "
         + f"missing_audits={summary.total_missing_field_audits} "
         + f"recrawl_tasks={summary.total_recrawl_tasks_upserted}"
     )
