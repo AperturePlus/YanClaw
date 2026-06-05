@@ -4,11 +4,11 @@ import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
 import { isErrorPage, urlMatches } from './utils';
 
-const POLL_INTERVAL = 2000;
+const POLL_INTERVAL = 1500;
 const FAST_POLL_INTERVAL = 500;
 const FAST_POLL_ROUNDS = 4;
-const AUTO_CHECK_INTERVAL = 1500;
-const AUTO_SUBMIT_DELAY = 1500;
+const AUTO_CHECK_INTERVAL = 1000;
+const AUTO_SUBMIT_DELAY = 1000;
 const CAPTURE_STABLE_INTERVAL = 200;
 const CAPTURE_STABLE_ROUNDS = 3;
 const CAPTURE_MAX_WAIT = 8000;
