@@ -34,6 +34,7 @@ from agents.crawler.org_unit_filter import (
     org_unit_filter_item_keys,
 )
 from agents.crawler.prompt_builder import CrawlerPromptBuilder
+from agents.crawler.sanitizer import contains_academician_hint, contains_self_academician_hint, normalize_name
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
@@ -87,6 +88,9 @@ class CrawlerState(str, Enum):
 
 
 _FOLLOWUP_PAGE_LIMIT = 36
+_COMPLETION_RECRAWL_LAST_ERROR_PREFIX = "completion_recrawl_"
+_COMPLETION_RECRAWL_REFETCH_FAILED = "completion_recrawl_refetch_failed"
+_COMPLETION_RECRAWL_REFETCH_BLOCKED_PREFIX = "completion_recrawl_refetch_blocked"
 
 
 @dataclass(frozen=True)
@@ -1951,6 +1955,25 @@ class CrawlerAgent:
             allowed_tools = ["save_professors"]
             task_kind = str(getattr(row, "task_kind", None) or CrawlTaskKind.LIST_PAGE.value)
             detail_mode = task_kind == CrawlTaskKind.DETAIL_PAGE.value
+            row_data = {
+                "id": int(row.id),
+                "university": row.university or self.university_name,
+                "org_unit_name": row.org_unit_name,
+                "org_unit_url": row.org_unit_url,
+                "source_url": row.source_url,
+                "page_url": row.page_url,
+                "page_hash": row.page_hash,
+                "page_text_snapshot": row.page_text_snapshot,
+                "attempt": int(row.attempt or 0),
+                "priority": int(row.priority or 0),
+                "status": row.status,
+                "last_error": row.last_error,
+            }
+            if self._recovered_task_needs_refetch(row_data, detail_mode=detail_mode):
+                refreshed = await self._refetch_recovered_detail_task(row_data)
+                if refreshed is None:
+                    continue
+                row_data = refreshed
             if row.allowed_tools:
                 try:
                     parsed = json.loads(row.allowed_tools)
@@ -1960,23 +1983,23 @@ class CrawlerAgent:
                     pass
             recovered.append(
                 _ExtractionTaskItem(
-                    task_id=int(row.id),
-                    university=row.university or self.university_name,
-                    org_unit_name=row.org_unit_name,
-                    org_unit_url=row.org_unit_url,
-                    source_url=row.source_url,
-                    page_url=row.page_url,
-                    page_hash=row.page_hash,
-                    page_text_snapshot=row.page_text_snapshot,
+                    task_id=int(row_data["id"]),
+                    university=str(row_data["university"] or self.university_name),
+                    org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
+                    org_unit_url=row_data["org_unit_url"],
+                    source_url=str(row_data["source_url"] or ""),
+                    page_url=str(row_data["page_url"] or row_data["source_url"] or ""),
+                    page_hash=str(row_data["page_hash"] or ""),
+                    page_text_snapshot=str(row_data["page_text_snapshot"] or ""),
                     allowed_tools=allowed_tools,
-                    attempt=int(row.attempt or 0),
-                    priority=int(row.priority or 0),
-                    strict_retry=(int(row.attempt or 0) > 0),
+                    attempt=int(row_data["attempt"] or 0),
+                    priority=int(row_data["priority"] or 0),
+                    strict_retry=(int(row_data["attempt"] or 0) > 0),
                     detail_mode=detail_mode,
                     task_kind=task_kind,
                 )
             )
-            if row.status == CrawlTaskStatus.RETRY.value:
+            if row_data["status"] == CrawlTaskStatus.RETRY.value:
                 self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
             else:
                 self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
@@ -1985,6 +2008,115 @@ class CrawlerAgent:
             else:
                 self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
         return recovered
+
+    @staticmethod
+    def _recovered_task_needs_refetch(row_data: dict[str, Any], *, detail_mode: bool) -> bool:
+        if not detail_mode:
+            return False
+        last_error = str(row_data.get("last_error") or "")
+        snapshot = str(row_data.get("page_text_snapshot") or "")
+        return not snapshot.strip() or last_error.startswith(_COMPLETION_RECRAWL_LAST_ERROR_PREFIX)
+
+    async def _refetch_recovered_detail_task(self, row_data: dict[str, Any]) -> dict[str, Any] | None:
+        task_id = int(row_data["id"])
+        source_url = _sanitize_url(str(row_data.get("source_url") or row_data.get("page_url") or ""))
+        if not source_url:
+            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
+            return None
+
+        self._add_resume_force_refetch_urls([source_url])
+        fetched = await self._fetch_url(source_url, 1)
+        if fetched is None:
+            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
+            self.logger.warning(
+                "Recovered detail task refetch failed task_id=%s source=%s",
+                task_id,
+                source_url,
+            )
+            return None
+        if fetched.block_reason:
+            last_error = f"{_COMPLETION_RECRAWL_REFETCH_BLOCKED_PREFIX}:{fetched.block_reason}"
+            await self._mark_recovered_refetch_retry(task_id, last_error)
+            self.logger.warning(
+                "Recovered detail task refetch blocked task_id=%s source=%s reason=%s",
+                task_id,
+                source_url,
+                fetched.block_reason,
+            )
+            return None
+
+        final_url = _sanitize_url(fetched.url) or source_url
+        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
+            source_url,
+            final_url,
+            detail_mode=True,
+        )
+        if skip_redirect:
+            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
+            self.logger.warning(
+                "Recovered detail task refetch redirected away task_id=%s source=%s final=%s reason=%s",
+                task_id,
+                source_url,
+                final_url,
+                redirect_reason,
+            )
+            return None
+
+        text_limit = self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=True)
+        snapshot = self._compact_page_text(fetched.text or "", text_limit)
+        if not snapshot.strip():
+            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
+            self.logger.warning(
+                "Recovered detail task refetch produced empty snapshot task_id=%s source=%s final=%s",
+                task_id,
+                source_url,
+                final_url,
+            )
+            return None
+
+        page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+        allowed_tools = json.dumps(["save_professors"], ensure_ascii=False, separators=(",", ":"))
+        async with self.db.session() as session:
+            refreshed = await crawler_db.upsert_crawl_task(
+                session,
+                university=str(row_data.get("university") or self.university_name),
+                org_unit_name=str(row_data.get("org_unit_name") or "Unknown"),
+                org_unit_url=(str(row_data.get("org_unit_url")) if row_data.get("org_unit_url") else None),
+                source_url=source_url,
+                page_url=source_url,
+                page_hash=page_hash,
+                task_kind=CrawlTaskKind.DETAIL_PAGE,
+                page_text_snapshot=snapshot,
+                allowed_tools=allowed_tools,
+                attempt=int(row_data.get("attempt") or 0),
+                priority=int(row_data.get("priority") or 0),
+                status=CrawlTaskStatus.RETRY,
+                last_error="completion_recrawl_refetched",
+            )
+            return {
+                "id": int(refreshed.id),
+                "university": refreshed.university or self.university_name,
+                "org_unit_name": refreshed.org_unit_name,
+                "org_unit_url": refreshed.org_unit_url,
+                "source_url": refreshed.source_url,
+                "page_url": refreshed.page_url,
+                "page_hash": refreshed.page_hash,
+                "page_text_snapshot": refreshed.page_text_snapshot,
+                "attempt": int(refreshed.attempt or 0),
+                "priority": int(refreshed.priority or 0),
+                "status": refreshed.status,
+                "last_error": refreshed.last_error,
+            }
+
+    async def _mark_recovered_refetch_retry(self, task_id: int, last_error: str) -> None:
+        async with self.db.session() as session:
+            await crawler_db.set_crawl_task_status(
+                session,
+                task_id,
+                status=CrawlTaskStatus.RETRY,
+                last_error=last_error,
+            )
+        self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
 
     async def _pipeline_llm_worker(
         self,
@@ -2328,6 +2460,7 @@ class CrawlerAgent:
                 incoming_name,
                 normalized.get("source_url") or task.source_url,
             )
+            self._infer_academician_flags_from_detail_context(normalized, task=task)
             return normalized
 
         normalized["org_unit_name"] = effective_name
@@ -2335,7 +2468,59 @@ class CrawlerAgent:
             normalized["org_unit_url"] = task.org_unit_url
         if not normalized.get("source_url"):
             normalized["source_url"] = task.source_url
+        self._infer_academician_flags_from_detail_context(normalized, task=task)
         return normalized
+
+    def _infer_academician_flags_from_detail_context(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: _ExtractionTaskItem,
+    ) -> None:
+        if not task.detail_mode:
+            return
+        page_text = str(task.page_text_snapshot or "")
+        if not page_text or not contains_academician_hint(page_text):
+            return
+        professors = payload.get("professors")
+        if not isinstance(professors, list):
+            return
+        changed = 0
+        for index, professor in enumerate(professors):
+            if not isinstance(professor, dict):
+                continue
+            if contains_self_academician_hint(
+                professor.get("name"),
+                professor.get("title"),
+                professor.get("bio"),
+            ):
+                continue
+            name = normalize_name(professor.get("name"))
+            if not name:
+                continue
+            window = self._name_context_window(page_text, name)
+            if not window or not contains_self_academician_hint(name, window):
+                continue
+            updated = dict(professor)
+            updated["is_academician"] = True
+            updated["_self_academician_evidence"] = True
+            professors[index] = updated
+            changed += 1
+        if changed:
+            self._pipeline_stats["academician_flags_inferred_from_detail"] = int(
+                self._pipeline_stats.get("academician_flags_inferred_from_detail", 0)
+            ) + changed
+
+    @staticmethod
+    def _name_context_window(text: str, name: str, *, radius: int = 160) -> str:
+        if not text or not name:
+            return ""
+        index = text.find(name)
+        if index < 0:
+            return ""
+        start = max(0, index - radius)
+        end = min(len(text), index + len(name) + radius)
+        return text[start:end]
 
     async def _save_payloads_to_db(
         self,
