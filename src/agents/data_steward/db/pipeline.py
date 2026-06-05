@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import sqlite3
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy import or_, select
+
 from agents.crawler import db as crawler_db
 from agents.crawler.config import CrawlerSettings
-from agents.crawler.models import OrgUnit, Professor
+from agents.crawler.db.utils import _normalize_url, _now_utc
+from agents.crawler.models import Academician, CrawlTask, CrawlTaskKind, CrawlTaskStatus, OrgUnit, Professor
 from agents.crawler.org_unit_filter import (
     ExcludedOrgUnit,
     hard_filter_org_unit_payloads,
     llm_filter_org_unit_payloads,
     org_unit_filter_item_keys,
+)
+from agents.crawler.sanitizer import (
+    contains_academician_hint,
+    contains_self_academician_hint,
+    infer_research_areas_from_bio,
+    normalize_non_academician_title,
 )
 from . import repository
 from agents.data_steward.types import StewardRunSummary
@@ -23,6 +33,24 @@ from runtime.skills import SkillManager
 
 
 UncertainClassifier = Callable[[list[dict[str, Any]], int], Awaitable[dict[int, dict[str, Any]]]]
+
+HOMEPAGE_PROFILE_INCOMPLETE_REASON = "homepage_profile_incomplete"
+COMPLETION_RECRAWL_LAST_ERROR = "completion_recrawl_missing_research_areas"
+COMPLETION_RECRAWL_REPAIRED_LAST_ERROR = "completion_recrawl_repaired_from_structured_evidence"
+BIO_ACADEMICIAN_REASON = "bio_academician_hint"
+BIO_INFERENCE_REASON = "bio_inference"
+PROFILE_SNAPSHOT_ACADEMICIAN_REASON = "profile_snapshot_academician_hint"
+PROFILE_SNAPSHOT_INFERENCE_REASON = "profile_snapshot_inference"
+MISCLASSIFIED_ACADEMICIAN_REASON = "no_self_academician_evidence"
+
+
+@dataclass(frozen=True)
+class ProfileSnapshotEvidence:
+    task_id: int
+    source_url: str
+    page_url: str
+    text: str
+    name_window: str
 
 
 async def process_one_database(
@@ -148,6 +176,13 @@ async def process_one_database(
                 )
                 if deleted:
                     duplicates_deleted += 1
+
+            audits_written += await process_bio_structured_inferences(
+                session,
+                run_id=run_id,
+                db_name=target_db.name,
+                apply=(mode == "apply"),
+            )
 
             uncertain_pool: list[dict[str, Any]] = []
             professors = await repository.list_professors(session)
@@ -427,6 +462,411 @@ async def process_sub_department_sections(
     return len(candidates), merged, cleanup_summary, audits_written
 
 
+async def process_bio_structured_inferences(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    apply: bool,
+) -> int:
+    audits_written = 0
+    snapshot_evidence = await _load_profile_snapshot_evidence(session)
+    audits_written += await _demote_misclassified_academicians(
+        session,
+        run_id=run_id,
+        db_name=db_name,
+        apply=apply,
+        snapshot_evidence=snapshot_evidence,
+    )
+    professors = await repository.list_professors(session)
+    for professor in professors:
+        before_snapshot = _professor_snapshot(professor)
+        evidence = _snapshot_evidence_for_entity(
+            snapshot_evidence,
+            name=professor.name,
+            urls=[professor.homepage, professor.external_link],
+        )
+        inferred_research, research_reason, research_evidence = _infer_research_from_profile_evidence(
+            bio=professor.bio,
+            snapshot_evidence=evidence,
+        )
+        academician_reason = _academician_reason_from_profile_evidence(
+            name=professor.name,
+            title=professor.title,
+            bio=professor.bio,
+            snapshot_evidence=evidence,
+        )
+        if academician_reason:
+            promotion_evidence = research_evidence
+            if promotion_evidence is None and academician_reason == PROFILE_SNAPSHOT_ACADEMICIAN_REASON:
+                promotion_evidence = evidence
+            await repository.add_audit(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type="professor",
+                entity_id=professor.id,
+                issue_type="promoted_academician",
+                reason=academician_reason,
+                confidence=0.95,
+                evidence={
+                    "name": professor.name,
+                    "org_unit_name": professor.org_unit_name,
+                    "inferred_research_areas": inferred_research,
+                    **_profile_evidence_payload(promotion_evidence),
+                },
+                action="promoted" if apply else "report_only",
+                before_snapshot=before_snapshot,
+            )
+            audits_written += 1
+            if apply:
+                await _mark_completion_recrawl_tasks_resolved(
+                    session,
+                    urls=[professor.homepage, professor.external_link],
+                    evidence=evidence,
+                )
+                await crawler_db.upsert_academician_with_status(
+                    session,
+                    {
+                        "name": professor.name,
+                        "org_unit_name": professor.org_unit_name,
+                        "title": "院士",
+                        "research_areas": professor.research_areas or inferred_research,
+                        "email": professor.email,
+                        "phone": professor.phone,
+                        "homepage": professor.homepage,
+                        "external_link": professor.external_link,
+                        "bio": professor.bio,
+                        "enrollment_pref": professor.enrollment_pref,
+                        "publications": professor.publications,
+                        "source_url": professor.homepage,
+                    },
+                )
+                await crawler_db.hard_delete_professor(session, professor)
+            continue
+
+        if inferred_research and not (professor.research_areas or "").strip():
+            await repository.add_audit(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type="professor",
+                entity_id=professor.id,
+                issue_type="inferred_research_areas",
+                field_name="research_areas",
+                reason=research_reason,
+                confidence=0.80,
+                evidence={
+                    "inferred_research_areas": inferred_research,
+                    **_profile_evidence_payload(research_evidence),
+                },
+                action="updated" if apply else "report_only",
+                before_snapshot=before_snapshot,
+            )
+            audits_written += 1
+            if apply:
+                professor.research_areas = inferred_research
+                professor.updated_at = _now_utc()
+                await _mark_completion_recrawl_tasks_resolved(
+                    session,
+                    urls=[professor.homepage, professor.external_link],
+                    evidence=research_evidence,
+                )
+
+    academicians = (await session.execute(select(Academician).order_by(Academician.id.asc()))).scalars().all()
+    for academician in academicians:
+        if (academician.research_areas or "").strip():
+            continue
+        evidence = _snapshot_evidence_for_entity(
+            snapshot_evidence,
+            name=academician.name,
+            urls=[academician.homepage, academician.external_link, academician.source_url],
+        )
+        inferred_research, research_reason, research_evidence = _infer_research_from_profile_evidence(
+            bio=academician.bio,
+            snapshot_evidence=evidence,
+        )
+        if not inferred_research:
+            continue
+        await repository.add_audit(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            entity_type="academician",
+            entity_id=academician.id,
+            issue_type="inferred_research_areas",
+            field_name="research_areas",
+            reason=research_reason,
+            confidence=0.80,
+            evidence={
+                "inferred_research_areas": inferred_research,
+                **_profile_evidence_payload(research_evidence),
+            },
+            action="updated" if apply else "report_only",
+            before_snapshot=_academician_snapshot(academician),
+        )
+        audits_written += 1
+        if apply:
+            academician.research_areas = inferred_research
+            academician.updated_at = _now_utc()
+            await _mark_completion_recrawl_tasks_resolved(
+                session,
+                urls=[academician.homepage, academician.external_link, academician.source_url],
+                evidence=research_evidence,
+            )
+    await session.flush()
+    return audits_written
+
+
+async def _demote_misclassified_academicians(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    apply: bool,
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+) -> int:
+    audits_written = 0
+    academicians = (await session.execute(select(Academician).order_by(Academician.id.asc()))).scalars().all()
+    for academician in academicians:
+        evidence = _snapshot_evidence_for_entity(
+            snapshot_evidence,
+            name=academician.name,
+            urls=[academician.homepage, academician.external_link, academician.source_url],
+        )
+        if not _has_profile_identity_evidence(academician.bio, evidence):
+            continue
+        if contains_self_academician_hint(academician.name, academician.bio):
+            continue
+        if evidence is not None and contains_self_academician_hint(academician.name, evidence.name_window, evidence.text):
+            continue
+
+        before_snapshot = _academician_snapshot(academician)
+        demoted_title = _infer_non_academician_title_from_profile(
+            academician.bio,
+            evidence.text if evidence is not None else None,
+        )
+        await repository.add_audit(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            entity_type="academician",
+            entity_id=academician.id,
+            issue_type="misclassified_academician",
+            reason=MISCLASSIFIED_ACADEMICIAN_REASON,
+            confidence=0.90,
+            evidence={
+                "name": academician.name,
+                "has_academician_mention": contains_academician_hint(
+                    academician.bio,
+                    evidence.text if evidence is not None else None,
+                ),
+                "demoted_title": demoted_title,
+                **_profile_evidence_payload(evidence if evidence is not None else None),
+            },
+            action="demoted_to_professor" if apply else "report_only",
+            before_snapshot=before_snapshot,
+        )
+        audits_written += 1
+        if apply:
+            await crawler_db.upsert_professor_with_status(
+                session,
+                {
+                    "name": academician.name,
+                    "org_unit_id": academician.org_unit_id,
+                    "title": demoted_title,
+                    "research_areas": academician.research_areas,
+                    "email": academician.email,
+                    "phone": academician.phone,
+                    "homepage": academician.homepage,
+                    "external_link": academician.external_link,
+                    "bio": academician.bio,
+                    "enrollment_pref": academician.enrollment_pref,
+                    "publications": academician.publications,
+                    "source_url": academician.source_url or academician.homepage,
+                },
+            )
+            await session.delete(academician)
+    if audits_written and apply:
+        await session.flush()
+    return audits_written
+
+
+async def _load_profile_snapshot_evidence(session: Any) -> dict[str, list[ProfileSnapshotEvidence]]:
+    rows = (
+        await session.execute(
+            select(CrawlTask)
+            .where(
+                CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value,
+                CrawlTask.page_text_snapshot != "",
+            )
+            .order_by(CrawlTask.id.asc())
+        )
+    ).scalars().all()
+    by_url: dict[str, list[ProfileSnapshotEvidence]] = {}
+    for task in rows:
+        text = (task.page_text_snapshot or "").strip()
+        if not text:
+            continue
+        evidence = ProfileSnapshotEvidence(
+            task_id=int(task.id),
+            source_url=task.source_url,
+            page_url=task.page_url,
+            text=text,
+            name_window="",
+        )
+        for url in {task.source_url, task.page_url}:
+            key = _normalize_url(url)
+            if key:
+                by_url.setdefault(key, []).append(evidence)
+    for values in by_url.values():
+        values.sort(key=lambda item: len(item.text), reverse=True)
+    return by_url
+
+
+def _snapshot_evidence_for_entity(
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+    *,
+    name: str | None,
+    urls: list[str | None],
+) -> ProfileSnapshotEvidence | None:
+    clean_name = (name or "").strip()
+    if not clean_name:
+        return None
+    seen_task_ids: set[int] = set()
+    for url in urls:
+        key = _normalize_url(url)
+        if not key:
+            continue
+        for evidence in snapshot_evidence.get(key, []):
+            if evidence.task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(evidence.task_id)
+            context = _snapshot_profile_context(evidence.text, clean_name)
+            if not context:
+                continue
+            name_window = _snapshot_name_window(context, clean_name)
+            return ProfileSnapshotEvidence(
+                task_id=evidence.task_id,
+                source_url=evidence.source_url,
+                page_url=evidence.page_url,
+                text=context,
+                name_window=name_window,
+            )
+    return None
+
+
+def _infer_research_from_profile_evidence(
+    *,
+    bio: str | None,
+    snapshot_evidence: ProfileSnapshotEvidence | None,
+) -> tuple[str | None, str, ProfileSnapshotEvidence | None]:
+    inferred = infer_research_areas_from_bio(bio)
+    if inferred:
+        return inferred, BIO_INFERENCE_REASON, None
+    if snapshot_evidence is not None:
+        inferred = infer_research_areas_from_bio(snapshot_evidence.text)
+        if inferred:
+            return inferred, PROFILE_SNAPSHOT_INFERENCE_REASON, snapshot_evidence
+    return None, "", None
+
+
+def _has_profile_identity_evidence(bio: str | None, snapshot_evidence: ProfileSnapshotEvidence | None) -> bool:
+    if (bio or "").strip():
+        return True
+    return bool(snapshot_evidence is not None and (snapshot_evidence.text or "").strip())
+
+
+def _infer_non_academician_title_from_profile(*values: str | None) -> str | None:
+    for value in values:
+        title = normalize_non_academician_title(value)
+        if title:
+            return title
+    return None
+
+
+def _academician_reason_from_profile_evidence(
+    *,
+    name: str | None,
+    title: str | None,
+    bio: str | None,
+    snapshot_evidence: ProfileSnapshotEvidence | None,
+) -> str | None:
+    if contains_self_academician_hint(name, title, bio):
+        return BIO_ACADEMICIAN_REASON
+    if snapshot_evidence is not None and contains_self_academician_hint(name, snapshot_evidence.name_window):
+        return PROFILE_SNAPSHOT_ACADEMICIAN_REASON
+    return None
+
+
+def _snapshot_profile_context(text: str, name: str) -> str | None:
+    index = text.find(name)
+    if index < 0:
+        return None
+    start = max(0, index - 120)
+    end_candidates = [
+        pos
+        for marker in ("[上一篇", "[下一篇", "友情链接", "版权所有", "地址：")
+        if (pos := text.find(marker, index)) > index
+    ]
+    end = min(end_candidates) if end_candidates else min(len(text), index + 3500)
+    return text[start:end].strip()
+
+
+def _snapshot_name_window(text: str, name: str, *, radius: int = 700) -> str:
+    index = text.find(name)
+    if index < 0:
+        return ""
+    start = max(0, index - min(120, radius))
+    end = min(len(text), index + len(name) + radius)
+    return text[start:end].strip()
+
+
+def _profile_evidence_payload(evidence: ProfileSnapshotEvidence | None) -> dict[str, Any]:
+    if evidence is None:
+        return {"text_source": "bio"}
+    return {
+        "text_source": "profile_snapshot",
+        "crawl_task_id": evidence.task_id,
+        "source_url": evidence.source_url,
+        "page_url": evidence.page_url,
+    }
+
+
+async def _mark_completion_recrawl_tasks_resolved(
+    session: Any,
+    *,
+    urls: list[str | None],
+    evidence: ProfileSnapshotEvidence | None,
+) -> None:
+    candidate_urls = {_normalize_url(url) for url in urls if _normalize_url(url)}
+    task_ids = {evidence.task_id} if evidence is not None else set()
+    filters = []
+    if candidate_urls:
+        filters.append(CrawlTask.source_url.in_(candidate_urls))
+        filters.append(CrawlTask.page_url.in_(candidate_urls))
+    if task_ids:
+        filters.append(CrawlTask.id.in_(task_ids))
+    if not filters:
+        return
+    tasks = (
+        await session.execute(
+            select(CrawlTask).where(
+                CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value,
+                CrawlTask.status.in_([CrawlTaskStatus.PENDING.value, CrawlTaskStatus.RETRY.value]),
+                CrawlTask.last_error.like("completion_recrawl_%"),
+                or_(*filters),
+            )
+        )
+    ).scalars().all()
+    for task in tasks:
+        task.status = CrawlTaskStatus.DONE.value
+        task.last_error = COMPLETION_RECRAWL_REPAIRED_LAST_ERROR
+        task.updated_at = _now_utc()
+    if tasks:
+        await session.flush()
+
+
 async def infer_missing_reason(
     session: Any,
     *,
@@ -442,6 +882,11 @@ async def infer_missing_reason(
         "homepage": homepage,
         "org_unit_name": professor.org_unit_name,
     }
+
+    if homepage and (professor.research_areas or "").strip() == "":
+        evidence["recrawl_source"] = "homepage"
+        return HOMEPAGE_PROFILE_INCOMPLETE_REASON, 0.95, evidence
+
     crawl_failure_count = await repository.count_failed_crawl_logs_by_url(
         session,
         source_url=source_url,
@@ -470,9 +915,15 @@ def validate_llm_reason(
     confidence: float,
     evidence: dict[str, Any],
 ) -> tuple[str, float]:
-    normalized_reason = reason if reason in {"crawl_failure", "site_missing", "uncertain"} else "uncertain"
+    normalized_reason = (
+        reason
+        if reason in {"crawl_failure", "site_missing", "uncertain", HOMEPAGE_PROFILE_INCOMPLETE_REASON}
+        else "uncertain"
+    )
     normalized_confidence = max(0.0, min(float(confidence), 1.0))
     failure_count = int(evidence.get("failure_count") or 0)
+    if normalized_reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON and not evidence.get("homepage"):
+        return "uncertain", min(normalized_confidence, 0.45)
     if normalized_reason == "site_missing" and failure_count > 0:
         return "uncertain", min(normalized_confidence, 0.45)
     if normalized_reason == "crawl_failure" and failure_count <= 0:
@@ -496,6 +947,11 @@ async def record_missing_field_audits(
     missing_field_audits = 0
     recrawl_tasks_upserted = 0
     for field_name in missing_fields:
+        recrawl_field = _should_enqueue_recrawl_for_field(
+            field_name=field_name,
+            missing_fields=missing_fields,
+            reason=reason,
+        )
         await repository.add_audit(
             session,
             run_id=run_id,
@@ -507,13 +963,13 @@ async def record_missing_field_audits(
             reason=reason,
             confidence=confidence,
             evidence=evidence,
-            action="recrawl_enqueued" if (apply and reason == "crawl_failure") else "report_only",
+            action="recrawl_enqueued" if (apply and recrawl_field) else "report_only",
         )
         audits_written += 1
         missing_field_audits += 1
 
-    if apply and reason == "crawl_failure":
-        if await enqueue_recrawl_task(session, professor):
+    if apply and _should_enqueue_recrawl(missing_fields=missing_fields, reason=reason):
+        if await enqueue_recrawl_task(session, professor, reason=reason):
             recrawl_tasks_upserted += 1
     return audits_written, missing_field_audits, recrawl_tasks_upserted
 
@@ -522,17 +978,37 @@ async def resolve_source_url(session: Any, professor_id: int) -> str:
     return await repository.resolve_source_url(session, professor_id=professor_id)
 
 
-async def enqueue_recrawl_task(session: Any, professor: Professor) -> bool:
-    source_url = await resolve_source_url(session, professor.id)
-    if not source_url:
+def _should_enqueue_recrawl_for_field(*, field_name: str, missing_fields: list[str], reason: str) -> bool:
+    if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
+        return field_name == "research_areas"
+    return reason == "crawl_failure" and bool(missing_fields)
+
+
+def _should_enqueue_recrawl(*, missing_fields: list[str], reason: str) -> bool:
+    if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
+        return "research_areas" in missing_fields
+    return reason == "crawl_failure" and bool(missing_fields)
+
+
+async def enqueue_recrawl_task(session: Any, professor: Professor, *, reason: str) -> bool:
+    priority = 0
+    last_error = "steward_recrawl_missing_core_fields"
+    if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
         source_url = (professor.homepage or "").strip()
+        priority = -10
+        last_error = COMPLETION_RECRAWL_LAST_ERROR
+    else:
+        source_url = await resolve_source_url(session, professor.id)
+        if not source_url:
+            source_url = (professor.homepage or "").strip()
     if not source_url:
         return False
     return await repository.upsert_recrawl_task(
         session,
         professor=professor,
         source_url=source_url,
-        last_error="steward_recrawl_missing_core_fields",
+        last_error=last_error,
+        priority=priority,
     )
 
 
@@ -583,6 +1059,23 @@ def _professor_snapshot(professor: Professor) -> dict[str, Any]:
         "bio": professor.bio,
         "enrollment_pref": professor.enrollment_pref,
         "publications": professor.publications,
+    }
+
+
+def _academician_snapshot(academician: Academician) -> dict[str, Any]:
+    return {
+        "id": academician.id,
+        "name": academician.name,
+        "org_unit_id": academician.org_unit_id,
+        "title": academician.title,
+        "research_areas": academician.research_areas,
+        "email": academician.email,
+        "phone": academician.phone,
+        "homepage": academician.homepage,
+        "external_link": academician.external_link,
+        "bio": academician.bio,
+        "enrollment_pref": academician.enrollment_pref,
+        "publications": academician.publications,
     }
 
 
