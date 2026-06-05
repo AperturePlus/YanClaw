@@ -425,10 +425,11 @@ def _contains_english_self_academician_hint(name: str, text: str) -> bool:
 
 def _academician_mention_is_relational(text: str) -> bool:
     compact = re.sub(r"\s+", "", text)
-    lowered = compact.lower()
-    if _ACADEMICIAN_RELATION_RE.search(compact):
+    relation_text = re.sub(r"(?:博士生导师|硕士生导师|研究生导师|博士导师|硕士导师|博导|硕导)", "", compact)
+    lowered = relation_text.lower()
+    if _ACADEMICIAN_RELATION_RE.search(relation_text):
         return True
-    if any(hint in compact for hint in _ACADEMICIAN_RELATION_HINTS):
+    if any(hint in relation_text for hint in _ACADEMICIAN_RELATION_HINTS):
         return True
     return bool(re.search(r"(advisor|adviser|mentor|supervisor|collaborat).{0,80}?academician", lowered))
 
