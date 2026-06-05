@@ -1,6 +1,6 @@
 ---
 name: crawler-loop-detection
-description: Detect and break out of crawler loops by analyzing backtrack count and visited URL patterns.
+description: 通过回退次数和已访问 URL 模式识别并打破爬虫循环。
 version: 2
 applies_to: DISCOVER_ORG_UNIT_PAGES,EXTRACT_ORG_UNITS,FIND_FACULTY_PAGES,EXTRACT_PROFESSORS
 allowed_tools:
@@ -9,42 +9,42 @@ token_budget: 700
 created_at: 2026-04-26T12:49:52+00:00
 updated_at: 2026-04-27T00:00:00+00:00
 ---
-# Crawler Loop Detection & Recovery
+# 爬虫循环识别与恢复
 
-## Loop Detection
+## 循环判断
 
-When the same state sequence repeats and backtrack count increases, the crawler is likely in a loop.
+如果同一组状态反复出现，并且回退次数持续增加，说明当前导航路径很可能已经陷入循环。
 
-### Loop Indicators
+### 典型信号
 
-1. Backtrack count increases without new data being extracted
-2. Same URLs being visited repeatedly across cycles
-3. State transitions repeat: `DISCOVER_ORG_UNIT_PAGES -> EXTRACT_ORG_UNITS -> FIND_FACULTY_PAGES -> backtrack`
-4. No professor data saved across multiple cycles
+1. 回退次数增加，但没有提取到新的学院、师资页或教师数据。
+2. 多轮循环中反复访问相同 URL。
+3. 状态序列重复，例如 `DISCOVER_ORG_UNIT_PAGES -> EXTRACT_ORG_UNITS -> FIND_FACULTY_PAGES -> backtrack`。
+4. 连续多轮没有保存任何教师记录。
 
-### Recovery Actions
+### 恢复动作
 
-When a loop is detected (3+ consecutive backtracks):
+当检测到循环，尤其是连续 3 次以上回退时，按以下优先级处理：
 
-Action 1: Skip the current navigation path entirely.
-- If the homepage links do not lead to org units or faculty pages, stop trying them
-- Do not revisit the same URLs expecting different results
-- The homepage may be JavaScript-rendered or simply not contain useful links
+动作 1：彻底跳过当前导航路径。
+- 如果主页链接没有导向学院列表或师资页，就停止继续尝试这条路径。
+- 不要反复访问同一 URL 并期待不同结果。
+- 主页可能依赖 JavaScript 渲染，或者本身不包含有用链接。
 
-Action 2: Prefer official org unit listing pages.
-- Look for pages like `院系设置`, `组织机构`, `学院设置`, `教学单位`, `科研机构`
+动作 2：优先寻找官方学院/机构列表页。
+- 重点查找 `院系设置`、`组织机构`、`学院设置`、`教学单位`、`科研机构` 等页面。
 
-Action 3: Try known faculty page paths on org unit subdomains.
-- `/szdw/` (faculty team)
+动作 3：在学院子站上尝试常见师资路径。
+- `/szdw/`
 - `/teachers/`
 - `/faculty/`
 - `/people/`
 
-Action 4: If all else fails, try searching.
-- Use `site:university.edu.cn 师资队伍` / `教师名录` to find faculty pages on the right domain
+动作 4：如果仍然没有候选，使用搜索。
+- 用 `site:university.edu.cn 师资队伍` 或 `site:university.edu.cn 教师名录` 查找同域师资页。
 
-## Critical Rule
+## 关键规则
 
-Do not visit the same page more than once unless:
-1. You have a new search query or a concrete new hypothesis, or
-2. You intentionally disabled cross-run dedup during backtrack retries.
+不要重复访问同一页面，除非满足以下条件之一：
+1. 有新的搜索词或明确的新假设。
+2. 回退重试时已经有意关闭跨运行去重。

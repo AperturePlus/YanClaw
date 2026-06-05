@@ -1,6 +1,6 @@
 ---
 name: extract-links
-description: Select same-site links that maximize org-unit and faculty coverage.
+description: 选择能最大化学院和师资覆盖面的同站链接。
 version: 8
 applies_to: DISCOVER_ORG_UNIT_PAGES,FIND_FACULTY_PAGES
 allowed_tools: extract_links
@@ -11,61 +11,58 @@ updated_at: 2026-06-03T00:00:00
 ---
 ## Goal
 
-Pick links that help the crawler cover as many colleges/schools and faculty directories as possible.
+选择最有助于覆盖大学学院/院系和师资目录的链接。
 
-## Priority Order
+## 优先级
 
-1. University-level org-unit index pages.
-2. College/school/department homepages.
-3. Faculty/team/teacher list pages for each org unit.
-4. Individual teacher profile pages.
+1. 校级学院/院系列表页。
+2. 学院、院系、研究院主页。
+3. 每个学院的师资队伍、教师名录、团队列表页。
+4. 单个教师详情页。
 
-## Org-Unit Discovery Hints
+## 学院列表线索
 
-Prefer links containing:
+优先选择包含以下线索的链接：
 
 - `jgsz`, `yxsz`, `xysz`, `zzjg`, `jxjg`
 - `college`, `school`, `department`, `academy`
 - `院系`, `学院`, `组织机构`, `机构设置`, `教学单位`
 
-## Faculty Discovery Hints
+## 师资页线索
 
-Prefer links containing:
+优先选择包含以下线索的链接：
 
 - `faculty`, `teacher`, `staff`, `people`, `team`, `directory`, `list`
 - `szdw`, `szll`, `jsdw`, `qzjs`
 - `师资`, `教师`, `导师`, `教工`
 
-## Coverage Rules
+## 覆盖规则
 
-- Keep same-site links only.
-- For each org unit, try to keep at least one faculty-list candidate.
-- If both showcase pages and directory pages exist, prefer directory pages.
-- Do not prioritize academicians-only pages over full teacher directories.
+- 只保留同站链接。
+- 对每个学院，尽量至少保留一个师资列表候选。
+- 如果同时存在展示页和完整目录页，优先目录页。
+- 不要把院士专页、人才荣誉页排在完整教师目录前面。
 
-## Exclusions
+## 排除项
 
-- News, notices, events, admissions, student affairs, alumni pages.
-- HR/personnel/recruitment pages (e.g. `renshi`, `hr`, `rczp`, `zhaopin`, `jobs`).
-- Policy/rules/party pages (e.g. `policy`, `zcwj`, `dangjian`, `party`).
-- Login/SSO/mail/library/download pages.
-- External non-university domains.
-- Do not prioritize org-unit or faculty links for arts, sports, Sino-foreign/joint-program colleges,
-  or basic teaching centers when broader academic org-unit pages are available.
-- Examples to deprioritize: 艺术学院, 体育学院, 匹兹堡学院, 格拉斯哥学院, 巴黎卓越工程师学院,
-  中法工程师学院, 中德工程学院, 中英国际学院, 中美联合学院, 密西根学院, 爱丁堡学院,
-  莱斯特国际学院, 基教中心, 基础教学部.
-- Do not treat 人工智能学院 as an arts page.
+- 新闻、通知、活动、招生、学生事务、校友页面。
+- 人事、人才招聘、岗位招聘页面，例如 `renshi`、`hr`、`rczp`、`zhaopin`、`jobs`。
+- 政策、规章、党建页面，例如 `policy`、`zcwj`、`dangjian`、`party`。
+- 登录、统一认证、邮箱、图书馆、下载页面。
+- 外部非高校域名。
+- 当存在更广泛的学术学院入口时，不优先选择艺术、体育、中外合作/联合办学、基础教学中心相关链接。
+- 典型降权对象：艺术学院、体育学院、匹兹堡学院、格拉斯哥学院、巴黎卓越工程师学院、中法工程师学院、中德工程学院、中英国际学院、中美联合学院、密西根学院、爱丁堡学院、莱斯特国际学院、基教中心、基础教学部。
+- 不要把人工智能学院误判为艺术学院。
 
-## Anti-Noise Rule (Important)
+## 抗噪规则
 
-- If a page is under a faculty-related path but is actually a notice/news/policy list, treat it as noise and skip it.
-- Prefer stable directory/profile patterns such as `szdw`, `jsdw`, `teacher`, `faculty`, `people`, `/info/...`.
+- 即使页面路径包含师资相关词，如果内容实际是通知、新闻、政策列表，也要当作噪声跳过。
+- 优先稳定的目录或详情模式，例如 `szdw`、`jsdw`、`teacher`、`faculty`、`people`、`/info/...`。
 
-## Tool Usage
+## 工具调用
 
-Call `extract_links` with:
+调用 `extract_links`，参数为：
 
-- `links`: raw candidate links from current page.
-- `base_url`: current university root URL.
-- `keywords`: optional, but keep broad enough to avoid empty results.
+- `links`：当前页面提取出的原始候选链接。
+- `base_url`：当前大学根 URL。
+- `keywords`：可选；关键词应足够宽，避免把所有有效候选过滤掉。
