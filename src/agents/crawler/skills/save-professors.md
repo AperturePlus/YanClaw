@@ -22,6 +22,12 @@ Use `save_professors` with:
 - `source_url`: current page URL.
 - `professors`: list of records.
 
+## Org Unit Context Rules
+
+- Use the current task's parent college/school as `org_unit_name`. Do not replace it with a page heading such as a department, teaching center, experiment center, lab section, or roster category.
+- If the current page is a department list under a college (for example `工业互联网与建模仿真系` under `自动化科学与电气工程学院`), extract visible teachers but still call `save_professors` with the parent college/school name.
+- If the current page is a teaching/experiment/training center roster (`教学中心`, `实验中心`, `教学实验中心`, `实验教学中心`, `实训中心`, `实践教学中心`), do not call `save_professors`; these units are not graduate-admission org units.
+
 ## Field Rules (Strict)
 
 - `name`: required; use the teacher's real name only. Remove extra punctuation, numbering,
