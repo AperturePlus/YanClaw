@@ -211,12 +211,76 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
     await db.close()
 
 
+async def test_save_professors_promotes_academician_from_bio(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "tools_academician_bio.db"))
+    await db.init_db()
+    manager = SkillManager(tmp_path / "skills", db, "crawler")
+    tools = get_crawler_tools(db, manager)
+
+    result = await tools["save_professors"](
+        org_unit_name="计算机学院",
+        org_unit_url="https://scse.buaa.edu.cn/",
+        source_url="https://scse.buaa.edu.cn/info/liwei.htm",
+        professors=[
+            {
+                "name": "李未",
+                "title": "教授",
+                "bio": "李未，北京航空航天大学计算机学院教授，博士生导师，中国科学院院士。",
+            }
+        ],
+    )
+
+    assert result["accepted"] == 1
+    assert result["created"] == 0
+    assert result["saved"] == 0
+    assert result["academicians_saved"] == 1
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor).where(Professor.name == "李未"))).scalars().all()
+        academician = (await session.execute(select(Academician).where(Academician.name == "李未"))).scalar_one()
+        assert professors == []
+        assert academician.title == "院士"
+    await db.close()
+
+
+async def test_save_professors_does_not_trust_unverified_academician_flag(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "tools_false_academician_flag.db"))
+    await db.init_db()
+    manager = SkillManager(tmp_path / "skills", db, "crawler")
+    tools = get_crawler_tools(db, manager)
+
+    result = await tools["save_professors"](
+        org_unit_name="计算机学院",
+        org_unit_url="https://cs.scu.edu.cn/",
+        source_url="https://cs.scu.edu.cn/info/lei.htm",
+        professors=[
+            {
+                "name": "雷文强",
+                "title": "教授",
+                "is_academician": True,
+                "bio": "与荷兰皇家科学院院士Maarten de Rijke教授等世界一流学者合作。",
+            }
+        ],
+    )
+
+    assert result["accepted"] == 1
+    assert result["created"] == 1
+    assert "academicians_saved" not in result
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "雷文强"))).scalar_one()
+        academicians = (await session.execute(select(Academician).where(Academician.name == "雷文强"))).scalars().all()
+        assert professor.title == "教授"
+        assert academicians == []
+    await db.close()
+
+
 def test_save_professors_skill_documents_name_and_homepage_rules():
     text = Path("src/agents/crawler/skills/save-professors.md").read_text(encoding="utf-8")
     assert "（兼）" in text
     assert "external_link" in text
     assert "Do not use roster/list pages" in text
     assert "教学实验中心" in text
+    assert "is_academician" in text
+    assert "研究方向" in text
     assert "parent college/school" in text
 
 

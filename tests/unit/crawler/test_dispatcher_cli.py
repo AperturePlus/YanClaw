@@ -15,7 +15,14 @@ from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError, _university_db_path
 from agents.crawler.fetchers import FetchResult
-from agents.crawler.models import CrawlStatus, OrgUnit, Professor, ProfessorAffiliation
+from agents.crawler.models import (
+    CrawlStatus,
+    CrawlTaskKind,
+    CrawlTaskStatus,
+    OrgUnit,
+    Professor,
+    ProfessorAffiliation,
+)
 from runtime.database import DatabaseManager
 from runtime.skills import SkillMeta
 from runtime.cli import cli as runtime_cli
@@ -776,6 +783,70 @@ async def test_dispatcher_resume_mode_reruns_completed_db_with_retryable_fetch_f
                 0,
                 block_reason="timeout",
             ),
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("resume_mode") is True
+    assert CaptureAgent.last_kwargs.get("resume_force_existing") is False
+
+
+async def test_dispatcher_resume_mode_reruns_completed_db_with_recoverable_crawl_task(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "homepage": "https://a.example.edu.cn/cs/info/1001/ada.htm",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="A",
+            org_unit_name="CS",
+            org_unit_url="https://a.example.edu.cn/cs",
+            source_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            page_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            page_hash="completion-recrawl",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            priority=-10,
+            last_error="completion_recrawl_missing_research_areas",
         )
     await db.close()
 

@@ -23,6 +23,7 @@ from agents.crawler.agent import (
 )
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import (
+    Academician,
     CrawlExtractionFailure,
     CrawlLogStatus,
     CrawlStatus,
@@ -95,6 +96,55 @@ class FakeLLM:
                 [ToolCallRecord("save_professors", {"professors": []}, result)],
             )
         return LLMResult("{}")
+
+
+class FakeLLMResearchDetail(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS" and "研究方向" in payload.get("page_text", ""):
+            result = await tool_handlers["save_professors"](
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
+                professors=[{"name": "Ada", "title": "Professor", "research_areas": "systems"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+class FakeLLMAcademicianOmitted(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS":
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机学院",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
+                professors=[{"name": "李未", "title": "教授"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+class FakeLLMRelationAcademicianFlag(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS":
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机学院",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=payload["url"],
+                professors=[
+                    {
+                        "name": "雷文强",
+                        "title": "教授",
+                        "is_academician": True,
+                        "bio": "与荷兰皇家科学院院士Maarten de Rijke教授等世界一流学者合作。",
+                    }
+                ],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
 
 
 class FakeLLMHomeAsOrgList(FakeLLM):
@@ -1487,6 +1537,193 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
     assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
     assert rows[1].page_hash == incoming_hash
     assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
+    await db.close()
+
+
+async def test_recovery_refetches_empty_completion_detail_task_and_updates_research(tmp_path):
+    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages={
+            homepage: FetchResult(
+                homepage,
+                "Ada 教授\n研究方向: systems",
+                [],
+                200,
+            ),
+        },
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": homepage,
+                "source_url": "https://www.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="empty-homepage",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            priority=-10,
+            last_error="completion_recrawl_missing_research_areas",
+        )
+
+    await agent._extract_professors([], recovery_limit=1)
+
+    assert fetcher.calls == [homepage]
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        assert professor.research_areas == "systems"
+        assert task.status == CrawlTaskStatus.DONE.value
+        assert task.page_hash != "empty-homepage"
+        assert "研究方向" in task.page_text_snapshot
+    await db.close()
+
+
+async def test_detail_context_marks_academician_when_llm_omits_flag(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLMAcademicianOmitted())
+    detail_url = "https://www.example.edu.cn/cs/info/liwei.htm"
+
+    await agent._extract_professors_from_page(
+        _QueuedUrl(detail_url, 1, "计算机学院"),
+        FetchResult(
+            detail_url,
+            "李未，北京航空航天大学计算机学院教授，博士生导师，中国科学院院士。李未院士是我国著名的计算机科学家。",
+            [],
+            200,
+        ),
+        "save professors",
+        detail_mode=True,
+        requested_url=detail_url,
+    )
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor).where(Professor.name == "李未"))).scalars().all()
+        academician = (await session.execute(select(Academician).where(Academician.name == "李未"))).scalar_one()
+        assert professors == []
+        assert academician.title == "院士"
+    await db.close()
+
+
+async def test_detail_context_does_not_mark_relation_academician_as_self(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLMRelationAcademicianFlag())
+    detail_url = "https://www.example.edu.cn/cs/info/lei.htm"
+
+    await agent._extract_professors_from_page(
+        _QueuedUrl(detail_url, 1, "计算机学院"),
+        FetchResult(
+            detail_url,
+            "雷文强，教授。与荷兰皇家科学院院士Maarten de Rijke教授等世界一流学者合作。",
+            [],
+            200,
+        ),
+        "save professors",
+        detail_mode=True,
+        requested_url=detail_url,
+    )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "雷文强"))).scalar_one()
+        academicians = (await session.execute(select(Academician).where(Academician.name == "雷文强"))).scalars().all()
+        assert professor.title == "教授"
+        assert academicians == []
+    await db.close()
+
+
+async def test_recovery_keeps_blocked_completion_detail_task_retry_without_llm(tmp_path):
+    homepage = "https://www.example.edu.cn/cs/info/1001/blocked.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages={
+            homepage: FetchResult(
+                homepage,
+                "",
+                [],
+                403,
+                block_reason="waf",
+            ),
+        },
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="empty-homepage",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            priority=-10,
+            last_error="completion_recrawl_missing_research_areas",
+        )
+
+    await agent._extract_professors([], recovery_limit=1)
+
+    assert fetcher.calls == [homepage]
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+        assert task.status == CrawlTaskStatus.RETRY.value
+        assert task.last_error == "completion_recrawl_refetch_blocked:waf"
+        assert not any(failure.failure_type == "no_structured_data" for failure in failures)
+    await db.close()
+
+
+async def test_recovery_uses_existing_nonempty_snapshot_without_refetch(tmp_path):
+    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={},
+        fetcher_cls=FakeHumanFetcher,
+        resume_mode=True,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="existing-snapshot",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="faculty list Ada",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            last_error="invalid_json_retry",
+        )
+
+    await agent._extract_professors([], recovery_limit=1)
+
+    assert fetcher.calls == []
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        assert task.status == CrawlTaskStatus.DONE.value
+        assert task.page_hash == "existing-snapshot"
     await db.close()
 
 
