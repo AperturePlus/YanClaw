@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from sqlalchemy import or_, select
 
@@ -24,6 +25,7 @@ from agents.crawler.sanitizer import (
     normalize_non_academician_title,
 )
 from . import repository
+from agents.data_steward.llm_service import STEWARD_ORG_UNIT_CLEANUP
 from agents.data_steward.types import StewardRunSummary
 from runtime.database import DatabaseManager
 from runtime.context import ContextManager
@@ -32,16 +34,24 @@ from runtime.logger import get_logger
 from runtime.skills import SkillManager
 
 
-UncertainClassifier = Callable[[list[dict[str, Any]], int], Awaitable[dict[int, dict[str, Any]]]]
+StewardLLMFactory = Callable[[DatabaseManager], Any]
 
 HOMEPAGE_PROFILE_INCOMPLETE_REASON = "homepage_profile_incomplete"
 COMPLETION_RECRAWL_LAST_ERROR = "completion_recrawl_missing_research_areas"
+COMPLETION_RECRAWL_PROFILE_FIELDS_LAST_ERROR = "completion_recrawl_missing_profile_fields"
 COMPLETION_RECRAWL_REPAIRED_LAST_ERROR = "completion_recrawl_repaired_from_structured_evidence"
 BIO_ACADEMICIAN_REASON = "bio_academician_hint"
 BIO_INFERENCE_REASON = "bio_inference"
 PROFILE_SNAPSHOT_ACADEMICIAN_REASON = "profile_snapshot_academician_hint"
 PROFILE_SNAPSHOT_INFERENCE_REASON = "profile_snapshot_inference"
 MISCLASSIFIED_ACADEMICIAN_REASON = "no_self_academician_evidence"
+_TITLE_RELATION_SENTENCE_RE = re.compile(
+    r"(?:^|[，,；;\s])(?:与|同|和|跟)[^。；;\n\r]{0,120}?"
+    r"(?:教授|副教授|研究员|院士|professor|researcher)[^。；;\n\r]{0,80}?合作|"
+    r"(?:师从|合作导师|合作学者|合作对象)[^。；;\n\r]{0,120}?"
+    r"(?:教授|副教授|研究员|院士|professor|researcher)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -60,7 +70,7 @@ async def process_one_database(
     mode: str,
     max_context_tokens: int,
     include_backup_audit: bool,
-    uncertain_classifier: UncertainClassifier | None,
+    steward_llm_factory: StewardLLMFactory | None,
 ) -> StewardRunSummary:
     logger = get_logger("steward.db.pipeline")
     db = DatabaseManager(_sqlite_url(target_db))
@@ -76,7 +86,16 @@ async def process_one_database(
     org_unit_cleanup: dict[str, int] = {}
     run_id: int | None = None
     try:
+        logger.info(
+            "Data Steward pipeline start db=%s mode=%s llm_enabled=%s include_backup_audit=%s",
+            target_db,
+            mode,
+            steward_llm_factory is not None,
+            include_backup_audit,
+        )
         await db.init_db()
+        logger.info("Data Steward DB initialized db=%s", target_db)
+        steward_llm = steward_llm_factory(db) if steward_llm_factory is not None else None
         async with db.session() as session:
             await repository.ensure_schema(session, repair_identity=False)
             run_id = await repository.create_run(
@@ -84,7 +103,14 @@ async def process_one_database(
                 mode=mode,
                 target_db=str(target_db),
             )
+            logger.info(
+                "Data Steward run created db=%s run_id=%s mode=%s",
+                target_db.name,
+                run_id,
+                mode,
+            )
 
+            logger.info("Data Steward excluded org-unit cleanup start db=%s", target_db.name)
             (
                 excluded_org_units_detected,
                 excluded_org_units_deleted,
@@ -99,9 +125,17 @@ async def process_one_database(
                 target_db=target_db,
                 mode=mode,
                 max_context_tokens=max_context_tokens,
-                llm_enabled=uncertain_classifier is not None,
+                llm_enabled=steward_llm is not None,
             )
             audits_written += org_unit_audits
+            logger.info(
+                "Data Steward excluded org-unit cleanup done db=%s detected=%s deleted=%s audits=%s",
+                target_db.name,
+                excluded_org_units_detected,
+                excluded_org_units_deleted,
+                org_unit_audits,
+            )
+            logger.info("Data Steward sub-department cleanup start db=%s", target_db.name)
             (
                 sub_department_sections_detected,
                 sub_department_sections_merged,
@@ -116,8 +150,21 @@ async def process_one_database(
             )
             _merge_cleanup_summary(org_unit_cleanup, sub_org_cleanup)
             audits_written += sub_org_audits
+            logger.info(
+                "Data Steward sub-department cleanup done db=%s detected=%s merged=%s audits=%s",
+                target_db.name,
+                sub_department_sections_detected,
+                sub_department_sections_merged,
+                sub_org_audits,
+            )
 
+            logger.info("Data Steward identity repair scan start db=%s", target_db.name)
             identity_candidates = await repository.list_identity_repair_candidates(session)
+            logger.info(
+                "Data Steward identity repair candidates db=%s candidates=%s",
+                target_db.name,
+                len(identity_candidates),
+            )
             for candidate in identity_candidates:
                 duplicates_detected += 1
                 action = "merged" if mode == "apply" else "report_only"
@@ -144,9 +191,20 @@ async def process_one_database(
                 if identity_candidates:
                     identity_repair = await repository.repair_identity_data(session)
                     duplicates_deleted += int(identity_repair.professors_merged or 0)
+                    logger.info(
+                        "Data Steward identity repair applied db=%s merged=%s",
+                        target_db.name,
+                        int(identity_repair.professors_merged or 0),
+                    )
                 await repository.ensure_schema(session, repair_identity=True)
 
+            logger.info("Data Steward academician duplicate scan start db=%s", target_db.name)
             duplicates = await repository.list_duplicates(session)
+            logger.info(
+                "Data Steward academician duplicate candidates db=%s candidates=%s",
+                target_db.name,
+                len(duplicates),
+            )
             for professor, academician, reason in duplicates:
                 duplicates_detected += 1
                 before_snapshot = _professor_snapshot(professor)
@@ -177,15 +235,30 @@ async def process_one_database(
                 if deleted:
                     duplicates_deleted += 1
 
-            audits_written += await process_bio_structured_inferences(
+            logger.info("Data Steward structured profile inference start db=%s", target_db.name)
+            structured_audits = await process_bio_structured_inferences(
                 session,
                 run_id=run_id,
                 db_name=target_db.name,
                 apply=(mode == "apply"),
+                steward_llm=steward_llm,
+                max_context_tokens=max_context_tokens,
+            )
+            audits_written += structured_audits
+            logger.info(
+                "Data Steward structured profile inference done db=%s audits=%s",
+                target_db.name,
+                structured_audits,
             )
 
-            uncertain_pool: list[dict[str, Any]] = []
+            missing_pool: list[dict[str, Any]] = []
             professors = await repository.list_professors(session)
+            logger.info(
+                "Data Steward missing-field audit start db=%s professors=%s llm_enabled=%s",
+                target_db.name,
+                len(professors),
+                steward_llm is not None,
+            )
             for professor in professors:
                 missing_fields: list[str] = []
                 if (professor.research_areas or "").strip() == "":
@@ -199,13 +272,16 @@ async def process_one_database(
                     session,
                     professor=professor,
                 )
-                if uncertain_classifier is not None and static_reason == "uncertain":
-                    uncertain_pool.append(
+                if steward_llm is not None:
+                    missing_pool.append(
                         {
+                            "id": professor.id,
                             "professor_id": professor.id,
                             "name": professor.name,
                             "org_unit_name": professor.org_unit_name,
                             "missing_fields": missing_fields,
+                            "static_reason": static_reason,
+                            "static_confidence": static_confidence,
                             "evidence": evidence,
                         }
                     )
@@ -226,13 +302,30 @@ async def process_one_database(
                 missing_field_audits += missing_field_delta
                 recrawl_tasks_upserted += recrawl_delta
 
-            if uncertain_classifier is not None and uncertain_pool:
-                llm_result = await uncertain_classifier(uncertain_pool, max_context_tokens)
-                for item in uncertain_pool:
+            if steward_llm is not None and missing_pool:
+                logger.info(
+                    "Data Steward missing-field LLM triage start db=%s rows=%s",
+                    target_db.name,
+                    len(missing_pool),
+                )
+                llm_result = await steward_llm.classify_missing_fields(missing_pool, max_context_tokens)
+                logger.info(
+                    "Data Steward missing-field LLM triage done db=%s rows=%s decisions=%s",
+                    target_db.name,
+                    len(missing_pool),
+                    len(llm_result),
+                )
+                for item in missing_pool:
                     professor_id = int(item["professor_id"])
                     missing_fields = [str(value) for value in item.get("missing_fields", [])]
                     evidence = dict(item.get("evidence") or {})
-                    predicted = llm_result.get(professor_id, {"reason": "uncertain", "confidence": 0.35})
+                    predicted = llm_result.get(
+                        professor_id,
+                        {
+                            "reason": item.get("static_reason") or "uncertain",
+                            "confidence": item.get("static_confidence") or 0.35,
+                        },
+                    )
                     reason, confidence = validate_llm_reason(
                         reason=str(predicted.get("reason") or "uncertain"),
                         confidence=float(predicted.get("confidence") or 0.35),
@@ -255,6 +348,13 @@ async def process_one_database(
                     audits_written += audits_written_delta
                     missing_field_audits += missing_field_delta
                     recrawl_tasks_upserted += recrawl_delta
+            logger.info(
+                "Data Steward missing-field audit done db=%s missing_audits=%s recrawl_tasks=%s audits_written=%s",
+                target_db.name,
+                missing_field_audits,
+                recrawl_tasks_upserted,
+                audits_written,
+            )
 
             await repository.finish_run(
                 session,
@@ -273,9 +373,19 @@ async def process_one_database(
                     "audits_written": audits_written,
                 },
             )
+            logger.info("Data Steward run marked completed db=%s run_id=%s", target_db.name, run_id)
 
-        backup_audit = compare_with_latest_backup(settings=settings, target_db=target_db) if include_backup_audit else {}
-        return StewardRunSummary(
+        if include_backup_audit:
+            logger.info("Data Steward backup audit start db=%s", target_db.name)
+            backup_audit = compare_with_latest_backup(settings=settings, target_db=target_db)
+            logger.info(
+                "Data Steward backup audit done db=%s keys=%s",
+                target_db.name,
+                len(backup_audit),
+            )
+        else:
+            backup_audit = {}
+        summary = StewardRunSummary(
             db_name=target_db.name,
             mode=mode,
             status="completed",
@@ -291,6 +401,23 @@ async def process_one_database(
             org_unit_cleanup=org_unit_cleanup,
             backup_audit=backup_audit,
         )
+        logger.info(
+            "Data Steward pipeline done db=%s status=%s duplicates=%s deleted=%s "
+            "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
+            "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s",
+            summary.db_name,
+            summary.status,
+            summary.duplicates_detected,
+            summary.duplicates_deleted,
+            summary.excluded_org_units_detected,
+            summary.excluded_org_units_deleted,
+            summary.sub_department_sections_detected,
+            summary.sub_department_sections_merged,
+            summary.missing_field_audits,
+            summary.recrawl_tasks_upserted,
+            summary.audits_written,
+        )
+        return summary
     except Exception as error:
         logger.exception("Data Steward pipeline failed target=%s", target_db)
         if run_id is not None:
@@ -313,6 +440,23 @@ async def process_one_database(
                         "audits_written": audits_written,
                     },
                 )
+        logger.warning(
+            "Data Steward pipeline failed summary db=%s run_id=%s duplicates=%s deleted=%s "
+            "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
+            "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s error=%s",
+            target_db.name,
+            run_id,
+            duplicates_detected,
+            duplicates_deleted,
+            excluded_org_units_detected,
+            excluded_org_units_deleted,
+            sub_department_sections_detected,
+            sub_department_sections_merged,
+            missing_field_audits,
+            recrawl_tasks_upserted,
+            audits_written,
+            error,
+        )
         return StewardRunSummary(
             db_name=target_db.name,
             mode=mode,
@@ -360,7 +504,7 @@ async def process_excluded_org_units(
     )
     llm_result = None
     if llm_enabled and settings.openai_api_key and hard_result.kept:
-        skill_manager = SkillManager(Path(settings.crawler_skills_dir), db, "crawler")
+        skill_manager = SkillManager(Path(settings.data_steward_skills_dir), db, "data_steward")
         llm_result = await llm_filter_org_unit_payloads(
             hard_result.kept,
             llm_client=LLMClient(
@@ -374,10 +518,11 @@ async def process_excluded_org_units(
                 max_rounds=1,
             ),
             context_manager=ContextManager(settings.openai_model),
-            skills_text=skill_manager.select_for_state("EXTRACT_ORG_UNITS", set()).rendered_text,
+            skills_text=skill_manager.select_for_state(STEWARD_ORG_UNIT_CLEANUP, set()).rendered_text,
             university=target_db.stem,
             source_url=str(target_db),
             source="data_steward",
+            state=STEWARD_ORG_UNIT_CLEANUP,
             model_max_tokens=max_context_tokens,
             logger=get_logger("steward.db.pipeline"),
         )
@@ -468,19 +613,45 @@ async def process_bio_structured_inferences(
     run_id: int,
     db_name: str,
     apply: bool,
+    steward_llm: Any | None = None,
+    max_context_tokens: int = 128000,
 ) -> int:
     audits_written = 0
     snapshot_evidence = await _load_profile_snapshot_evidence(session)
+    identity_reviewed: set[str] = set()
+    if steward_llm is not None:
+        identity_delta, identity_reviewed = await _apply_llm_identity_reviews(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            apply=apply,
+            snapshot_evidence=snapshot_evidence,
+            steward_llm=steward_llm,
+            max_context_tokens=max_context_tokens,
+        )
+        audits_written += identity_delta
+        audits_written += await _apply_llm_profile_cleanup(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            apply=apply,
+            snapshot_evidence=snapshot_evidence,
+            steward_llm=steward_llm,
+            max_context_tokens=max_context_tokens,
+        )
     audits_written += await _demote_misclassified_academicians(
         session,
         run_id=run_id,
         db_name=db_name,
         apply=apply,
         snapshot_evidence=snapshot_evidence,
+        identity_reviewed=identity_reviewed,
     )
     professors = await repository.list_professors(session)
     for professor in professors:
         before_snapshot = _professor_snapshot(professor)
+        if _entity_key("professor", professor.id) in identity_reviewed:
+            continue
         evidence = _snapshot_evidence_for_entity(
             snapshot_evidence,
             name=professor.name,
@@ -618,6 +789,352 @@ async def process_bio_structured_inferences(
     return audits_written
 
 
+async def _apply_llm_profile_cleanup(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    apply: bool,
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+    steward_llm: Any,
+    max_context_tokens: int,
+) -> int:
+    rows, text_by_key, entity_by_key, evidence_by_key = await _profile_cleanup_rows(session, snapshot_evidence)
+    if not rows:
+        return 0
+    decisions = await steward_llm.cleanup_profiles(rows, max_context_tokens)
+    audits_written = 0
+    for row in rows:
+        key = str(row["entity_key"])
+        decision = decisions.get(key)
+        if not isinstance(decision, dict):
+            continue
+        entity = entity_by_key.get(key)
+        if entity is None:
+            continue
+        updates = decision.get("updates")
+        if not isinstance(updates, dict):
+            continue
+        confidence = _safe_confidence(decision.get("confidence"), default=0.0)
+        profile_text = text_by_key.get(key, "")
+        before_snapshot = _entity_snapshot(row["entity_type"], entity)
+        for field_name in ("bio", "research_areas", "title", "enrollment_pref"):
+            value = _clean_llm_text(updates.get(field_name))
+            if not value or not _is_empty_text(getattr(entity, field_name, None)):
+                continue
+            spans = _evidence_spans_for_field(decision, field_name)
+            evidence_ok = confidence >= 0.75 and _evidence_spans_exist(spans, profile_text)
+            await repository.add_audit(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type=str(row["entity_type"]),
+                entity_id=int(getattr(entity, "id")),
+                issue_type="llm_profile_cleanup",
+                field_name=field_name,
+                reason=str(decision.get("reason") or "llm_profile_cleanup"),
+                confidence=confidence,
+                evidence={
+                    "field_update": value,
+                    "evidence_spans": spans,
+                    "evidence_valid": evidence_ok,
+                    "recrawl_needed": bool(decision.get("recrawl_needed")),
+                    "skill_state": "STEWARD_PROFILE_CLEANUP",
+                    **_profile_evidence_payload(evidence_by_key.get(key)),
+                },
+                action="updated" if (apply and evidence_ok) else "report_only",
+                before_snapshot=before_snapshot,
+            )
+            audits_written += 1
+            if apply and evidence_ok:
+                setattr(entity, field_name, value)
+                entity.updated_at = _now_utc()
+                await _mark_completion_recrawl_tasks_resolved(
+                    session,
+                    urls=[getattr(entity, "homepage", None), getattr(entity, "external_link", None)],
+                    evidence=evidence_by_key.get(key),
+                )
+    if audits_written and apply:
+        await session.flush()
+    return audits_written
+
+
+async def _profile_cleanup_rows(
+    session: Any,
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any], dict[str, ProfileSnapshotEvidence | None]]:
+    rows: list[dict[str, Any]] = []
+    text_by_key: dict[str, str] = {}
+    entity_by_key: dict[str, Any] = {}
+    evidence_by_key: dict[str, ProfileSnapshotEvidence | None] = {}
+    professors = await repository.list_professors(session)
+    academicians = (await session.execute(select(Academician).order_by(Academician.id.asc()))).scalars().all()
+    for entity_type, entities in (("professor", professors), ("academician", academicians)):
+        for entity in entities:
+            entity_id = getattr(entity, "id", None)
+            if entity_id is None:
+                continue
+            evidence = _snapshot_evidence_for_entity(
+                snapshot_evidence,
+                name=getattr(entity, "name", None),
+                urls=[getattr(entity, "homepage", None), getattr(entity, "external_link", None), getattr(entity, "source_url", None)],
+            )
+            profile_text = _profile_text_for_llm(entity, evidence)
+            if not profile_text:
+                continue
+            missing_fields = [
+                field
+                for field in ("bio", "research_areas", "title", "enrollment_pref")
+                if _is_empty_text(getattr(entity, field, None))
+            ]
+            if not missing_fields:
+                continue
+            key = _entity_key(entity_type, entity_id)
+            rows.append(
+                {
+                    "entity_key": key,
+                    "entity_type": entity_type,
+                    "name": getattr(entity, "name", None),
+                    "org_unit_name": getattr(entity, "org_unit_name", None),
+                    "missing_fields": missing_fields,
+                    "current": _entity_snapshot(entity_type, entity),
+                    "profile_text": profile_text,
+                    "profile_source": _profile_evidence_payload(evidence),
+                }
+            )
+            text_by_key[key] = profile_text
+            entity_by_key[key] = entity
+            evidence_by_key[key] = evidence
+    return rows, text_by_key, entity_by_key, evidence_by_key
+
+
+async def _apply_llm_identity_reviews(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    apply: bool,
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+    steward_llm: Any,
+    max_context_tokens: int,
+) -> tuple[int, set[str]]:
+    rows, text_by_key, entity_by_key, evidence_by_key = await _identity_review_rows(session, snapshot_evidence)
+    if not rows:
+        return 0, set()
+    decisions = await steward_llm.review_identities(rows, max_context_tokens)
+    reviewed: set[str] = set()
+    audits_written = 0
+    for row in rows:
+        key = str(row["entity_key"])
+        decision = decisions.get(key)
+        if not isinstance(decision, dict):
+            continue
+        entity = entity_by_key.get(key)
+        if entity is None:
+            continue
+        action = str(decision.get("action") or "no_action").strip()
+        confidence = _safe_confidence(decision.get("confidence"), default=0.0)
+        spans = _evidence_spans_for_field(decision, None)
+        evidence_ok = _evidence_spans_exist(spans, text_by_key.get(key, ""))
+        reviewed.add(key)
+
+        if row["entity_type"] == "professor" and action == "promote_academician":
+            audits_written += await _audit_llm_identity_decision(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type="professor",
+                entity=entity,
+                issue_type="promoted_academician",
+                action="promoted" if (apply and evidence_ok and confidence >= 0.90) else "report_only",
+                decision=decision,
+                evidence_ok=evidence_ok,
+                spans=spans,
+            )
+            if apply and evidence_ok and confidence >= 0.90:
+                await _mark_completion_recrawl_tasks_resolved(
+                    session,
+                    urls=[entity.homepage, entity.external_link],
+                    evidence=evidence_by_key.get(key),
+                )
+                updates = decision.get("updates") if isinstance(decision.get("updates"), dict) else {}
+                await crawler_db.upsert_academician_with_status(
+                    session,
+                    {
+                        "name": entity.name,
+                        "org_unit_name": entity.org_unit_name,
+                        "title": "院士",
+                        "research_areas": entity.research_areas or _clean_llm_text(updates.get("research_areas")),
+                        "email": entity.email,
+                        "phone": entity.phone,
+                        "homepage": entity.homepage,
+                        "external_link": entity.external_link,
+                        "bio": entity.bio,
+                        "enrollment_pref": entity.enrollment_pref,
+                        "publications": entity.publications,
+                        "source_url": entity.homepage,
+                    },
+                )
+                await crawler_db.hard_delete_professor(session, entity)
+            continue
+
+        if row["entity_type"] == "academician" and action == "demote_to_professor":
+            audits_written += await _audit_llm_identity_decision(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type="academician",
+                entity=entity,
+                issue_type="misclassified_academician",
+                action="demoted_to_professor" if (apply and evidence_ok and confidence >= 0.90) else "report_only",
+                decision=decision,
+                evidence_ok=evidence_ok,
+                spans=spans,
+            )
+            if apply and evidence_ok and confidence >= 0.90:
+                updates = decision.get("updates") if isinstance(decision.get("updates"), dict) else {}
+                demoted_title = _clean_llm_text(updates.get("title")) or _infer_non_academician_title_from_profile(
+                    entity.bio,
+                    evidence_by_key.get(key).text if evidence_by_key.get(key) is not None else None,
+                )
+                await crawler_db.upsert_professor_with_status(
+                    session,
+                    {
+                        "name": entity.name,
+                        "org_unit_id": entity.org_unit_id,
+                        "title": demoted_title,
+                        "research_areas": entity.research_areas,
+                        "email": entity.email,
+                        "phone": entity.phone,
+                        "homepage": entity.homepage,
+                        "external_link": entity.external_link,
+                        "bio": entity.bio,
+                        "enrollment_pref": entity.enrollment_pref,
+                        "publications": entity.publications,
+                        "source_url": entity.source_url or entity.homepage,
+                    },
+                )
+                await session.delete(entity)
+            continue
+
+        if action in {"keep_professor", "keep_academician", "no_action"}:
+            audits_written += await _audit_llm_identity_decision(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type=str(row["entity_type"]),
+                entity=entity,
+                issue_type="llm_identity_review",
+                action="kept" if evidence_ok or action == "no_action" else "report_only",
+                decision=decision,
+                evidence_ok=evidence_ok,
+                spans=spans,
+            )
+    if audits_written and apply:
+        await session.flush()
+    return audits_written, reviewed
+
+
+async def _identity_review_rows(
+    session: Any,
+    snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+) -> tuple[list[dict[str, Any]], dict[str, str], dict[str, Any], dict[str, ProfileSnapshotEvidence | None]]:
+    rows: list[dict[str, Any]] = []
+    text_by_key: dict[str, str] = {}
+    entity_by_key: dict[str, Any] = {}
+    evidence_by_key: dict[str, ProfileSnapshotEvidence | None] = {}
+    professors = await repository.list_professors(session)
+    academicians = (await session.execute(select(Academician).order_by(Academician.id.asc()))).scalars().all()
+    for professor in professors:
+        if professor.id is None:
+            continue
+        evidence = _snapshot_evidence_for_entity(
+            snapshot_evidence,
+            name=professor.name,
+            urls=[professor.homepage, professor.external_link],
+        )
+        profile_text = _profile_text_for_llm(professor, evidence)
+        if not profile_text or not contains_academician_hint(professor.title, professor.bio, profile_text):
+            continue
+        key = _entity_key("professor", professor.id)
+        rows.append(_identity_review_payload("professor", key, professor, evidence, profile_text))
+        text_by_key[key] = profile_text
+        entity_by_key[key] = professor
+        evidence_by_key[key] = evidence
+    for academician in academicians:
+        if academician.id is None:
+            continue
+        evidence = _snapshot_evidence_for_entity(
+            snapshot_evidence,
+            name=academician.name,
+            urls=[academician.homepage, academician.external_link, academician.source_url],
+        )
+        profile_text = _profile_text_for_llm(academician, evidence)
+        if not profile_text:
+            continue
+        key = _entity_key("academician", academician.id)
+        rows.append(_identity_review_payload("academician", key, academician, evidence, profile_text))
+        text_by_key[key] = profile_text
+        entity_by_key[key] = academician
+        evidence_by_key[key] = evidence
+    return rows, text_by_key, entity_by_key, evidence_by_key
+
+
+def _identity_review_payload(
+    entity_type: str,
+    key: str,
+    entity: Professor | Academician,
+    evidence: ProfileSnapshotEvidence | None,
+    profile_text: str,
+) -> dict[str, Any]:
+    return {
+        "entity_key": key,
+        "entity_type": entity_type,
+        "current_entity_type": entity_type,
+        "name": entity.name,
+        "current": _entity_snapshot(entity_type, entity),
+        "profile_text": profile_text,
+        "name_window": evidence.name_window if evidence is not None else "",
+        "profile_source": _profile_evidence_payload(evidence),
+    }
+
+
+async def _audit_llm_identity_decision(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    entity_type: str,
+    entity: Professor | Academician,
+    issue_type: str,
+    action: str,
+    decision: dict[str, Any],
+    evidence_ok: bool,
+    spans: list[str],
+) -> int:
+    await repository.add_audit(
+        session,
+        run_id=run_id,
+        db_name=db_name,
+        entity_type=entity_type,
+        entity_id=int(entity.id),
+        issue_type=issue_type,
+        reason=str(decision.get("reason") or "llm_identity_review"),
+        confidence=_safe_confidence(decision.get("confidence"), default=0.0),
+        evidence={
+            "llm_action": str(decision.get("action") or "no_action"),
+            "updates": decision.get("updates") if isinstance(decision.get("updates"), dict) else {},
+            "evidence_spans": spans,
+            "evidence_valid": evidence_ok,
+            "recrawl_needed": bool(decision.get("recrawl_needed")),
+            "skill_state": "STEWARD_IDENTITY_REVIEW",
+        },
+        action=action,
+        before_snapshot=_entity_snapshot(entity_type, entity),
+    )
+    return 1
+
+
 async def _demote_misclassified_academicians(
     session: Any,
     *,
@@ -625,10 +1142,14 @@ async def _demote_misclassified_academicians(
     db_name: str,
     apply: bool,
     snapshot_evidence: dict[str, list[ProfileSnapshotEvidence]],
+    identity_reviewed: set[str] | None = None,
 ) -> int:
     audits_written = 0
+    reviewed = identity_reviewed or set()
     academicians = (await session.execute(select(Academician).order_by(Academician.id.asc()))).scalars().all()
     for academician in academicians:
+        if _entity_key("academician", academician.id) in reviewed:
+            continue
         evidence = _snapshot_evidence_for_entity(
             snapshot_evidence,
             name=academician.name,
@@ -779,10 +1300,19 @@ def _has_profile_identity_evidence(bio: str | None, snapshot_evidence: ProfileSn
 
 def _infer_non_academician_title_from_profile(*values: str | None) -> str | None:
     for value in values:
-        title = normalize_non_academician_title(value)
-        if title:
-            return title
+        text = (value or "").strip()
+        if not text:
+            continue
+        for sentence in _profile_title_candidate_sentences(text):
+            title = normalize_non_academician_title(sentence)
+            if title:
+                return title
     return None
+
+
+def _profile_title_candidate_sentences(text: str) -> list[str]:
+    sentences = [part.strip() for part in re.split(r"[。；;\n\r]+", text) if part.strip()]
+    return [sentence for sentence in sentences if not _TITLE_RELATION_SENTENCE_RE.search(sentence)]
 
 
 def _academician_reason_from_profile_evidence(
@@ -831,6 +1361,71 @@ def _profile_evidence_payload(evidence: ProfileSnapshotEvidence | None) -> dict[
         "source_url": evidence.source_url,
         "page_url": evidence.page_url,
     }
+
+
+def _profile_text_for_llm(entity: Professor | Academician, evidence: ProfileSnapshotEvidence | None) -> str:
+    parts = []
+    bio = (getattr(entity, "bio", None) or "").strip()
+    if bio:
+        parts.append(bio)
+    if evidence is not None:
+        if (evidence.name_window or "").strip():
+            parts.append(evidence.name_window.strip())
+        if (evidence.text or "").strip() and evidence.text.strip() not in parts:
+            parts.append(evidence.text.strip())
+    return "\n\n".join(part for part in parts if part).strip()
+
+
+def _entity_key(entity_type: str, entity_id: Any) -> str:
+    return f"{entity_type}:{int(entity_id)}"
+
+
+def _entity_snapshot(entity_type: str, entity: Professor | Academician) -> dict[str, Any]:
+    return _professor_snapshot(entity) if entity_type == "professor" else _academician_snapshot(entity)
+
+
+def _is_empty_text(value: Any) -> bool:
+    return not str(value or "").strip()
+
+
+def _clean_llm_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _safe_confidence(value: Any, *, default: float) -> float:
+    try:
+        confidence = float(value)
+    except Exception:
+        confidence = default
+    return max(0.0, min(confidence, 1.0))
+
+
+def _evidence_spans_for_field(decision: dict[str, Any], field_name: str | None) -> list[str]:
+    raw = decision.get("evidence_spans")
+    if isinstance(raw, dict):
+        if field_name is not None:
+            return _coerce_spans(raw.get(field_name))
+        spans: list[str] = []
+        for value in raw.values():
+            spans.extend(_coerce_spans(value))
+        return spans
+    return _coerce_spans(raw)
+
+
+def _coerce_spans(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item or "").strip()]
+    return []
+
+
+def _evidence_spans_exist(spans: list[str], text: str) -> bool:
+    haystack = str(text or "")
+    if not spans or not haystack:
+        return False
+    return all(span in haystack for span in spans)
 
 
 async def _mark_completion_recrawl_tasks_resolved(
@@ -883,7 +1478,10 @@ async def infer_missing_reason(
         "org_unit_name": professor.org_unit_name,
     }
 
-    if homepage and (professor.research_areas or "").strip() == "":
+    if homepage and (
+        (professor.research_areas or "").strip() == ""
+        or (professor.bio or "").strip() == ""
+    ):
         evidence["recrawl_source"] = "homepage"
         return HOMEPAGE_PROFILE_INCOMPLETE_REASON, 0.95, evidence
 
@@ -980,13 +1578,13 @@ async def resolve_source_url(session: Any, professor_id: int) -> str:
 
 def _should_enqueue_recrawl_for_field(*, field_name: str, missing_fields: list[str], reason: str) -> bool:
     if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
-        return field_name == "research_areas"
+        return field_name in {"bio", "research_areas"}
     return reason == "crawl_failure" and bool(missing_fields)
 
 
 def _should_enqueue_recrawl(*, missing_fields: list[str], reason: str) -> bool:
     if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
-        return "research_areas" in missing_fields
+        return any(field in {"bio", "research_areas"} for field in missing_fields)
     return reason == "crawl_failure" and bool(missing_fields)
 
 
@@ -996,7 +1594,7 @@ async def enqueue_recrawl_task(session: Any, professor: Professor, *, reason: st
     if reason == HOMEPAGE_PROFILE_INCOMPLETE_REASON:
         source_url = (professor.homepage or "").strip()
         priority = -10
-        last_error = COMPLETION_RECRAWL_LAST_ERROR
+        last_error = COMPLETION_RECRAWL_PROFILE_FIELDS_LAST_ERROR
     else:
         source_url = await resolve_source_url(session, professor.id)
         if not source_url:

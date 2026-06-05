@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 from sqlalchemy import select
@@ -19,7 +20,9 @@ from agents.crawler.models import (
     StewardRun,
 )
 from agents.data_steward.agent import DataStewardAgent
+from agents.data_steward.llm_service import DataStewardLLMService
 from runtime.database import DatabaseManager
+from runtime.logger import setup_logging
 from runtime.llm import LLMResult
 
 
@@ -255,6 +258,50 @@ async def test_steward_dry_run_detects_duplicates_and_writes_audits(tmp_path):
     await db.close()
 
 
+async def test_steward_run_logs_stage_progress_to_console_and_file(tmp_path, capsys):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    await _seed_db(db_path)
+    log_file = setup_logging(tmp_path / "logs")
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=False,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    captured = capsys.readouterr()
+    expected_messages = [
+        "Data Steward batch start",
+        "Data Steward target start",
+        "Data Steward pipeline start",
+        "Data Steward excluded org-unit cleanup start",
+        "Data Steward missing-field audit done",
+        "Data Steward target done",
+        "Data Steward batch done",
+    ]
+    for message in expected_messages:
+        assert message in captured.err
+
+    content = log_file.read_text(encoding="utf-8")
+    for message in expected_messages:
+        assert message in content
+
+
 async def test_steward_dry_run_audits_sub_department_sections_without_merging(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -474,6 +521,303 @@ async def test_steward_llm_enabled_deletes_person_named_teaching_units(tmp_path,
     await db.close()
 
 
+async def test_data_steward_llm_service_loads_steward_skills(tmp_path):
+    db = DatabaseManager(_sqlite_url(tmp_path / "meta.db"))
+    await db.init_db()
+    settings = CrawlerSettings(
+        openai_api_key="test-key",
+        data_steward_skills_dir=Path("src/agents/data_steward/skills"),
+    )
+    service = DataStewardLLMService(settings=settings, db=db)
+    captured: dict[str, object] = {}
+
+    class FakeLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            captured["messages"] = messages
+            return LLMResult('{"items":[]}')
+
+    service.llm_client = FakeLLM()
+    await service.cleanup_profiles(
+        [
+            {
+                "entity_key": "professor:1",
+                "entity_type": "professor",
+                "name": "Ada",
+                "profile_text": "Ada 研究方向：可靠性数字孪生",
+            }
+        ],
+        128000,
+    )
+
+    system_text = "\n".join(
+        str(message.get("content") or "")
+        for message in captured["messages"]
+        if message.get("role") == "system"
+    )
+    assert "Skill: steward-evidence-rules" in system_text
+    assert "Skill: profile-cleanup" in system_text
+    assert "save-professors" not in system_text
+    await db.close()
+
+
+async def test_steward_llm_profile_cleanup_updates_with_valid_evidence(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    homepage = "https://www.example.edu.cn/cs/info/ada.htm"
+    snapshot = "Ada\n个人简介\nAda focuses on reliable digital twins.\n研究方向\n可靠性数字孪生"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": homepage,
+            },
+        )
+        await _seed_completion_detail_task(session, url=homepage, snapshot=snapshot)
+    await db.close()
+
+    class FakeStewardLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def review_identities(self, rows, max_context_tokens):
+            return {}
+
+        async def cleanup_profiles(self, rows, max_context_tokens):
+            key = rows[0]["entity_key"]
+            return {
+                key: {
+                    "entity_key": key,
+                    "updates": {
+                        "bio": "Ada focuses on reliable digital twins.",
+                        "research_areas": "可靠性数字孪生",
+                    },
+                    "reason": "profile_snapshot_cleanup",
+                    "confidence": 0.92,
+                    "evidence_spans": {
+                        "bio": ["Ada focuses on reliable digital twins."],
+                        "research_areas": ["可靠性数字孪生"],
+                    },
+                    "recrawl_needed": False,
+                }
+            }
+
+        async def classify_missing_fields(self, rows, max_context_tokens):
+            return {}
+
+    monkeypatch.setattr("agents.data_steward.agent.DataStewardLLMService", FakeStewardLLM)
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+        org_unit_exclude_enabled=False,
+        openai_api_key="test-key",
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=True,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_recrawl_tasks_upserted == 0
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert professor.bio == "Ada focuses on reliable digital twins."
+        assert professor.research_areas == "可靠性数字孪生"
+        assert sum(audit.issue_type == "llm_profile_cleanup" and audit.action == "updated" for audit in audits) == 2
+    await db.close()
+
+
+async def test_steward_llm_profile_cleanup_rejects_missing_evidence_span(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    homepage = "https://www.example.edu.cn/cs/info/ada.htm"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": homepage,
+            },
+        )
+        await _seed_completion_detail_task(session, url=homepage, snapshot="Ada\n研究方向\n可靠性数字孪生")
+    await db.close()
+
+    class FakeStewardLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def review_identities(self, rows, max_context_tokens):
+            return {}
+
+        async def cleanup_profiles(self, rows, max_context_tokens):
+            key = rows[0]["entity_key"]
+            return {
+                key: {
+                    "entity_key": key,
+                    "updates": {"bio": "Invented biography text."},
+                    "reason": "profile_snapshot_cleanup",
+                    "confidence": 0.95,
+                    "evidence_spans": {"bio": ["not present in input"]},
+                }
+            }
+
+        async def classify_missing_fields(self, rows, max_context_tokens):
+            return {}
+
+    monkeypatch.setattr("agents.data_steward.agent.DataStewardLLMService", FakeStewardLLM)
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+        org_unit_exclude_enabled=False,
+        openai_api_key="test-key",
+    )
+    await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=True,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert not (professor.bio or "").strip()
+        assert any(
+            audit.issue_type == "llm_profile_cleanup"
+            and audit.field_name == "bio"
+            and audit.action == "report_only"
+            and json.loads(audit.evidence or "{}").get("evidence_valid") is False
+            for audit in audits
+        )
+    await db.close()
+
+
+async def test_steward_llm_identity_review_can_veto_hard_demotion(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_academician(
+            session,
+            {
+                "name": "Relational Mention",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "bio": "国家级青年人才，博士生导师。与荷兰皇家科学院院士Maarten de Rijke教授等世界一流学者合作。",
+                "research_areas": "信息检索",
+            },
+        )
+    await db.close()
+
+    class FakeStewardLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def review_identities(self, rows, max_context_tokens):
+            key = rows[0]["entity_key"]
+            return {
+                key: {
+                    "entity_key": key,
+                    "action": "no_action",
+                    "reason": "relational_academician_mention_uncertain",
+                    "confidence": 0.80,
+                    "evidence_spans": [],
+                }
+            }
+
+        async def cleanup_profiles(self, rows, max_context_tokens):
+            return {}
+
+        async def classify_missing_fields(self, rows, max_context_tokens):
+            return {}
+
+    monkeypatch.setattr("agents.data_steward.agent.DataStewardLLMService", FakeStewardLLM)
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+        org_unit_exclude_enabled=False,
+        openai_api_key="test-key",
+    )
+    await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=True,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        academician = (
+            await session.execute(select(Academician).where(Academician.name == "Relational Mention"))
+        ).scalar_one()
+        professors = (
+            await session.execute(select(Professor).where(Professor.name == "Relational Mention"))
+        ).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert academician.name == "Relational Mention"
+        assert professors == []
+        assert any(audit.issue_type == "llm_identity_review" and audit.action == "kept" for audit in audits)
+    await db.close()
+
+
 async def test_steward_apply_deletes_duplicates_and_enqueues_recrawl(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -579,7 +923,7 @@ async def test_steward_apply_enqueues_homepage_missing_research_recrawl(tmp_path
         assert task.task_kind == CrawlTaskKind.DETAIL_PAGE.value
         assert task.status == CrawlTaskStatus.RETRY.value
         assert task.priority == -10
-        assert task.last_error == "completion_recrawl_missing_research_areas"
+        assert task.last_error == "completion_recrawl_missing_profile_fields"
         assert any(
             audit.field_name == "research_areas"
             and audit.reason == "homepage_profile_incomplete"
@@ -589,7 +933,7 @@ async def test_steward_apply_enqueues_homepage_missing_research_recrawl(tmp_path
     await db.close()
 
 
-async def test_steward_apply_does_not_enqueue_bio_only_or_no_homepage_research(tmp_path):
+async def test_steward_apply_enqueues_homepage_missing_bio_but_not_no_homepage(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
         "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
@@ -646,13 +990,85 @@ async def test_steward_apply_does_not_enqueue_bio_only_or_no_homepage_research(t
         include_backup_audit=False,
     )
 
-    assert summary.total_recrawl_tasks_upserted == 0
+    assert summary.total_recrawl_tasks_upserted == 1
 
     db = DatabaseManager(_sqlite_url(db_path))
     await db.init_db()
     async with db.session() as session:
         tasks = (await session.execute(select(CrawlTask))).scalars().all()
-        assert tasks == []
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert len(tasks) == 1
+        assert tasks[0].source_url == "https://www.example.edu.cn/cs/info/1001/bio-only.htm"
+        assert tasks[0].last_error == "completion_recrawl_missing_profile_fields"
+        assert any(
+            audit.field_name == "bio"
+            and audit.reason == "homepage_profile_incomplete"
+            and audit.action == "recrawl_enqueued"
+            for audit in audits
+        )
+    await db.close()
+
+
+async def test_steward_apply_enqueues_one_task_when_homepage_missing_bio_and_research(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    homepage = "https://www.example.edu.cn/cs/info/1001/missing-both.htm"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Missing Both",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": homepage,
+                "source_url": "https://www.example.edu.cn/cs/faculty",
+            },
+        )
+    await db.close()
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_recrawl_tasks_upserted == 1
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert len(tasks) == 1
+        assert tasks[0].source_url == homepage
+        assert {audit.field_name for audit in audits if audit.issue_type == "missing_core_field"} == {
+            "bio",
+            "research_areas",
+        }
     await db.close()
 
 
@@ -897,7 +1313,7 @@ async def test_steward_apply_backfills_research_from_detail_snapshot(tmp_path):
         include_backup_audit=False,
     )
 
-    assert summary.total_recrawl_tasks_upserted == 0
+    assert summary.total_recrawl_tasks_upserted == 1
 
     db = DatabaseManager(_sqlite_url(db_path))
     await db.init_db()
@@ -913,8 +1329,21 @@ async def test_steward_apply_backfills_research_from_detail_snapshot(tmp_path):
 
         assert professor.research_areas == "机器学习；数据挖掘"
         assert academician.research_areas == "形式化方法；可信软件"
-        assert [task.status for task in tasks] == [CrawlTaskStatus.DONE.value, CrawlTaskStatus.DONE.value]
+        task_by_url = {task.source_url: task for task in tasks}
+        assert task_by_url[professor_homepage].status == CrawlTaskStatus.RETRY.value
+        assert task_by_url[professor_homepage].last_error == "completion_recrawl_missing_profile_fields"
+        assert task_by_url[academician_homepage].status == CrawlTaskStatus.DONE.value
+        assert (
+            task_by_url[academician_homepage].last_error
+            == "completion_recrawl_repaired_from_structured_evidence"
+        )
         assert sum(audit.reason == "profile_snapshot_inference" for audit in audits) == 2
+        assert any(
+            audit.field_name == "bio"
+            and audit.reason == "homepage_profile_incomplete"
+            and audit.action == "recrawl_enqueued"
+            for audit in audits
+        )
         assert not any(
             audit.issue_type == "promoted_academician" and audit.entity_id == professor.id
             for audit in audits
@@ -988,7 +1417,7 @@ async def test_steward_detail_snapshot_requires_matching_name(tmp_path):
         assert professor.research_areas is None
         assert academicians == []
         assert task.status == CrawlTaskStatus.RETRY.value
-        assert task.last_error == "completion_recrawl_missing_research_areas"
+        assert task.last_error == "completion_recrawl_missing_profile_fields"
         assert not any(str(audit.reason or "").startswith("profile_snapshot_") for audit in audits)
     await db.close()
 
@@ -1042,7 +1471,7 @@ async def test_steward_apply_demotes_misclassified_academicians_with_profile_evi
                 "org_unit_name": "CS",
                 "org_unit_url": "https://www.example.edu.cn/cs",
                 "homepage": "https://www.example.edu.cn/cs/info/liwei.htm",
-                "bio": "李未，北京航空航天大学计算机学院教授，博士生导师，中国科学院院士。",
+                "bio": "李未，中国科学院院士，北京航空航天大学计算机学院教授，博士生导师。",
                 "research_areas": "形式理论",
             },
         )

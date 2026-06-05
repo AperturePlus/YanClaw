@@ -1,20 +1,19 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 from agents.crawler.config import CrawlerSettings
 from agents.data_steward.db import process_one_database, resolve_targets
+from agents.data_steward.llm_service import DataStewardLLMService
 from agents.data_steward.types import StewardBatchSummary
-from runtime.context import ContextManager
-from runtime.llm import LLMClient
+from runtime.database import DatabaseManager
+from runtime.logger import get_logger
 
 
 class DataStewardAgent:
     def __init__(self, *, settings: CrawlerSettings) -> None:
         self.settings = settings
-        self.context_manager = ContextManager(settings.openai_model)
+        self.logger = get_logger("steward.agent")
 
     async def run(
         self,
@@ -34,20 +33,52 @@ class DataStewardAgent:
             db_roots=db_roots,
         )
         mode = "apply" if apply else "dry_run"
-        classifier = self._classify_uncertain_with_llm if llm_enabled else None
+        steward_llm_factory = self._build_llm_service if llm_enabled and self.settings.openai_api_key else None
         summaries = []
-        for target_db in resolution.targets:
+        target_count = len(resolution.targets)
+        self.logger.info(
+            "Data Steward batch start mode=%s targets=%s llm_enabled=%s include_backup_audit=%s",
+            mode,
+            target_count,
+            steward_llm_factory is not None,
+            include_backup_audit,
+        )
+        for index, target_db in enumerate(resolution.targets, start=1):
+            self.logger.info(
+                "Data Steward target start index=%s/%s db=%s",
+                index,
+                target_count,
+                target_db,
+            )
             summary = await process_one_database(
                 settings=self.settings,
                 target_db=target_db,
                 mode=mode,
                 max_context_tokens=max_context_tokens,
                 include_backup_audit=include_backup_audit,
-                uncertain_classifier=classifier,
+                steward_llm_factory=steward_llm_factory,
             )
             summaries.append(summary)
+            self.logger.info(
+                "Data Steward target done index=%s/%s db=%s status=%s duplicates=%s deleted=%s "
+                "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
+                "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s",
+                index,
+                target_count,
+                target_db,
+                summary.status,
+                summary.duplicates_detected,
+                summary.duplicates_deleted,
+                summary.excluded_org_units_detected,
+                summary.excluded_org_units_deleted,
+                summary.sub_department_sections_detected,
+                summary.sub_department_sections_merged,
+                summary.missing_field_audits,
+                summary.recrawl_tasks_upserted,
+                summary.audits_written,
+            )
 
-        return StewardBatchSummary(
+        batch_summary = StewardBatchSummary(
             mode=mode,
             targets=[str(path) for path in resolution.targets],
             total_duplicates_detected=sum(item.duplicates_detected for item in summaries),
@@ -65,92 +96,27 @@ class DataStewardAgent:
             ),
             total_sub_department_sections_merged=sum(item.sub_department_sections_merged for item in summaries),
         )
-
-    async def _classify_uncertain_with_llm(
-        self,
-        rows: list[dict[str, Any]],
-        max_context_tokens: int,
-    ) -> dict[int, dict[str, Any]]:
-        if not rows:
-            return {}
-        if not self.settings.openai_api_key:
-            return {}
-
-        budget = max(4096, min(int(max_context_tokens), 256000))
-        llm = LLMClient(
-            self.settings.openai_base_url,
-            self.settings.openai_api_key,
-            self.settings.openai_model,
-            timeout_seconds=self.settings.llm_timeout_seconds,
-            max_rounds=1,
+        self.logger.info(
+            "Data Steward batch done mode=%s targets=%s duplicates=%s deleted=%s "
+            "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
+            "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s "
+            "unmatched_universities=%s unmatched_db_roots=%s",
+            batch_summary.mode,
+            len(batch_summary.targets),
+            batch_summary.total_duplicates_detected,
+            batch_summary.total_duplicates_deleted,
+            batch_summary.total_excluded_org_units_detected,
+            batch_summary.total_excluded_org_units_deleted,
+            batch_summary.total_sub_department_sections_detected,
+            batch_summary.total_sub_department_sections_merged,
+            batch_summary.total_missing_field_audits,
+            batch_summary.total_recrawl_tasks_upserted,
+            batch_summary.total_audits_written,
+            len(batch_summary.unmatched_universities),
+            len(batch_summary.unmatched_db_roots),
         )
-        result: dict[int, dict[str, Any]] = {}
-        batches = self._chunk_rows_for_llm(rows, budget)
-        for batch in batches:
-            payload = json.dumps({"items": batch}, ensure_ascii=False)
-            response = await llm.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You classify missing faculty fields. "
-                            "Allowed reasons: crawl_failure, site_missing, uncertain. "
-                            "Return strict JSON object: {\"items\":[{\"id\":<int>,\"reason\":\"...\",\"confidence\":<0..1>}]}."
-                        ),
-                    },
-                    {"role": "user", "content": payload},
-                ]
-            )
-            parsed = self._parse_json_object(response.content)
-            items = parsed.get("items") if isinstance(parsed, dict) else None
-            if not isinstance(items, list):
-                continue
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    row_id = int(item.get("id"))
-                except Exception:
-                    continue
-                reason = str(item.get("reason") or "uncertain").strip()
-                confidence = float(item.get("confidence") or 0.35)
-                result[row_id] = {"reason": reason, "confidence": confidence}
-        return result
+        return batch_summary
 
-    def _chunk_rows_for_llm(self, rows: list[dict[str, Any]], budget: int) -> list[list[dict[str, Any]]]:
-        chunks: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for row in rows:
-            candidate = current + [row]
-            content = json.dumps({"items": candidate}, ensure_ascii=False)
-            if current and self.context_manager.count_tokens(content) > budget:
-                chunks.append(current)
-                current = [row]
-                continue
-            current = candidate
-        if current:
-            chunks.append(current)
-        return chunks
-
-    @staticmethod
-    def _parse_json_object(text: str) -> dict[str, Any]:
-        raw = (text or "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start >= 0 and end > start:
-            try:
-                parsed = json.loads(raw[start : end + 1])
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                return {}
-        return {}
+    def _build_llm_service(self, db: DatabaseManager) -> DataStewardLLMService:
+        return DataStewardLLMService(settings=self.settings, db=db)
 
