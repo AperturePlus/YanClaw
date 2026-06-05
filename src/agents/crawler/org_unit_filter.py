@@ -12,7 +12,7 @@ from agents.crawler.url_heuristics import (
 )
 
 
-ORG_UNIT_FILTER_STATE = "EXTRACT_ORG_UNITS"
+ORG_UNIT_FILTER_STATE = "ORG_UNIT_FILTER"
 
 ORG_UNIT_FILTER_INSTRUCTION = (
     "Filter only org units that clearly belong to excluded categories: arts, sports, "
@@ -148,6 +148,8 @@ async def llm_filter_org_unit_payloads(
     source: str,
     model_max_tokens: int,
     logger: Any,
+    state: str = ORG_UNIT_FILTER_STATE,
+    instruction: str = ORG_UNIT_FILTER_INSTRUCTION,
 ) -> OrgUnitFilterResult:
     if not units or llm_client is None:
         return OrgUnitFilterResult(kept=list(units), hard_excluded=[], llm_excluded=[])
@@ -155,7 +157,7 @@ async def llm_filter_org_unit_payloads(
     payload = {
         "allowed_tools": [],
         "filter_task": "org_unit_exclusion",
-        "instruction": ORG_UNIT_FILTER_INSTRUCTION,
+        "instruction": instruction,
         "org_units": [
             {
                 "id": unit.get("id"),
@@ -166,7 +168,7 @@ async def llm_filter_org_unit_payloads(
             for unit in units
         ],
         "source": source,
-        "state": ORG_UNIT_FILTER_STATE,
+        "state": state,
         "university": university,
         "url": source_url,
     }

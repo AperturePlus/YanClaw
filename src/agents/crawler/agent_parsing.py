@@ -159,10 +159,25 @@ def org_units_from_result(self: Any, content: str) -> list[dict[str, Any]]:
     payload = self._parse_json_from_text(content)
     if payload is None or not isinstance(payload, dict):
         return []
-    units = payload.get("org_units")
-    if isinstance(units, list):
-        return [item for item in units if isinstance(item, dict)]
+    units = _dict_items(payload.get("org_units"))
+    if units:
+        return units
+    included_units = _dict_items(payload.get("included_org_units"))
+    if included_units:
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.warning(
+                "Org-unit extraction result used included_org_units fallback count=%s",
+                len(included_units),
+            )
+        return included_units
     return []
+
+
+def _dict_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def parse_json_from_text(self: Any, content: str) -> Any | None:

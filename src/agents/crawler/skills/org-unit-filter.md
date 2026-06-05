@@ -2,7 +2,7 @@
 name: org-unit-filter
 description: 在师资页发现前过滤非目标学院/机构。
 version: 1
-applies_to: EXTRACT_ORG_UNITS
+applies_to: ORG_UNIT_FILTER
 allowed_tools:
 priority: 15
 token_budget: 1100

@@ -14,6 +14,7 @@ from agents.crawler.config import CrawlerSettings
 from agents.crawler.fetchers import Fetcher, _site_root
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus
 from agents.crawler.org_unit_filter import (
+    ORG_UNIT_FILTER_STATE,
     hard_filter_org_unit_payloads,
     llm_filter_org_unit_payloads,
     org_unit_filter_item_keys,
@@ -335,7 +336,7 @@ class CrawlDispatcher:
                         hard_result.kept,
                         llm_client=self.llm_client_factory(),
                         context_manager=ContextManager(self.settings.openai_model),
-                        skills_text=skill_manager.select_for_state("EXTRACT_ORG_UNITS", set()).rendered_text,
+                        skills_text=skill_manager.select_for_state(ORG_UNIT_FILTER_STATE, set()).rendered_text,
                         university=university.name,
                         source_url=university.url,
                         source="dispatcher_resume",
