@@ -60,7 +60,7 @@ class LLMClient:
         max_retries: int = 3,
         retry_base_delay: float = 5.0,
         max_concurrent: int = 2,
-        min_interval: float = 1.0,
+        min_interval: float = 0.5,
         timeout_seconds: float = 120.0,
         temperature: float = 0.0,
         top_p: float = 1.0,
