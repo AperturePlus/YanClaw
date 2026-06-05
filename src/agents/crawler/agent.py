@@ -27,7 +27,9 @@ from agents.crawler.models import (
 )
 from agents.crawler.org_unit_filter import (
     hard_filter_org_unit_payloads,
+    is_teaching_experiment_center_name,
     llm_filter_org_unit_payloads,
+    looks_like_sub_department_section_name,
     normalize_org_unit_match_text,
     org_unit_filter_item_keys,
 )
@@ -588,6 +590,7 @@ class CrawlerAgent:
                 )
             if self.org_unit_exclude_enabled and not self.target_org_units:
                 excluded_units, excluded_preview = self._hard_excluded_org_units(org_units)
+                cleanup_summary: dict[str, int] = {}
                 if excluded_units:
                     cleanup_summary = await crawler_db.cleanup_excluded_org_units(session, excluded_units)
                     self.logger.info(
@@ -597,6 +600,15 @@ class CrawlerAgent:
                         excluded_preview[:5],
                         cleanup_summary,
                     )
+                sub_cleanup_summary = await crawler_db.merge_sub_department_sections(session)
+                if int(sub_cleanup_summary.get("sub_org_units_merged", 0) or 0):
+                    cleanup_summary.update(sub_cleanup_summary)
+                    self.logger.info(
+                        "Strict resume merged sub-department org units university=%s summary=%s",
+                        self.university_name,
+                        sub_cleanup_summary,
+                    )
+                if cleanup_summary:
                     org_units = await crawler_db.list_org_units(session)
 
             if self.resume_force_existing:
@@ -2220,14 +2232,18 @@ class CrawlerAgent:
             normalized_professors = [item for item in professors if isinstance(item, dict)]
             if task.strict_retry and len(normalized_professors) > 25:
                 normalized_professors = normalized_professors[:25]
-            captured_payloads.append(
+            normalized_payload = self._normalize_extraction_payload_for_task(
                 {
                     "org_unit_name": org_unit_name,
                     "org_unit_url": org_unit_url or task.org_unit_url,
                     "source_url": source_url or task.source_url,
                     "professors": normalized_professors,
-                }
+                },
+                task=task,
             )
+            if normalized_payload is None:
+                return {"accepted": 0}
+            captured_payloads.append(normalized_payload)
             return {"accepted": len(normalized_professors)}
 
         final_result = None
@@ -2253,21 +2269,73 @@ class CrawlerAgent:
             if isinstance(payload, dict):
                 professors = payload.get("professors")
                 if isinstance(professors, list) and professors:
-                    captured_payloads.append(
+                    normalized_payload = self._normalize_extraction_payload_for_task(
                         {
                             "org_unit_name": str(payload.get("org_unit_name") or task.org_unit_name),
                             "org_unit_url": str(payload.get("org_unit_url") or task.org_unit_url or "").strip() or None,
                             "source_url": str(payload.get("source_url") or task.source_url or "").strip() or task.source_url,
                             "professors": [item for item in professors if isinstance(item, dict)],
-                        }
+                        },
+                        task=task,
                     )
-                    used_fallback = True
+                    if normalized_payload is not None:
+                        captured_payloads.append(normalized_payload)
+                        used_fallback = True
 
         return _ExtractionOutcome(
             payloads=captured_payloads,
             invalid_json_events=invalid_events,
             content_fallback_used=used_fallback,
         )
+
+    def _normalize_extraction_payload_for_task(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: _ExtractionTaskItem,
+    ) -> dict[str, Any] | None:
+        incoming_name = str(payload.get("org_unit_name") or "").strip()
+        task_name = str(task.org_unit_name or "").strip()
+        effective_name = incoming_name or task_name or "Unknown"
+        if is_teaching_experiment_center_name(effective_name):
+            self._pipeline_stats["teaching_center_payloads_dropped"] = int(
+                self._pipeline_stats.get("teaching_center_payloads_dropped", 0)
+            ) + 1
+            self.logger.info(
+                "Drop professor payload for teaching/experiment center task_org=%s payload_org=%s source=%s",
+                task_name,
+                incoming_name,
+                payload.get("source_url") or task.source_url,
+            )
+            return None
+
+        normalized = dict(payload)
+        if (
+            incoming_name
+            and task_name
+            and task_name != "Unknown"
+            and incoming_name != task_name
+            and looks_like_sub_department_section_name(incoming_name)
+        ):
+            normalized["org_unit_name"] = task_name
+            normalized["org_unit_url"] = task.org_unit_url or normalized.get("org_unit_url")
+            self._pipeline_stats["sub_department_payloads_rewritten"] = int(
+                self._pipeline_stats.get("sub_department_payloads_rewritten", 0)
+            ) + 1
+            self.logger.info(
+                "Rewrite sub-department professor payload to parent org_unit parent=%s child=%s source=%s",
+                task_name,
+                incoming_name,
+                normalized.get("source_url") or task.source_url,
+            )
+            return normalized
+
+        normalized["org_unit_name"] = effective_name
+        if not normalized.get("org_unit_url"):
+            normalized["org_unit_url"] = task.org_unit_url
+        if not normalized.get("source_url"):
+            normalized["source_url"] = task.source_url
+        return normalized
 
     async def _save_payloads_to_db(
         self,
@@ -2285,6 +2353,11 @@ class CrawlerAgent:
             "deduped_by_homepage": 0,
         }
         for payload in payloads:
+            if task is not None:
+                normalized_payload = self._normalize_extraction_payload_for_task(payload, task=task)
+                if normalized_payload is None:
+                    continue
+                payload = normalized_payload
             result = await tools["save_professors"](
                 org_unit_name=str(payload.get("org_unit_name") or "Unknown"),
                 org_unit_url=(str(payload.get("org_unit_url")) if payload.get("org_unit_url") else None),
@@ -2994,12 +3067,39 @@ class CrawlerAgent:
         source_url = str(payload.get("source_url") or "").strip() or None
         org_unit_url = str(payload.get("org_unit_url") or "").strip() or None
 
+        task = _ExtractionTaskItem(
+            task_id=0,
+            university=self.university_name,
+            org_unit_name=fallback_org_unit or "Unknown",
+            org_unit_url=org_unit_url,
+            source_url=source_url or "",
+            page_url=source_url or "",
+            page_hash="content-fallback",
+            page_text_snapshot="",
+            allowed_tools=["save_professors"],
+        )
+        normalized_payload = self._normalize_extraction_payload_for_task(
+            {
+                "org_unit_name": org_unit_name,
+                "org_unit_url": org_unit_url,
+                "source_url": source_url,
+                "professors": [item for item in professors if isinstance(item, dict)],
+            },
+            task=task,
+        )
+        if normalized_payload is None:
+            return
+
         tools = get_crawler_tools(self.db, self.skill_manager)
         result = await tools["save_professors"](
-            org_unit_name=org_unit_name,
-            org_unit_url=org_unit_url,
-            source_url=source_url,
-            professors=[item for item in professors if isinstance(item, dict)],
+            org_unit_name=str(normalized_payload.get("org_unit_name") or "Unknown"),
+            org_unit_url=(
+                str(normalized_payload.get("org_unit_url")) if normalized_payload.get("org_unit_url") else None
+            ),
+            source_url=(
+                str(normalized_payload.get("source_url")) if normalized_payload.get("source_url") else None
+            ),
+            professors=[item for item in normalized_payload.get("professors", []) if isinstance(item, dict)],
         )
         if isinstance(result, dict):
             self.saved_professors += int(result.get("saved", 0) or 0)

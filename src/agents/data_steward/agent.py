@@ -60,6 +60,10 @@ class DataStewardAgent:
             runs=summaries,
             total_excluded_org_units_detected=sum(item.excluded_org_units_detected for item in summaries),
             total_excluded_org_units_deleted=sum(item.excluded_org_units_deleted for item in summaries),
+            total_sub_department_sections_detected=sum(
+                item.sub_department_sections_detected for item in summaries
+            ),
+            total_sub_department_sections_merged=sum(item.sub_department_sections_merged for item in summaries),
         )
 
     async def _classify_uncertain_with_llm(

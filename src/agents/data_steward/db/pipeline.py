@@ -40,6 +40,8 @@ async def process_one_database(
     duplicates_deleted = 0
     excluded_org_units_detected = 0
     excluded_org_units_deleted = 0
+    sub_department_sections_detected = 0
+    sub_department_sections_merged = 0
     missing_field_audits = 0
     recrawl_tasks_upserted = 0
     audits_written = 0
@@ -72,6 +74,20 @@ async def process_one_database(
                 llm_enabled=uncertain_classifier is not None,
             )
             audits_written += org_unit_audits
+            (
+                sub_department_sections_detected,
+                sub_department_sections_merged,
+                sub_org_cleanup,
+                sub_org_audits,
+            ) = await process_sub_department_sections(
+                session,
+                settings=settings,
+                run_id=run_id,
+                db_name=target_db.name,
+                mode=mode,
+            )
+            _merge_cleanup_summary(org_unit_cleanup, sub_org_cleanup)
+            audits_written += sub_org_audits
 
             identity_candidates = await repository.list_identity_repair_candidates(session)
             for candidate in identity_candidates:
@@ -214,6 +230,8 @@ async def process_one_database(
                     "duplicates_deleted": duplicates_deleted,
                     "excluded_org_units_detected": excluded_org_units_detected,
                     "excluded_org_units_deleted": excluded_org_units_deleted,
+                    "sub_department_sections_detected": sub_department_sections_detected,
+                    "sub_department_sections_merged": sub_department_sections_merged,
                     "org_unit_cleanup": org_unit_cleanup,
                     "missing_field_audits": missing_field_audits,
                     "recrawl_tasks_upserted": recrawl_tasks_upserted,
@@ -230,6 +248,8 @@ async def process_one_database(
             duplicates_deleted=duplicates_deleted,
             excluded_org_units_detected=excluded_org_units_detected,
             excluded_org_units_deleted=excluded_org_units_deleted,
+            sub_department_sections_detected=sub_department_sections_detected,
+            sub_department_sections_merged=sub_department_sections_merged,
             missing_field_audits=missing_field_audits,
             recrawl_tasks_upserted=recrawl_tasks_upserted,
             audits_written=audits_written,
@@ -250,6 +270,8 @@ async def process_one_database(
                         "duplicates_deleted": duplicates_deleted,
                         "excluded_org_units_detected": excluded_org_units_detected,
                         "excluded_org_units_deleted": excluded_org_units_deleted,
+                        "sub_department_sections_detected": sub_department_sections_detected,
+                        "sub_department_sections_merged": sub_department_sections_merged,
                         "org_unit_cleanup": org_unit_cleanup,
                         "missing_field_audits": missing_field_audits,
                         "recrawl_tasks_upserted": recrawl_tasks_upserted,
@@ -264,6 +286,8 @@ async def process_one_database(
             duplicates_deleted=duplicates_deleted,
             excluded_org_units_detected=excluded_org_units_detected,
             excluded_org_units_deleted=excluded_org_units_deleted,
+            sub_department_sections_detected=sub_department_sections_detected,
+            sub_department_sections_merged=sub_department_sections_merged,
             missing_field_audits=missing_field_audits,
             recrawl_tasks_upserted=recrawl_tasks_upserted,
             audits_written=audits_written,
@@ -326,7 +350,8 @@ async def process_excluded_org_units(
     excluded = list(hard_result.hard_excluded)
     if llm_result is not None:
         excluded.extend(llm_result.llm_excluded)
-    excluded_pairs = _match_excluded_org_units(org_units, excluded)
+    excluded_for_delete = [item for item in excluded if item.category != "sub_department_section"]
+    excluded_pairs = _match_excluded_org_units(org_units, excluded_for_delete)
     if not excluded_pairs:
         return 0, 0, {}, 0
 
@@ -357,6 +382,49 @@ async def process_excluded_org_units(
         deleted = int(cleanup_summary.get("org_units_deleted", 0) or 0)
 
     return len(excluded_pairs), deleted, cleanup_summary, audits_written
+
+
+async def process_sub_department_sections(
+    session: Any,
+    *,
+    settings: CrawlerSettings,
+    run_id: int,
+    db_name: str,
+    mode: str,
+) -> tuple[int, int, dict[str, int], int]:
+    if not settings.org_unit_exclude_enabled:
+        return 0, 0, {}, 0
+
+    candidates = await crawler_db.list_sub_department_section_candidates(session)
+    if not candidates:
+        return 0, 0, {}, 0
+
+    org_units_by_id = {int(unit.id): unit for unit in await crawler_db.list_org_units(session) if unit.id is not None}
+    audits_written = 0
+    for candidate in candidates:
+        child = org_units_by_id.get(int(candidate.child_id))
+        await repository.add_audit(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            entity_type="org_unit",
+            entity_id=int(candidate.child_id),
+            issue_type="sub_department_section",
+            reason="sub_department_section",
+            confidence=1.0,
+            evidence=candidate.to_evidence(),
+            action="merged" if mode == "apply" else "report_only",
+            before_snapshot=_org_unit_snapshot(child) if child is not None else candidate.to_evidence(),
+        )
+        audits_written += 1
+
+    cleanup_summary: dict[str, int] = {}
+    merged = 0
+    if mode == "apply":
+        cleanup_summary = await crawler_db.merge_sub_department_sections(session, candidates)
+        merged = int(cleanup_summary.get("sub_org_units_merged", 0) or 0)
+
+    return len(candidates), merged, cleanup_summary, audits_written
 
 
 async def infer_missing_reason(
@@ -562,6 +630,11 @@ def _match_excluded_org_units(
             seen_ids.add(int(org_unit.id))
         result.append((org_unit, excluded_by_key[sorted(matched)[0]]))
     return result
+
+
+def _merge_cleanup_summary(target: dict[str, int], incoming: dict[str, int]) -> None:
+    for key, value in incoming.items():
+        target[key] = int(target.get(key, 0) or 0) + int(value or 0)
 
 
 def _sqlite_url(path: Path) -> str:

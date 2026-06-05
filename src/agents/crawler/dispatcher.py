@@ -336,37 +336,52 @@ class CrawlDispatcher:
                 excluded = list(hard_result.hard_excluded)
                 if llm_result is not None:
                     excluded.extend(llm_result.llm_excluded)
-                if not excluded:
-                    return {}
-
-                excluded_keys: set[str] = set()
-                for item in excluded:
-                    excluded_keys.update(org_unit_filter_item_keys(item.to_evidence()))
-                excluded_units = [
-                    unit
-                    for unit in org_units
-                    if org_unit_filter_item_keys(
-                        {
-                            "id": int(unit.id) if unit.id is not None else None,
-                            "name": unit.name,
-                            "url": unit.url,
-                        }
-                    )
-                    & excluded_keys
+                excluded_for_delete = [
+                    item for item in excluded if item.category != "sub_department_section"
                 ]
-                if not excluded_units:
-                    return {}
 
-                cleanup_summary = await crawler_db.cleanup_excluded_org_units(session, excluded_units)
-                self._resume_cleaned_db_paths.add(university.db_path)
-                self.logger.info(
-                    "Resume cleaned excluded org units university=%s excluded=%s sample=%s summary=%s",
-                    university.name,
-                    len(excluded_units),
-                    [item.to_evidence() for item in excluded[:5]],
-                    cleanup_summary,
-                )
-                return {key: int(value or 0) for key, value in cleanup_summary.items()}
+                cleanup_summary: dict[str, int] = {}
+                excluded_units: list[Any] = []
+                excluded_keys: set[str] = set()
+                for item in excluded_for_delete:
+                    excluded_keys.update(org_unit_filter_item_keys(item.to_evidence()))
+                if excluded_keys:
+                    excluded_units = [
+                        unit
+                        for unit in org_units
+                        if org_unit_filter_item_keys(
+                            {
+                                "id": int(unit.id) if unit.id is not None else None,
+                                "name": unit.name,
+                                "url": unit.url,
+                            }
+                        )
+                        & excluded_keys
+                    ]
+
+                if excluded_units:
+                    cleanup_summary.update(await crawler_db.cleanup_excluded_org_units(session, excluded_units))
+                    self.logger.info(
+                        "Resume cleaned excluded org units university=%s excluded=%s sample=%s summary=%s",
+                        university.name,
+                        len(excluded_units),
+                        [item.to_evidence() for item in excluded_for_delete[:5]],
+                        cleanup_summary,
+                    )
+
+                sub_cleanup_summary = await crawler_db.merge_sub_department_sections(session)
+                if int(sub_cleanup_summary.get("sub_org_units_merged", 0) or 0):
+                    cleanup_summary.update(sub_cleanup_summary)
+                    self.logger.info(
+                        "Resume merged sub-department org units university=%s summary=%s",
+                        university.name,
+                        sub_cleanup_summary,
+                    )
+
+                if any(int(value or 0) for value in cleanup_summary.values()):
+                    self._resume_cleaned_db_paths.add(university.db_path)
+                    return {key: int(value or 0) for key, value in cleanup_summary.items()}
+                return {}
         finally:
             await db.close()
 
