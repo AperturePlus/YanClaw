@@ -165,6 +165,23 @@ _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        "teaching_experiment_center",
+        (
+            "教学实验中心",
+            "实验教学中心",
+            "实践教学中心",
+            "实验中心",
+            "教学中心",
+            "实训中心",
+            "工程训练中心",
+            "实验实训中心",
+            "teaching experiment center",
+            "experimental teaching center",
+            "practice teaching center",
+            "training center",
+        ),
+    ),
+    (
         "continuing_education",
         (
             "继续教育学院",

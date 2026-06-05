@@ -16,11 +16,13 @@ ORG_UNIT_FILTER_STATE = "EXTRACT_ORG_UNITS"
 
 ORG_UNIT_FILTER_INSTRUCTION = (
     "Filter only org units that clearly belong to excluded categories: arts, sports, "
-    "Sino-foreign/joint programs, basic teaching centers, continuing/adult education, "
+    "Sino-foreign/joint programs, basic teaching centers, teaching/experiment/training centers, "
+    "continuing/adult education, "
     "undergraduate teaching units such as residential colleges, or excellent engineer "
     "teaching programs. Treat person-named colleges as excluded only when the evidence "
     "shows they are undergraduate/honor/residential teaching groupings with no independent "
-    "faculty. Do not apply a broad academic whitelist. When uncertain, keep the org unit. "
+    "faculty. Treat ordinary department sections under a college as sub_department_section, "
+    "not as independent org units. Do not apply a broad academic whitelist. When uncertain, keep the org unit. "
     "Return JSON with included_org_units and excluded_org_units."
 )
 
@@ -61,6 +63,33 @@ class OrgUnitFilterResult:
 
 
 NameMatcher = Callable[[str], bool]
+
+
+def org_unit_exclusion_category(
+    *,
+    name: str,
+    kind: str | None = None,
+    url: str | None = None,
+    keywords: tuple[str, ...] | list[str] | None = None,
+) -> str | None:
+    match = _org_unit_exclusion_match(name=name, kind=kind, url=url, keywords=keywords)
+    return match.category if match is not None else None
+
+
+def is_teaching_experiment_center_name(name: str, *, kind: str | None = None, url: str | None = None) -> bool:
+    return org_unit_exclusion_category(name=name, kind=kind, url=url) == "teaching_experiment_center"
+
+
+def looks_like_sub_department_section_name(name: str) -> bool:
+    text = str(name or "").strip()
+    if not text:
+        return False
+    if is_teaching_experiment_center_name(text):
+        return False
+    normalized = re.sub(r"\s+", "", text)
+    if normalized.endswith("系") and normalized not in {"院系"}:
+        return True
+    return bool(re.search(r"[-－—–]\s*[^-－—–]*(系)$", text))
 
 
 def hard_filter_org_unit_payloads(
