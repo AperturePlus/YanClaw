@@ -37,6 +37,7 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
                         "phone": {"type": "string"},
                         "homepage": {"type": "string"},
                         "external_link": {"type": "string"},
+                        "is_academician": {"type": "boolean"},
                         "bio": {"type": "string"},
                         "enrollment_pref": {"type": "string"},
                         "publications": {

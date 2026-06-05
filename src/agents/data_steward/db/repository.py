@@ -184,6 +184,7 @@ async def upsert_recrawl_task(
     professor: Professor,
     source_url: str,
     last_error: str,
+    priority: int = 0,
 ) -> bool:
     source = (source_url or "").strip()
     if not source:
@@ -204,7 +205,7 @@ async def upsert_recrawl_task(
         allowed_tools='["save_professors"]',
         status=CrawlTaskStatus.RETRY,
         attempt=0,
-        priority=0,
+        priority=priority,
         last_error=last_error,
     )
     return True

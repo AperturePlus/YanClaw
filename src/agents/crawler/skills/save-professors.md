@@ -1,13 +1,13 @@
 ---
 name: save-professors
 description: Extract public professor records and save them with strict field normalization.
-version: 6
+version: 8
 applies_to: EXTRACT_PROFESSORS
 allowed_tools: save_professors
 priority: 20
 token_budget: 1000
 created_at: 2026-04-26T00:00:00
-updated_at: 2026-06-04
+updated_at: 2026-06-05
 ---
 ## Goal
 
@@ -37,12 +37,20 @@ Use `save_professors` with:
 - `title`: use only academic rank / role. Do not include honors.
 - `enrollment_pref`: put advisor information here (博导/硕导), not in `title`.
 - `email` / `phone` / `homepage` / `external_link` / `bio` / `research_areas` / `publications`: only if visible on the page.
+- `is_academician`: set to `true` when the page explicitly says the person is an academician
+  (`院士`, `中国科学院院士`, `中国工程院院士`, or `Academician`), even if their academic rank is also `教授`.
+- Do not set `is_academician=true` just because the person's advisor, collaborator, team leader,
+  lab, project, `院士工作站`, `院士团队`, or `院士课题组` mentions an academician. The academician
+  identity must refer to this teacher personally.
 - `homepage`: prefer the teacher's official profile/detail page. If the current `source_url`
   is a single-teacher profile page, it may be used as that teacher's `homepage`.
 - Do not use roster/list pages, org-unit homepages, or faculty directory pages as a teacher `homepage`.
 - Put external personal sites such as Google Scholar, ORCID, ResearchGate, or personal domains
   in `external_link`, not in `homepage`.
 - Missing optional values should be `null` (not empty string `""`).
+- If `bio` contains explicit research phrases such as `研究方向`, `研究领域`,
+  `主要从事...研究`, or `在...方面取得...研究成果`, extract those phrases into
+  `research_areas` as well; do not leave them only in `bio`.
 
 ## Allowed Title Set
 
