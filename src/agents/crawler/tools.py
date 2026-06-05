@@ -21,7 +21,6 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
             "source_url": {"type": "string"},
             "professors": {
                 "type": "array",
-                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -143,6 +142,7 @@ def get_crawler_tools(
         professors_deleted_as_academician_duplicates = 0
         filtered_retired = 0
         errors: list[str] = []
+        prepared_professors: list[tuple[dict[str, Any], bool]] = []
         for professor in professors:
             try:
                 if contains_retired_hint(
@@ -158,7 +158,13 @@ def get_crawler_tools(
                     org_unit_name=org_unit_name,
                 )
                 accepted += 1
-                async with db.session() as session:
+                prepared_professors.append((cleaned, is_academician))
+            except Exception as exc:
+                errors.append(f"{professor.get('name', '?')}: {exc}")
+
+        if prepared_professors:
+            async with db.session() as session:
+                for cleaned, is_academician in prepared_professors:
                     data = {
                         **cleaned,
                         "org_unit_url": org_unit_url,
@@ -225,8 +231,6 @@ def get_crawler_tools(
                             deduped_by_name_key += 1
                         if upsert_result.deduped_by_homepage:
                             deduped_by_homepage += 1
-            except Exception as exc:
-                errors.append(f"{professor.get('name', '?')}: {exc}")
         result: dict[str, Any] = {
             "accepted": accepted,
             "created": created,
