@@ -45,6 +45,8 @@ class CrawlerPromptBuilder:
                 + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
                 + "Prioritize fields: email, phone, research_areas. "
                 + "Only save records that include at least one of email/phone/research_areas. "
+                + "Research areas may appear as text under headings like 研究方向/研究领域 or as linked anchor text; save those visible phrases in research_areas. "
+                + "If visible body text follows headings like 个人简介/简介/个人概况, save that paragraph in bio without inventing missing content. "
                 + "If this page only contains category/list names without these fields, do not save placeholders. "
                 + "Do not include retired/emeritus records. "
                 + "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
