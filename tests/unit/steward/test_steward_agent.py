@@ -140,6 +140,38 @@ async def _seed_excluded_org_db(db_path: Path, *, org_unit_name: str = "继续�
     await db.close()
 
 
+async def _seed_sub_department_org_db(db_path: Path) -> None:
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="自动化科学与电气工程学院",
+            url="https://auto.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Sub A",
+                "org_unit_name": "工业互联网与建模仿真系",
+                "org_unit_url": "https://auto.example.edu.cn/szdw/gongye.htm",
+                "title": "Professor",
+                "research_areas": "systems",
+                "bio": "sub department professor",
+                "source_url": "https://auto.example.edu.cn/szdw/gongye.htm",
+            },
+        )
+    await db.close()
+
+
 async def test_steward_dry_run_detects_duplicates_and_writes_audits(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
@@ -183,6 +215,93 @@ async def test_steward_dry_run_detects_duplicates_and_writes_audits(tmp_path):
         assert len(audits) >= 3
         assert len(home) == 2
         assert any(audit.issue_type == "duplicate_professor_identity" for audit in audits)
+    await db.close()
+
+
+async def test_steward_dry_run_audits_sub_department_sections_without_merging(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    await _seed_sub_department_org_db(db_path)
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=False,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_sub_department_sections_detected == 1
+    assert summary.total_sub_department_sections_merged == 0
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert [unit.name for unit in org_units] == ["工业互联网与建模仿真系", "自动化科学与电气工程学院"]
+        assert any(
+            audit.issue_type == "sub_department_section" and audit.action == "report_only"
+            for audit in audits
+        )
+    await db.close()
+
+
+async def test_steward_apply_merges_sub_department_sections(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    await _seed_sub_department_org_db(db_path)
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_sub_department_sections_detected == 1
+    assert summary.total_sub_department_sections_merged == 1
+    assert summary.runs[0].org_unit_cleanup["sub_org_units_merged"] == 1
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert [unit.name for unit in org_units] == ["自动化科学与电气工程学院"]
+        assert [(professor.name, professor.org_unit_name) for professor in professors] == [
+            ("Sub A", "自动化科学与电气工程学院")
+        ]
+        assert any(
+            audit.issue_type == "sub_department_section" and audit.action == "merged"
+            for audit in audits
+        )
     await db.close()
 
 

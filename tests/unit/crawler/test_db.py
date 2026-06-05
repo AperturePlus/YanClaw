@@ -804,6 +804,89 @@ async def test_cleanup_excluded_org_units_removes_related_records(tmp_path):
     await db.close()
 
 
+async def test_merge_sub_department_sections_moves_professors_to_parent_org_unit(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "sub_department_merge.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        parent = await crawler_db.get_or_create_org_unit(
+            session,
+            name="自动化科学与电气工程学院",
+            url="https://auto.example.edu.cn/",
+            kind="college",
+        )
+        child = await crawler_db.get_or_create_org_unit(
+            session,
+            name="工业互联网与建模仿真系",
+            url="https://auto.example.edu.cn/szdw/gongye.htm",
+            kind="department",
+        )
+        child_professor = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Child Only",
+                "title": "Professor",
+                "org_unit_name": child.name,
+                "org_unit_url": child.url,
+                "source_url": "https://auto.example.edu.cn/szdw/gongye.htm",
+            },
+        )
+        task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name=child.name,
+            org_unit_url=child.url,
+            source_url="https://auto.example.edu.cn/szdw/gongye.htm",
+            page_url="https://auto.example.edu.cn/szdw/gongye.htm",
+            page_hash="child-page",
+            page_text_snapshot="child",
+            allowed_tools="save_professors",
+        )
+        await crawler_db.log_extraction_failure(
+            session,
+            task_id=int(task.id),
+            failure_type="invalid_json",
+            org_unit_name=child.name,
+            source_url="https://auto.example.edu.cn/szdw/gongye.htm",
+        )
+
+        candidates = await crawler_db.list_sub_department_section_candidates(session)
+        assert [candidate.child_name for candidate in candidates] == ["工业互联网与建模仿真系"]
+        assert candidates[0].parent_name == "自动化科学与电气工程学院"
+
+        summary = await crawler_db.merge_sub_department_sections(session, candidates)
+        assert summary["sub_org_units_detected"] == 1
+        assert summary["sub_org_units_merged"] == 1
+        assert summary["affiliations_added"] == 1
+        assert summary["affiliations_deleted"] == 1
+        assert summary["crawl_tasks_rewritten"] == 1
+        assert summary["crawl_extraction_failures_rewritten"] == 1
+
+        parent_id = int(parent.id)
+        professor_id = int(child_professor.id)
+
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+
+        assert [unit.name for unit in org_units] == ["自动化科学与电气工程学院"]
+        assert [(professor.name, professor.org_unit_name) for professor in professors] == [
+            ("Child Only", "自动化科学与电气工程学院")
+        ]
+        assert [(aff.professor_id, aff.org_unit_id) for aff in affiliations] == [(professor_id, parent_id)]
+        assert [(task.org_unit_name, task.org_unit_url) for task in tasks] == [
+            ("自动化科学与电气工程学院", "https://auto.example.edu.cn")
+        ]
+        assert [(failure.task_id, failure.org_unit_name) for failure in failures] == [
+            (tasks[0].id, "自动化科学与电气工程学院")
+        ]
+
+    await db.close()
+
+
 async def test_retryable_fetch_failure_urls_only_include_unresolved_fetch_failures(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "retryable_fetch_failures.db"))
     await db.init_db()

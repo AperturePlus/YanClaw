@@ -89,6 +89,11 @@ def test_org_unit_exclusion_hard_rules_match_blacklisted_units():
     assert _should_exclude_org_unit(name="国际联合学院", url="https://joint.example.edu.cn/")
     assert _should_exclude_org_unit(name="基教中心", url="https://basic.example.edu.cn/")
     assert _should_exclude_org_unit(name="基础教学部", url="https://basic.example.edu.cn/")
+    assert _should_exclude_org_unit(name="教学实验中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实验中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实验教学中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实践教学中心", url="https://practice.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实训中心", url="https://training.example.edu.cn/")
     assert _should_exclude_org_unit(name="继续教育学院", url="https://jxjy.example.edu.cn/")
     assert _should_exclude_org_unit(name="成人教育学院", url="https://adult.example.edu.cn/")
     assert _should_exclude_org_unit(name="网络教育学院", url="https://online.example.edu.cn/")
@@ -109,6 +114,10 @@ def test_org_unit_exclusion_hard_rules_match_blacklisted_units():
         _org_unit_exclusion_match(name="卓越工程师学院", url="https://engineer.example.edu.cn/").category
         == "excellent_engineer_program"
     )
+    assert (
+        _org_unit_exclusion_match(name="教学实验中心", url="https://lab-teach.example.edu.cn/").category
+        == "teaching_experiment_center"
+    )
 
 
 def test_org_unit_exclusion_hard_rules_avoid_false_positives():
@@ -122,6 +131,9 @@ def test_org_unit_exclusion_hard_rules_avoid_false_positives():
     assert not _should_exclude_org_unit(name="高等教育研究院", url="https://ihe.example.edu.cn/")
     assert not _should_exclude_org_unit(name="航空学院", url="https://aviation.example.edu.cn/")
     assert not _should_exclude_org_unit(name="软件学院", url="https://software.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="智能科学研究中心", url="https://ai.example.edu.cn/research-center")
+    assert not _should_exclude_org_unit(name="工程研究中心", url="https://engineering.example.edu.cn/research")
+    assert not _should_exclude_org_unit(name="国家重点实验室", url="https://lab.example.edu.cn/")
 
 
 def test_retired_content_not_triggered_on_mixed_faculty_tabs():

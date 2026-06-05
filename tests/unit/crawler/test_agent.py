@@ -31,6 +31,7 @@ from agents.crawler.models import (
     CrawlTaskStatus,
     OrgUnit,
     OrgUnitStatus,
+    Professor,
     UniversityMeta,
 )
 from runtime.context import ContextManager
@@ -112,6 +113,34 @@ class FakeLLMWithFacultyFollowup(FakeLLM):
         state = payload["state"]
         if state == "FIND_FACULTY_PAGES":
             return LLMResult('{"links": ["https://www.example.edu.cn/cs/landing"]}')
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+class FakeLLMSubDepartmentProfessor(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS":
+            result = await tool_handlers["save_professors"](
+                org_unit_name="工业互联网与建模仿真系",
+                org_unit_url="https://auto.example.edu.cn/szdw/gongye.htm",
+                source_url=payload["url"],
+                professors=[{"name": "Sub Dept A", "title": "Professor"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+class FakeLLMTeachingCenterProfessor(FakeLLM):
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS":
+            result = await tool_handlers["save_professors"](
+                org_unit_name="教学实验中心",
+                org_unit_url="https://auto.example.edu.cn/jxsyzx/",
+                source_url=payload["url"],
+                professors=[{"name": "Teaching Center A", "title": "Professor"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
         return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
 
 
@@ -212,6 +241,59 @@ async def test_agent_state_machine_discovers_org_units_and_saves_professors(tmp_
     await db.close()
 
 
+async def test_extract_professors_rewrites_sub_department_payload_to_parent_org_unit(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLMSubDepartmentProfessor())
+
+    await agent._extract_professors_from_page(
+        _QueuedUrl("https://auto.example.edu.cn/", 0, "自动化科学与电气工程学院"),
+        FetchResult(
+            "https://auto.example.edu.cn/szdw/gongye.htm",
+            "faculty Sub Dept A",
+            [],
+            200,
+        ),
+        "save professors",
+        detail_mode=False,
+        requested_url="https://auto.example.edu.cn/szdw/gongye.htm",
+    )
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        assert [(professor.name, professor.org_unit_name) for professor in professors] == [
+            ("Sub Dept A", "自动化科学与电气工程学院")
+        ]
+        assert [unit.name for unit in org_units] == ["自动化科学与电气工程学院"]
+
+    await db.close()
+
+
+async def test_extract_professors_drops_teaching_experiment_center_payload(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLMTeachingCenterProfessor())
+
+    saved = await agent._extract_professors_from_page(
+        _QueuedUrl("https://auto.example.edu.cn/", 0, "自动化科学与电气工程学院"),
+        FetchResult(
+            "https://auto.example.edu.cn/jxsyzx/",
+            "faculty Teaching Center A",
+            [],
+            200,
+        ),
+        "save professors",
+        detail_mode=False,
+        requested_url="https://auto.example.edu.cn/jxsyzx/",
+    )
+
+    assert saved == 0
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        org_units = (await session.execute(select(OrgUnit))).scalars().all()
+        assert professors == []
+        assert org_units == []
+
+    await db.close()
+
+
 async def test_fetch_url_skips_malformed_cms_link_before_fetch(tmp_path):
     agent, fetcher, db = await _agent(tmp_path, FakeLLM())
     bad_url = (
@@ -296,6 +378,47 @@ async def test_resume_mode_cleans_excluded_org_units_before_cached_homepage_flow
     async with db.session() as session:
         units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
         assert "艺术学院" not in [unit.name for unit in units]
+    await db.close()
+
+
+async def test_resume_mode_merges_sub_department_org_units_before_cached_homepage_flow(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), resume_mode=True)
+    async with db.session() as session:
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/",
+            fetched=FetchResult(
+                "https://www.example.edu.cn/",
+                "home",
+                ["https://www.example.edu.cn/orgs"],
+                200,
+            ),
+        )
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="自动化科学与电气工程学院",
+            url="https://auto.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Sub A",
+                "title": "Professor",
+                "org_unit_name": "工业互联网与建模仿真系",
+                "org_unit_url": "https://auto.example.edu.cn/szdw/gongye.htm",
+                "source_url": "https://auto.example.edu.cn/szdw/gongye.htm",
+            },
+        )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    async with db.session() as session:
+        units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        sub_professor = (await session.execute(select(Professor).where(Professor.name == "Sub A"))).scalar_one()
+        assert "工业互联网与建模仿真系" not in [unit.name for unit in units]
+        assert sub_professor.org_unit_name == "自动化科学与电气工程学院"
     await db.close()
 
 
