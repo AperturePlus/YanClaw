@@ -354,6 +354,9 @@ _FACULTY_NOISE_URL_HINTS = (
     "/renshi/",
     "/rsrc/",
     "/rsc/",
+    "/rszc/",
+    "/bszn/",
+    "/bslc/",
     "/personnel/",
     "/policy/",
     "/zcwj/",
@@ -365,6 +368,7 @@ _FACULTY_NOISE_URL_HINTS = (
     "/student/",
     "/xsgz/",
     "/zsjy/",
+    "/zlxz/",
     "/download/",
 )
 
@@ -387,6 +391,9 @@ _FACULTY_NOISE_TOKEN_HINTS = frozenset(
         "rsrc",
         "rsc",
         "rszc",
+        "bszn",
+        "bslc",
+        "zlxz",
         "personnel",
         "policy",
         "zcwj",
@@ -399,10 +406,13 @@ _FACULTY_NOISE_TOKEN_HINTS = frozenset(
         "xsgz",
         "zsjy",
         "download",
+        "downloads",
     }
 )
 
-_FACULTY_NOISE_STEM_HINTS = frozenset({"rszc", "tzgg", "xwzx", "rczp", "zcwj", "renshi", "policy"})
+_FACULTY_NOISE_STEM_HINTS = frozenset(
+    {"rszc", "bszn", "bslc", "zlxz", "tzgg", "xwzx", "rczp", "zcwj", "renshi", "policy", "download"}
+)
 
 _EXPLICIT_FACULTY_DIR_HINTS = (
     "/faculty/",
@@ -651,6 +661,11 @@ _FACULTY_NOISE_TEXT_HINTS = (
     "党建",
     "人事",
     "招聘",
+    "办事指南",
+    "办事流程",
+    "资料下载",
+    "申请表",
+    "办理程序",
     "news",
     "notice",
     "announcement",
@@ -735,7 +750,8 @@ def _assess_faculty_candidate(
     full_strong_hit = _contains_any(signal_text, _FACULTY_FULL_STRONG_TEXT_HINTS)
     category_hit = _contains_any(signal_text, _FACULTY_CATEGORY_TEXT_HINTS)
     elite_hit = _contains_any(signal_text, _FACULTY_ELITE_TEXT_HINTS)
-    noise_hit = _contains_any(signal_text, _FACULTY_NOISE_TEXT_HINTS) or _is_non_faculty_noise_url(url)
+    explicit_noise_url_hit = _is_non_faculty_noise_url(url)
+    noise_hit = _contains_any(signal_text, _FACULTY_NOISE_TEXT_HINTS) or explicit_noise_url_hit
     nav_hit = _contains_any(signal_text, _FACULTY_NAV_CONTEXT_HINTS)
 
     score = 0
@@ -765,9 +781,12 @@ def _assess_faculty_candidate(
     if noise_hit:
         score -= 14
         reasons.append("noise_hit")
+    if explicit_noise_url_hit:
+        score -= 8
+        reasons.append("explicit_noise_url_hit")
 
     page_type = FACULTY_PAGE_TYPE_UNKNOWN
-    if noise_hit and score <= 0:
+    if explicit_noise_url_hit or (noise_hit and score <= 0):
         page_type = FACULTY_PAGE_TYPE_NOISE
     elif category_hit and (not full_strong_hit or _contains_any(f"{anchor_text} {heading_text}", _FACULTY_CATEGORY_TEXT_HINTS)):
         page_type = FACULTY_PAGE_TYPE_CATEGORY
