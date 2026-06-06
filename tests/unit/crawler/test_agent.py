@@ -52,7 +52,7 @@ class FakeFetcher:
         self.pages = pages
         self.calls = []
 
-    async def fetch(self, url):
+    async def fetch(self, url, **kwargs):
         self.calls.append(url)
         return self.pages[url]
 
@@ -3999,6 +3999,98 @@ async def test_scu_query_teamlist_detail_links_are_detail_tasks(tmp_path):
     assert task_kind_by_url[list_url] == "list_page"
     assert task_kind_by_url[detail_url] == "detail_page"
     assert int(agent._pipeline_stats.get("followups_scheduled", 0)) == 0
+    await db.close()
+
+
+async def test_dynamic_form_pagination_states_schedule_distinct_list_tasks(tmp_path):
+    list_url = "https://faculty.uestc.edu.cn/xylb.jsp?id=2031&lang=zh_CN&urltype=tsites.CollegeTeacherList&wbtreeid=1021"
+    page2_identity = (
+        list_url
+        + "&__ycl_kind=form&__ycl_form=fromWen&__ycl_field=fromWenNOWPAGE&__ycl_page=2"
+    )
+    pagination_state = {
+        "kind": "form_submit",
+        "state_id": "form:fromWen:fromWenNOWPAGE:2",
+        "label": "fromWen 第 2 页",
+        "page_index": 2,
+        "total_pages": 2,
+        "form_name": "fromWen",
+        "fields": {"fromWenNOWPAGE": "2"},
+        "submit": True,
+        "synthetic_url": page2_identity,
+        "url": list_url,
+    }
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "教师列表 faculty page one 教师一 教授",
+            [],
+            200,
+            pagination_states=(pagination_state,),
+        ),
+        page2_identity: FetchResult(
+            page2_identity,
+            "教师列表 faculty page two 教师二 教授",
+            [],
+            200,
+        ),
+    }
+
+    class DynamicFetcher(FakeHumanFetcher):
+        def __init__(self, pages):
+            super().__init__(pages)
+            self.action_calls: list[dict[str, object]] = []
+
+        async def fetch(self, url, **kwargs):
+            self.calls.append(url)
+            self.action_calls.append(kwargs)
+            identity_url = kwargs.get("identity_url")
+            return self.pages[identity_url or url]
+
+    class DynamicLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") != "EXTRACT_PROFESSORS":
+                return LLMResult("{}")
+            name = "教师二" if "__ycl_page=2" in payload["url"] else "教师一"
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机科学与工程学院",
+                org_unit_url=list_url,
+                source_url=payload["url"],
+                professors=[{"name": name, "title": "教授"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    db = DatabaseManager(sqlite_url(tmp_path / "dynamic_form_pagination.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    fetcher = DynamicFetcher(pages)
+    agent = CrawlerAgent(
+        university_name="电子科技大学",
+        start_url="https://faculty.uestc.edu.cn/",
+        location="成都",
+        db=db,
+        llm_client=DynamicLLM(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        min_org_units=1,
+        max_depth=2,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="计算机科学与工程学院")])
+
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        professors = (await session.execute(select(Professor))).scalars().all()
+    source_urls = {task.source_url for task in tasks}
+    assert list_url in source_urls
+    assert page2_identity in source_urls
+    assert any(call.get("action", {}).get("form_name") == "fromWen" for call in fetcher.action_calls)
+    assert {professor.name for professor in professors} == {"教师一", "教师二"}
+    assert int(agent._pipeline_stats.get("pagination_scheduled", 0)) >= 1
     await db.close()
 
 

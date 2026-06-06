@@ -16,11 +16,19 @@ class FetchScheduler:
     def __init__(self, agent: Any) -> None:
         self.agent = agent
 
-    async def fetch_url(self, url: str, depth: int) -> FetchResult | None:
+    async def fetch_url(
+        self,
+        url: str,
+        depth: int,
+        *,
+        action: dict[str, Any] | None = None,
+        identity_url: str | None = None,
+    ) -> FetchResult | None:
         agent = self.agent
         url = _sanitize_url(url)
         if not url:
             return None
+        identity = _sanitize_url(identity_url or "") or None
         normalized_url = normalize_crawlable_url(url)
         if not normalized_url:
             stats = getattr(agent, "_pipeline_stats", None)
@@ -42,22 +50,23 @@ class FetchScheduler:
         resume_mode = bool(getattr(agent, "resume_mode", False))
         cross_run_dedup_enabled = resume_mode or not agent._skip_cross_run_dedup
         force_refetch_urls = getattr(agent, "_resume_force_refetch_urls", set())
-        force_refetch = url in force_refetch_urls or url.rstrip("/") in force_refetch_urls
+        dedup_url = identity or url
+        force_refetch = dedup_url in force_refetch_urls or dedup_url.rstrip("/") in force_refetch_urls
         if force_refetch:
-            agent.execution_log.append(f"force refetch url={url}")
+            agent.execution_log.append(f"force refetch url={dedup_url}")
 
         if resume_mode and not force_refetch:
             async with agent.db.session() as session:
-                cached = await crawler_db.get_cached_fetch_result(session, url)
+                cached = await crawler_db.get_cached_fetch_result(session, dedup_url)
             if cached is not None and not cached.block_reason:
                 canonical = _sanitize_url(cached.url)
-                agent.visited_urls.add(url)
+                agent.visited_urls.add(dedup_url)
                 if canonical:
                     agent.visited_urls.add(canonical)
                     agent._fetch_cache.setdefault(canonical, cached)
-                agent._fetch_cache.setdefault(url, cached)
-                agent.execution_log.append(f"fetch resume_cache url={url} depth={depth}")
-                agent.logger.info("Using cached resume page: %s", url)
+                agent._fetch_cache.setdefault(dedup_url, cached)
+                agent.execution_log.append(f"fetch resume_cache url={dedup_url} depth={depth}")
+                agent.logger.info("Using cached resume page: %s", dedup_url)
                 return cached
             if cached is not None and cached.block_reason:
                 agent.logger.info(
@@ -66,60 +75,63 @@ class FetchScheduler:
                     cached.block_reason,
                 )
 
-        if url in agent.visited_urls and cross_run_dedup_enabled and not force_refetch:
-            cached = agent._fetch_cache.get(url)
-            if cached is not None and url == _sanitize_url(agent.start_url):
-                agent.execution_log.append(f"fetch cache url={url} depth={depth}")
-                agent.logger.debug("Using cached start URL: %s", url)
+        if dedup_url in agent.visited_urls and cross_run_dedup_enabled and not force_refetch:
+            cached = agent._fetch_cache.get(dedup_url)
+            if cached is not None and dedup_url == _sanitize_url(agent.start_url):
+                agent.execution_log.append(f"fetch cache url={dedup_url} depth={depth}")
+                agent.logger.debug("Using cached start URL: %s", dedup_url)
                 return cached
-            agent.execution_log.append(f"skip visited url={url}")
-            agent.logger.info("Skipping already visited URL: %s", url)
+            agent.execution_log.append(f"skip visited url={dedup_url}")
+            agent.logger.info("Skipping already visited URL: %s", dedup_url)
             return None
 
-        cached = agent._fetch_cache.get(url)
+        cached = agent._fetch_cache.get(dedup_url)
         if cached is not None and not force_refetch:
-            agent.execution_log.append(f"fetch cache url={url} depth={depth}")
-            agent.logger.debug("Using cached URL: %s", url)
+            agent.execution_log.append(f"fetch cache url={dedup_url} depth={depth}")
+            agent.logger.debug("Using cached URL: %s", dedup_url)
             return cached
 
-        if cross_run_dedup_enabled and not force_refetch and (resume_mode or url != agent.start_url):
+        if cross_run_dedup_enabled and not force_refetch and (resume_mode or dedup_url != agent.start_url):
             async with agent.db.session() as session:
-                if await crawler_db.is_url_crawled(session, url):
-                    agent.visited_urls.add(url)
-                    agent.execution_log.append(f"skip already_crawled url={url}")
-                    agent.logger.info("Skipping previously crawled URL: %s", url)
+                if await crawler_db.is_url_crawled(session, dedup_url):
+                    agent.visited_urls.add(dedup_url)
+                    agent.execution_log.append(f"skip already_crawled url={dedup_url}")
+                    agent.logger.info("Skipping previously crawled URL: %s", dedup_url)
                     return None
 
-        agent.visited_urls.add(url)
+        agent.visited_urls.add(dedup_url)
         if force_refetch:
             try:
-                force_refetch_urls.discard(url)
-                force_refetch_urls.discard(url.rstrip("/"))
+                force_refetch_urls.discard(dedup_url)
+                force_refetch_urls.discard(dedup_url.rstrip("/"))
             except AttributeError:
                 pass
         try:
-            fetched = await agent.fetcher.fetch(url)
+            if action is not None:
+                fetched = await agent.fetcher.fetch(url, action=action, identity_url=identity)
+            else:
+                fetched = await agent.fetcher.fetch(url)
         except Exception as error:
             async with agent.db.session() as session:
                 await crawler_db.log_crawl(
                     session,
-                    url,
+                    dedup_url,
                     CrawlLogStatus.FAILED,
                     str(error),
                 )
-            agent.execution_log.append(f"fetch failed url={url} error={error}")
-            agent.logger.warning("Fetch failed for %s: %s", url, error)
+            agent.execution_log.append(f"fetch failed url={dedup_url} error={error}")
+            agent.logger.warning("Fetch failed for %s: %s", dedup_url, error)
             return None
 
-        canonical = _sanitize_url(fetched.url)
+        canonical = _sanitize_url(fetched.url) or dedup_url
         if canonical:
             agent.visited_urls.add(canonical)
             agent._fetch_cache.setdefault(canonical, fetched)
-        agent._fetch_cache.setdefault(url, fetched)
+        agent._fetch_cache.setdefault(dedup_url, fetched)
 
         async with agent.db.session() as session:
-            await crawler_db.upsert_page_cache(session, url=url, fetched=fetched)
-            if canonical and canonical != url:
+            await crawler_db.upsert_page_cache(session, url=dedup_url, fetched=fetched)
+            if canonical and canonical != dedup_url:
                 await crawler_db.upsert_page_cache(session, url=canonical, fetched=fetched)
             crawl_status = CrawlLogStatus.SUCCESS
             crawl_message = f"depth={depth} status_code={fetched.status_code}"
@@ -128,14 +140,14 @@ class FetchScheduler:
                 crawl_message = f"{crawl_message} blocked={fetched.block_reason} links={len(fetched.links)}"
             await crawler_db.log_crawl(
                 session,
-                fetched.url,
+                canonical or dedup_url,
                 crawl_status,
                 crawl_message,
             )
-            if canonical and canonical != url:
+            if canonical and canonical != dedup_url:
                 await crawler_db.log_crawl(
                     session,
-                    url,
+                    dedup_url,
                     crawl_status,
                     f"{crawl_message} final_url={fetched.url}",
                 )

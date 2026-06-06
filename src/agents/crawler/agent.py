@@ -12,7 +12,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
-from agents.crawler import agent_detail, agent_parsing
+from agents.crawler import agent_detail, agent_parsing, form_pagination
 from agents.crawler.extraction_pipeline import ExtractionPipeline
 from agents.crawler.faculty_discovery import FacultyDiscoveryService
 from agents.crawler.fetchers import FetchResult, Fetcher
@@ -134,6 +134,12 @@ class _QueuedUrl:
     depth: int
     label: str = ""
     org_unit_id: int | None = None
+    fetch_action: dict[str, Any] | None = None
+    identity_url: str | None = None
+
+    @property
+    def queue_url(self) -> str:
+        return self.identity_url or self.url
 
 
 @dataclass
@@ -1587,7 +1593,8 @@ class CrawlerAgent:
         def _queue_key(url: str) -> str:
             return _sanitize_url(url) or (url or "").strip()
 
-        def _mark_scheduled(url: str) -> bool:
+        def _mark_scheduled(item_or_url: _QueuedUrl | str) -> bool:
+            url = item_or_url.queue_url if isinstance(item_or_url, _QueuedUrl) else item_or_url
             key = _queue_key(url)
             if not key:
                 return False
@@ -1599,7 +1606,8 @@ class CrawlerAgent:
             scheduled_urls.add(key)
             return True
 
-        def _mark_processing(url: str) -> bool:
+        def _mark_processing(item_or_url: _QueuedUrl | str) -> bool:
+            url = item_or_url.queue_url if isinstance(item_or_url, _QueuedUrl) else item_or_url
             key = _queue_key(url)
             if not key:
                 return False
@@ -1623,17 +1631,16 @@ class CrawlerAgent:
                 next_depth = current.depth + 1
                 if not self._within_depth(next_depth):
                     continue
-                if not _mark_scheduled(link):
+                followup_item = _QueuedUrl(
+                    url=link,
+                    depth=next_depth,
+                    label=current.label,
+                    org_unit_id=current.org_unit_id,
+                )
+                if not _mark_scheduled(followup_item):
                     skipped_duplicates += 1
                     continue
-                pages_to_process.append(
-                    _QueuedUrl(
-                        url=link,
-                        depth=next_depth,
-                        label=current.label,
-                        org_unit_id=current.org_unit_id,
-                    )
-                )
+                pages_to_process.append(followup_item)
                 added_followups.append(link)
 
             added_pagination: list[str] = []
@@ -1641,18 +1648,38 @@ class CrawlerAgent:
             for plink in pagination_links:
                 if not self._within_depth(current.depth):
                     continue
-                if not _mark_scheduled(plink):
+                page_item = _QueuedUrl(
+                    url=plink,
+                    depth=current.depth,
+                    label=current.label,
+                    org_unit_id=current.org_unit_id,
+                )
+                if not _mark_scheduled(page_item):
                     skipped_duplicates += 1
                     continue
-                pages_to_process.append(
-                    _QueuedUrl(
-                        url=plink,
-                        depth=current.depth,
-                        label=current.label,
-                        org_unit_id=current.org_unit_id,
-                    )
-                )
+                pages_to_process.append(page_item)
                 added_pagination.append(plink)
+
+            for state in getattr(fetched, "pagination_states", ()) or ():
+                action = form_pagination.pagination_state_to_fetch_action(state)
+                if not action:
+                    continue
+                identity_url = str(action.get("synthetic_url") or "").strip()
+                if not identity_url:
+                    continue
+                page_item = _QueuedUrl(
+                    url=str(action.get("url") or fetched.url),
+                    depth=current.depth,
+                    label=current.label,
+                    org_unit_id=current.org_unit_id,
+                    fetch_action=action,
+                    identity_url=identity_url,
+                )
+                if not _mark_scheduled(page_item):
+                    skipped_duplicates += 1
+                    continue
+                pages_to_process.append(page_item)
+                added_pagination.append(identity_url)
 
             if added_followups:
                 self._pipeline_stats["followups_scheduled"] = int(
@@ -1680,17 +1707,17 @@ class CrawlerAgent:
 
         if not self.pipeline_enabled:
             for item in faculty_links[:max_pages]:
-                if not _mark_scheduled(item.url):
+                if not _mark_scheduled(item):
                     continue
                 pages_to_process = [item]
                 while pages_to_process:
                     current = pages_to_process.pop(0)
-                    if not _mark_processing(current.url):
+                    if not _mark_processing(current):
                         continue
                     if self._is_noise_or_login_candidate(current.url):
                         self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
                         continue
-                    fetched = await self._fetch_url(current.url, current.depth)
+                    fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
                     if fetched is None:
                         continue
                     if self._is_noise_or_login_candidate(fetched.url):
@@ -1754,17 +1781,17 @@ class CrawlerAgent:
                     )
 
             for item in faculty_links[:max_pages]:
-                if not _mark_scheduled(item.url):
+                if not _mark_scheduled(item):
                     continue
                 pages_to_process = [item]
                 while pages_to_process:
                     current = pages_to_process.pop(0)
-                    if not _mark_processing(current.url):
+                    if not _mark_processing(current):
                         continue
                     if self._is_noise_or_login_candidate(current.url):
                         self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
                         continue
-                    fetched = await self._fetch_url(current.url, current.depth)
+                    fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
                     if fetched is None:
                         continue
                     if self._is_noise_or_login_candidate(fetched.url):
@@ -1917,7 +1944,7 @@ class CrawlerAgent:
         priority: int,
         requested_url: str | None = None,
     ) -> None:
-        source_url = _sanitize_url(requested_url or current.url) or _sanitize_url(fetched.url) or ""
+        source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return
         final_url = _sanitize_url(fetched.url) or source_url
@@ -3261,7 +3288,7 @@ class CrawlerAgent:
         requested_url: str | None = None,
     ) -> int:
         saved_before = self.saved_professors
-        source_url = _sanitize_url(requested_url or current.url) or _sanitize_url(fetched.url) or ""
+        source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return 0
         final_url = _sanitize_url(fetched.url) or source_url
@@ -3494,8 +3521,15 @@ class CrawlerAgent:
         else:
             allowed_tools = set()
         return self.skill_manager.select_for_state(state.value, allowed_tools).rendered_text
-    async def _fetch_url(self, url: str, depth: int) -> FetchResult | None:
-        return await self.fetch_scheduler.fetch_url(url, depth)
+    async def _fetch_url(
+        self,
+        url: str,
+        depth: int,
+        *,
+        action: dict[str, Any] | None = None,
+        identity_url: str | None = None,
+    ) -> FetchResult | None:
+        return await self.fetch_scheduler.fetch_url(url, depth, action=action, identity_url=identity_url)
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
         payload = self._parse_json_from_text(content)

@@ -23,6 +23,7 @@ from agents.crawler.fetchers.human_models import (
     JobQueue,
 )
 from agents.crawler.fetchers.human_server import create_app
+from agents.crawler.form_pagination import extract_form_pagination_states, pagination_state_from_any
 from agents.crawler.url_validation import normalize_crawlable_url
 from runtime.logger import get_logger
 
@@ -69,7 +70,13 @@ class HumanFetcherBridge:
 
     # -- Fetcher-compatible interface --
 
-    async def fetch(self, url: str) -> FetchResult:
+    async def fetch(
+        self,
+        url: str,
+        *,
+        action: dict[str, Any] | None = None,
+        identity_url: str | None = None,
+    ) -> FetchResult:
         normalized_url = normalize_crawlable_url(url)
         if not normalized_url:
             self.logger.warning("Reject invalid URL before human queue url=%s", url)
@@ -80,12 +87,15 @@ class HumanFetcherBridge:
                 status_code=0,
                 block_reason="invalid_url",
                 link_signals=(),
+                pagination_states=(),
             )
         url = normalized_url
         job = FetchJob(
             url=url,
             context=self._context,
             timeout_seconds=self.job_timeout_seconds,
+            action=action,
+            identity_url=identity_url,
         )
         await self.queue.submit(job)
         self.logger.info("Job queued id=%s url=%s", job.id, url)
@@ -99,12 +109,18 @@ class HumanFetcherBridge:
         if job.status == FetchJobStatus.COMPLETED and job.result_html:
             text = self._helper._html_to_text(job.result_html)
             links, link_signals = extract_links_with_signals(job.result_html, job.result_url or url)
+            reported_states = tuple(
+                state for state in (pagination_state_from_any(item) for item in job.result_pagination_states) if state
+            )
+            derived_states = extract_form_pagination_states(job.result_html, job.result_url or url)
+            pagination_states = reported_states or derived_states
             return FetchResult(
-                url=job.result_url or url,
+                url=identity_url or job.result_url or url,
                 text=text,
                 links=links,
                 status_code=200,
                 link_signals=link_signals,
+                pagination_states=pagination_states,
             )
 
         reason = "human_skip" if job.status == FetchJobStatus.SKIPPED else (job.error_message or "human_failed")
@@ -115,6 +131,7 @@ class HumanFetcherBridge:
             status_code=0,
             block_reason=reason,
             link_signals=(),
+            pagination_states=(),
         )
 
     def set_context(self, context: JobContext) -> None:
