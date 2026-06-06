@@ -396,11 +396,11 @@
     if (bodyText.length < 2e3 && ERROR_PATTERNS.test(title + " " + bodyText)) return true;
     return false;
   }
-  const POLL_INTERVAL = 2e3;
+  const POLL_INTERVAL = 1500;
   const FAST_POLL_INTERVAL = 500;
   const FAST_POLL_ROUNDS = 4;
-  const AUTO_CHECK_INTERVAL = 1500;
-  const AUTO_SUBMIT_DELAY = 1500;
+  const AUTO_CHECK_INTERVAL = 1e3;
+  const AUTO_SUBMIT_DELAY = 1e3;
   const CAPTURE_STABLE_INTERVAL = 200;
   const CAPTURE_STABLE_ROUNDS = 3;
   const CAPTURE_MAX_WAIT = 8e3;
