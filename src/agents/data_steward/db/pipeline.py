@@ -45,12 +45,24 @@ BIO_INFERENCE_REASON = "bio_inference"
 PROFILE_SNAPSHOT_ACADEMICIAN_REASON = "profile_snapshot_academician_hint"
 PROFILE_SNAPSHOT_INFERENCE_REASON = "profile_snapshot_inference"
 MISCLASSIFIED_ACADEMICIAN_REASON = "no_self_academician_evidence"
+SYNTHETIC_UNLINKED_PROFILE_REASON = "synthetic_snapshot_navigation_bio"
+SYNTHETIC_UNLINKED_PROFILE_ISSUE = "synthetic_unlinked_profile_false_positive"
 _TITLE_RELATION_SENTENCE_RE = re.compile(
     r"(?:^|[，,；;\s])(?:与|同|和|跟)[^。；;\n\r]{0,120}?"
     r"(?:教授|副教授|研究员|院士|professor|researcher)[^。；;\n\r]{0,80}?合作|"
     r"(?:师从|合作导师|合作学者|合作对象)[^。；;\n\r]{0,120}?"
     r"(?:教授|副教授|研究员|院士|professor|researcher)",
     re.IGNORECASE,
+)
+_SYNTHETIC_PROFILE_LABEL_RE = re.compile(r"^\s*姓名\s*[:：]\s*(?P<name>.+?)\s*$")
+_SYNTHETIC_DUPLICATE_SUFFIX_RE = re.compile(r"\s*[（(]\s*\d+\s*[）)]\s*$")
+_SYNTHETIC_NAVIGATION_BIO_TOKENS = (
+    "校园地图",
+    "VI系统",
+    "校园图库",
+    "网上服务大厅",
+    "校友邮箱",
+    "图书馆",
 )
 
 
@@ -156,6 +168,23 @@ async def process_one_database(
                 sub_department_sections_detected,
                 sub_department_sections_merged,
                 sub_org_audits,
+            )
+
+            logger.info("Data Steward synthetic profile cleanup start db=%s", target_db.name)
+            synthetic_deleted, synthetic_audits = await process_synthetic_unlinked_profiles(
+                session,
+                run_id=run_id,
+                db_name=target_db.name,
+                apply=(mode == "apply"),
+            )
+            duplicates_detected += synthetic_audits
+            duplicates_deleted += synthetic_deleted
+            audits_written += synthetic_audits
+            logger.info(
+                "Data Steward synthetic profile cleanup done db=%s deleted=%s audits=%s",
+                target_db.name,
+                synthetic_deleted,
+                synthetic_audits,
             )
 
             logger.info("Data Steward identity repair scan start db=%s", target_db.name)
@@ -1462,6 +1491,166 @@ async def _mark_completion_recrawl_tasks_resolved(
         task.updated_at = _now_utc()
     if tasks:
         await session.flush()
+
+
+async def process_synthetic_unlinked_profiles(
+    session: Any,
+    *,
+    run_id: int,
+    db_name: str,
+    apply: bool,
+) -> tuple[int, int]:
+    professors = await repository.list_professors(session)
+    candidates = _synthetic_profile_cleanup_candidates(professors)
+    if not candidates:
+        return 0, 0
+
+    deleted = 0
+    audits_written = 0
+    deleted_ids: set[int] = set()
+    for professor, clean_name, reason in candidates:
+        if int(professor.id) in deleted_ids:
+            continue
+        related = _synthetic_roster_only_matches(
+            professors,
+            source=professor,
+            clean_name=clean_name,
+            deleted_ids=deleted_ids,
+        )
+        delete_rows = [professor, *related]
+        await repository.add_audit(
+            session,
+            run_id=run_id,
+            db_name=db_name,
+            entity_type="professor",
+            entity_id=int(professor.id),
+            issue_type=SYNTHETIC_UNLINKED_PROFILE_ISSUE,
+            field_name="name",
+            reason=reason,
+            confidence=1.0,
+            evidence={
+                "clean_name": clean_name,
+                "homepage": professor.homepage,
+                "related_roster_only_ids": [int(row.id) for row in related],
+            },
+            action="hard_deleted" if apply else "report_only",
+            before_snapshot=_professor_snapshot(professor),
+        )
+        audits_written += 1
+        for row in related:
+            await repository.add_audit(
+                session,
+                run_id=run_id,
+                db_name=db_name,
+                entity_type="professor",
+                entity_id=int(row.id),
+                issue_type=SYNTHETIC_UNLINKED_PROFILE_ISSUE,
+                field_name="name",
+                reason="roster_only_duplicate_of_synthetic_profile",
+                confidence=1.0,
+                evidence={
+                    "synthetic_professor_id": int(professor.id),
+                    "synthetic_name": professor.name,
+                    "clean_name": clean_name,
+                },
+                action="hard_deleted" if apply else "report_only",
+                before_snapshot=_professor_snapshot(row),
+            )
+            audits_written += 1
+
+        if apply:
+            for row in delete_rows:
+                if int(row.id) in deleted_ids:
+                    continue
+                await crawler_db.hard_delete_professor(session, row)
+                deleted_ids.add(int(row.id))
+                deleted += 1
+    if apply and deleted:
+        await session.flush()
+    return deleted, audits_written
+
+
+def _synthetic_profile_cleanup_candidates(professors: list[Professor]) -> list[tuple[Professor, str, str]]:
+    candidates: list[tuple[Professor, str, str]] = []
+    for professor in professors:
+        clean_name = _synthetic_profile_clean_name(professor.name) or _synthetic_profile_clean_name(
+            professor.name_key
+        )
+        if not clean_name:
+            continue
+        if not _looks_like_navigation_bio(professor.bio):
+            continue
+        if not _looks_like_synthetic_sparse_profile(professor):
+            continue
+        candidates.append((professor, clean_name, SYNTHETIC_UNLINKED_PROFILE_REASON))
+    return candidates
+
+
+def _synthetic_roster_only_matches(
+    professors: list[Professor],
+    *,
+    source: Professor,
+    clean_name: str,
+    deleted_ids: set[int],
+) -> list[Professor]:
+    matches: list[Professor] = []
+    for professor in professors:
+        if int(professor.id) == int(source.id) or int(professor.id) in deleted_ids:
+            continue
+        if (professor.org_unit_name or "").strip() != (source.org_unit_name or "").strip():
+            continue
+        if (professor.name or "").strip() != clean_name and (professor.name_key or "").strip() != clean_name:
+            continue
+        if _is_roster_only_empty_professor(professor):
+            matches.append(professor)
+    return matches
+
+
+def _synthetic_profile_clean_name(value: Any) -> str | None:
+    text = str(value or "").strip()
+    match = _SYNTHETIC_PROFILE_LABEL_RE.match(text)
+    if not match:
+        return None
+    clean_name = _SYNTHETIC_DUPLICATE_SUFFIX_RE.sub("", match.group("name")).strip()
+    return clean_name or None
+
+
+def _looks_like_navigation_bio(value: Any) -> bool:
+    text = re.sub(r"\s+", "", str(value or ""))
+    if not text or len(text) > 220:
+        return False
+    hits = sum(1 for token in _SYNTHETIC_NAVIGATION_BIO_TOKENS if token in text)
+    return hits >= 3
+
+
+def _looks_like_synthetic_sparse_profile(professor: Professor) -> bool:
+    return all(
+        _is_empty_text(value)
+        for value in (
+            professor.email,
+            professor.phone,
+            professor.research_areas,
+            professor.external_link,
+            professor.enrollment_pref,
+            professor.publications,
+        )
+    )
+
+
+def _is_roster_only_empty_professor(professor: Professor) -> bool:
+    return all(
+        _is_empty_text(value)
+        for value in (
+            professor.homepage,
+            professor.external_link,
+            professor.email,
+            professor.phone,
+            professor.research_areas,
+            professor.bio,
+            professor.enrollment_pref,
+            professor.publications,
+        )
+    )
 
 
 async def infer_missing_reason(

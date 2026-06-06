@@ -1039,6 +1039,186 @@ async def test_steward_apply_deletes_duplicates_and_enqueues_recrawl(tmp_path):
     await db.close()
 
 
+async def test_steward_apply_deletes_synthetic_unlinked_profile_false_positive(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "姓名：何芳",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.example.edu.cn/med",
+                "title": "研究员",
+                "homepage": "https://www.example.edu.cn/med/info/1310/2404.htm",
+                "bio": "校园地图 VI系统 校园图库 网上服务大厅 校友邮箱 图书馆 电子科技大学医学院",
+            },
+        )
+    await db.close()
+
+    settings = CrawlerSettings(websites_path=websites, university_db_dir=db_dir)
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_duplicates_deleted == 1
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+    assert professors == []
+    assert any(
+        audit.issue_type == "synthetic_unlinked_profile_false_positive"
+        and audit.action == "hard_deleted"
+        and audit.entity_type == "professor"
+        for audit in audits
+    )
+    await db.close()
+
+
+async def test_steward_apply_deletes_synthetic_profile_and_empty_roster_duplicate(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "姓名：何芳",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.example.edu.cn/med",
+                "title": "研究员",
+                "homepage": "https://www.example.edu.cn/med/info/1310/2404.htm",
+                "bio": "校园地图 VI系统 校园图库 网上服务大厅 校友邮箱 图书馆 电子科技大学医学院",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "何芳",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.example.edu.cn/med",
+                "title": "研究员",
+            },
+        )
+    await db.close()
+
+    settings = CrawlerSettings(websites_path=websites, university_db_dir=db_dir)
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_duplicates_deleted == 2
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+    assert professors == []
+    assert sum(audit.issue_type == "synthetic_unlinked_profile_false_positive" for audit in audits) == 2
+    await db.close()
+
+
+async def test_steward_apply_keeps_real_same_name_profile_when_deleting_synthetic_profile(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text("name,url,location\nTestU,https://www.example.edu.cn/,X\n", encoding="utf-8")
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "姓名：张伟（2）",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.example.edu.cn/med",
+                "title": "研究员",
+                "homepage": "https://www.example.edu.cn/med/info/1310/2296.htm",
+                "bio": "校园地图 VI系统 校园图库 网上服务大厅 校友邮箱 图书馆 电子科技大学医学院",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "张伟",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.example.edu.cn/med",
+                "title": "主任医师",
+                "homepage": "https://www.example.edu.cn/med/info/1310/2307.htm",
+                "bio": "张伟，主任医师，长期从事脊柱外科临床工作。",
+            },
+        )
+    await db.close()
+
+    settings = CrawlerSettings(websites_path=websites, university_db_dir=db_dir)
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_duplicates_deleted == 1
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor).order_by(Professor.id.asc()))).scalars().all()
+    assert [professor.name for professor in professors] == ["张伟"]
+    assert professors[0].homepage == "https://www.example.edu.cn/med/info/1310/2307.htm"
+    await db.close()
+
+
 async def test_steward_apply_enqueues_homepage_missing_research_recrawl(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
