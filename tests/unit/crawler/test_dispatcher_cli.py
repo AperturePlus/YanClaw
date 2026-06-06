@@ -452,10 +452,12 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
         llm_enabled,
         max_context_tokens,
         include_backup_audit,
+        export,
     ):
         captured["universities"] = universities
         captured["db_roots"] = db_roots
         captured["apply"] = apply
+        captured["export"] = export
         return type(
             "Summary",
             (),
@@ -466,6 +468,8 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
                 "total_duplicates_deleted": 0,
                 "total_missing_field_audits": 2,
                 "total_recrawl_tasks_upserted": 0,
+                "total_exports": 1,
+                "total_exported_bytes": 123,
                 "unmatched_universities": [],
                 "unmatched_db_roots": [],
                 "runs": [],
@@ -483,12 +487,17 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
             "A,B",
             "--db-roots",
             "pku.edu.cn,tsinghua.edu.cn",
+            "--apply",
+            "--export",
         ],
     )
     assert result.exit_code == 0, result.output
     assert captured["universities"] == ["A", "B"]
     assert captured["db_roots"] == ["pku.edu.cn", "tsinghua.edu.cn"]
-    assert captured["apply"] is False
+    assert captured["apply"] is True
+    assert captured["export"] is True
+    assert "exports=1" in result.output
+    assert "exported_bytes=123" in result.output
 
 
 def test_steward_llm_default_depends_on_api_key():

@@ -184,6 +184,7 @@ async def _crawl_async(
             llm_enabled=_resolve_steward_llm_enabled(settings, None),
             max_context_tokens=256000,
             include_backup_audit=False,
+            export=False,
         )
         click.echo(
             "steward "
@@ -422,6 +423,7 @@ def recommend(
 )
 @click.option("--max-context-tokens", default=128000, type=int, help="LLM context cap (hard-limited to <=256000).")
 @click.option("--include-backup-audit", is_flag=True, help="Read-only compare with latest backup DB snapshot.")
+@click.option("--export", is_flag=True, help="Export compact clean DBs after stewardship completes.")
 def steward_run(
     universities: str,
     universities_file: Path | None,
@@ -430,6 +432,7 @@ def steward_run(
     llm_enabled: bool | None,
     max_context_tokens: int,
     include_backup_audit: bool,
+    export: bool,
 ) -> None:
     if apply and include_backup_audit:
         raise click.ClickException("`--include-backup-audit` is read-only and cannot be combined with `--apply`.")
@@ -449,6 +452,7 @@ def steward_run(
             llm_enabled=resolved_llm_enabled,
             max_context_tokens=max_context_tokens,
             include_backup_audit=include_backup_audit,
+            export=export,
         )
     )
     click.echo(
@@ -462,7 +466,9 @@ def steward_run(
         + f"sub_department_sections={getattr(summary, 'total_sub_department_sections_detected', 0)} "
         + f"sub_department_sections_merged={getattr(summary, 'total_sub_department_sections_merged', 0)} "
         + f"missing_audits={summary.total_missing_field_audits} "
-        + f"recrawl_tasks={summary.total_recrawl_tasks_upserted}"
+        + f"recrawl_tasks={summary.total_recrawl_tasks_upserted} "
+        + f"exports={getattr(summary, 'total_exports', 0)} "
+        + f"exported_bytes={getattr(summary, 'total_exported_bytes', 0)}"
     )
     if summary.unmatched_universities:
         click.echo("unmatched_universities=" + ",".join(summary.unmatched_universities))
@@ -512,6 +518,7 @@ async def _steward_run_async(
     llm_enabled: bool,
     max_context_tokens: int,
     include_backup_audit: bool,
+    export: bool,
 ):
     from agents.data_steward.agent import DataStewardAgent
 
@@ -524,6 +531,7 @@ async def _steward_run_async(
         llm_enabled=llm_enabled,
         max_context_tokens=max_context_tokens,
         include_backup_audit=include_backup_audit,
+        export=export,
     )
 
 

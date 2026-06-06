@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler.config import CrawlerSettings
+from agents.crawler.fetchers import FetchResult
 from agents.crawler.models import (
     Academician,
     CrawlTask,
@@ -20,6 +22,7 @@ from agents.crawler.models import (
     StewardRun,
 )
 from agents.data_steward.agent import DataStewardAgent
+from agents.data_steward.db.exporter import PUBLIC_TABLES, default_export_root, export_clean_database
 from agents.data_steward.llm_service import DataStewardLLMService
 from runtime.database import DatabaseManager
 from runtime.logger import setup_logging
@@ -28,6 +31,42 @@ from runtime.llm import LLMResult
 
 def _sqlite_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path.as_posix()}"
+
+
+def _sqlite_tables(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _sqlite_columns(path: Path, table: str) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(row[1]) for row in rows}
+    finally:
+        conn.close()
+
+
+def _sqlite_count(path: Path, table: str) -> int:
+    conn = sqlite3.connect(path)
+    try:
+        return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _sqlite_scalar(path: Path, sql: str) -> object:
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(sql).fetchone()[0]
+    finally:
+        conn.close()
 
 
 async def _seed_completion_detail_task(
@@ -210,6 +249,144 @@ async def _seed_sub_department_org_db(db_path: Path) -> None:
             },
         )
     await db.close()
+
+
+async def test_clean_exporter_writes_only_public_tables_and_columns(tmp_path):
+    db_path = tmp_path / "example.edu.cn.db"
+    await _seed_db(db_path)
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.log_crawl(
+            session,
+            url="https://www.example.edu.cn/cs/faculty",
+            status="success",
+            message="runtime log",
+        )
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://www.example.edu.cn/cs/faculty",
+            fetched=FetchResult(
+                url="https://www.example.edu.cn/cs/faculty",
+                text="cached page text",
+                links=[],
+                status_code=200,
+            ),
+        )
+        run = await crawler_db.create_steward_run(
+            session,
+            mode="dry_run",
+            target_db=str(db_path),
+        )
+        await crawler_db.add_data_quality_audit(
+            session,
+            run_id=run.id,
+            db_name=db_path.name,
+            entity_type="professor",
+            entity_id=1,
+            issue_type="test_audit",
+        )
+    await db.close()
+
+    result = export_clean_database(db_path, tmp_path / "exports")
+    assert result.export_path.exists()
+    assert result.size_bytes > 0
+    assert set(result.row_counts) == set(PUBLIC_TABLES)
+    assert result.row_counts["professors"] == _sqlite_count(result.export_path, "professors")
+
+    assert _sqlite_tables(result.export_path) == set(PUBLIC_TABLES)
+    assert "crawl_logs" not in _sqlite_tables(result.export_path)
+    assert "crawl_tasks" not in _sqlite_tables(result.export_path)
+    assert "crawl_page_cache" not in _sqlite_tables(result.export_path)
+    assert "crawl_extraction_failures" not in _sqlite_tables(result.export_path)
+    assert "steward_runs" not in _sqlite_tables(result.export_path)
+    assert "data_quality_audits" not in _sqlite_tables(result.export_path)
+
+    assert _sqlite_columns(result.export_path, "university_meta") == {"id", "name", "start_url", "location"}
+    assert "crawl_status" not in _sqlite_columns(result.export_path, "university_meta")
+    assert "created_at" not in _sqlite_columns(result.export_path, "university_meta")
+    assert "updated_at" not in _sqlite_columns(result.export_path, "university_meta")
+    assert _sqlite_columns(result.export_path, "org_units") == {"id", "name", "url", "kind"}
+    assert "status" not in _sqlite_columns(result.export_path, "org_units")
+    assert "discovered_from_url" not in _sqlite_columns(result.export_path, "org_units")
+    assert "created_at" not in _sqlite_columns(result.export_path, "professor_affiliations")
+    assert "updated_at" not in _sqlite_columns(result.export_path, "professors")
+
+
+async def test_steward_dry_run_export_keeps_current_public_data(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    await _seed_db(db_path)
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=False,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+        export=True,
+    )
+
+    export_path = default_export_root(db_dir) / "example.edu.cn.clean.db"
+    assert summary.total_exports == 1
+    assert summary.total_exported_bytes > 0
+    assert summary.runs[0].export_path == str(export_path)
+    assert summary.runs[0].export_row_counts["professors"] == _sqlite_count(export_path, "professors")
+    assert _sqlite_count(export_path, "professors") == 4
+    assert _sqlite_count(export_path, "academicians") == 1
+    assert _sqlite_count(export_path, "professor_affiliations") >= 3
+    assert _sqlite_scalar(export_path, "SELECT COUNT(*) FROM professors WHERE name = 'Dup A'") == 1
+    assert _sqlite_tables(export_path) == set(PUBLIC_TABLES)
+
+
+async def test_steward_apply_export_reflects_cleaned_public_data(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    await _seed_db(db_path)
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+        export=True,
+    )
+
+    export_path = default_export_root(db_dir) / "example.edu.cn.clean.db"
+    assert summary.total_exports == 1
+    assert summary.runs[0].status == "completed"
+    assert summary.runs[0].export_error is None
+    assert summary.runs[0].export_path == str(export_path)
+    assert _sqlite_scalar(export_path, "SELECT COUNT(*) FROM professors WHERE name = 'Dup A'") == 0
+    assert _sqlite_scalar(export_path, "SELECT COUNT(*) FROM professors WHERE name = 'Home A'") == 1
+    assert _sqlite_count(export_path, "professors") == 2
+    assert _sqlite_count(export_path, "academicians") == 1
 
 
 async def test_steward_dry_run_detects_duplicates_and_writes_audits(tmp_path):

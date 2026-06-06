@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from agents.crawler.config import CrawlerSettings
-from agents.data_steward.db import process_one_database, resolve_targets
+from agents.data_steward.db import default_export_root, export_clean_database, process_one_database, resolve_targets
 from agents.data_steward.llm_service import DataStewardLLMService
-from agents.data_steward.types import StewardBatchSummary
+from agents.data_steward.types import StewardBatchSummary, StewardRunSummary
 from runtime.database import DatabaseManager
 from runtime.logger import get_logger
 
@@ -25,6 +26,7 @@ class DataStewardAgent:
         llm_enabled: bool,
         max_context_tokens: int,
         include_backup_audit: bool,
+        export: bool = False,
     ) -> StewardBatchSummary:
         resolution = resolve_targets(
             settings=self.settings,
@@ -36,12 +38,14 @@ class DataStewardAgent:
         steward_llm_factory = self._build_llm_service if llm_enabled and self.settings.openai_api_key else None
         summaries = []
         target_count = len(resolution.targets)
+        export_root = default_export_root(Path(self.settings.university_db_dir))
         self.logger.info(
-            "Data Steward batch start mode=%s targets=%s llm_enabled=%s include_backup_audit=%s",
+            "Data Steward batch start mode=%s targets=%s llm_enabled=%s include_backup_audit=%s export=%s",
             mode,
             target_count,
             steward_llm_factory is not None,
             include_backup_audit,
+            export,
         )
         for index, target_db in enumerate(resolution.targets, start=1):
             self.logger.info(
@@ -58,11 +62,14 @@ class DataStewardAgent:
                 include_backup_audit=include_backup_audit,
                 steward_llm_factory=steward_llm_factory,
             )
+            if export and summary.status == "completed":
+                summary = self._export_clean_database(target_db, export_root, summary)
             summaries.append(summary)
             self.logger.info(
                 "Data Steward target done index=%s/%s db=%s status=%s duplicates=%s deleted=%s "
                 "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
-                "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s",
+                "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s "
+                "export_path=%s export_bytes=%s export_error=%s",
                 index,
                 target_count,
                 target_db,
@@ -76,6 +83,9 @@ class DataStewardAgent:
                 summary.missing_field_audits,
                 summary.recrawl_tasks_upserted,
                 summary.audits_written,
+                summary.export_path or "",
+                summary.export_size_bytes,
+                summary.export_error or "",
             )
 
         batch_summary = StewardBatchSummary(
@@ -95,12 +105,14 @@ class DataStewardAgent:
                 item.sub_department_sections_detected for item in summaries
             ),
             total_sub_department_sections_merged=sum(item.sub_department_sections_merged for item in summaries),
+            total_exports=sum(1 for item in summaries if item.export_path),
+            total_exported_bytes=sum(item.export_size_bytes for item in summaries),
         )
         self.logger.info(
             "Data Steward batch done mode=%s targets=%s duplicates=%s deleted=%s "
             "excluded_org_units=%s excluded_org_units_deleted=%s sub_department_sections=%s "
             "sub_department_sections_merged=%s missing_audits=%s recrawl_tasks=%s audits_written=%s "
-            "unmatched_universities=%s unmatched_db_roots=%s",
+            "exports=%s exported_bytes=%s unmatched_universities=%s unmatched_db_roots=%s",
             batch_summary.mode,
             len(batch_summary.targets),
             batch_summary.total_duplicates_detected,
@@ -112,6 +124,8 @@ class DataStewardAgent:
             batch_summary.total_missing_field_audits,
             batch_summary.total_recrawl_tasks_upserted,
             batch_summary.total_audits_written,
+            batch_summary.total_exports,
+            batch_summary.total_exported_bytes,
             len(batch_summary.unmatched_universities),
             len(batch_summary.unmatched_db_roots),
         )
@@ -119,4 +133,40 @@ class DataStewardAgent:
 
     def _build_llm_service(self, db: DatabaseManager) -> DataStewardLLMService:
         return DataStewardLLMService(settings=self.settings, db=db)
+
+    def _export_clean_database(
+        self,
+        target_db: Path,
+        export_root: Path,
+        summary: StewardRunSummary,
+    ) -> StewardRunSummary:
+        try:
+            self.logger.info(
+                "Data Steward clean export start db=%s export_root=%s",
+                target_db,
+                export_root,
+            )
+            result = export_clean_database(target_db, export_root)
+            self.logger.info(
+                "Data Steward clean export done db=%s export_path=%s bytes=%s rows=%s",
+                target_db,
+                result.export_path,
+                result.size_bytes,
+                result.row_counts,
+            )
+            return replace(
+                summary,
+                export_path=str(result.export_path),
+                export_size_bytes=result.size_bytes,
+                export_row_counts=result.row_counts,
+                export_error=None,
+            )
+        except Exception as error:
+            self.logger.exception("Data Steward clean export failed db=%s", target_db)
+            return replace(
+                summary,
+                status="failed",
+                warnings=[*summary.warnings, str(error)],
+                export_error=str(error),
+            )
 
