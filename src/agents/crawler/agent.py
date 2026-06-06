@@ -92,6 +92,31 @@ _FOLLOWUP_PAGE_LIMIT = 36
 _COMPLETION_RECRAWL_LAST_ERROR_PREFIX = "completion_recrawl_"
 _COMPLETION_RECRAWL_REFETCH_FAILED = "completion_recrawl_refetch_failed"
 _COMPLETION_RECRAWL_REFETCH_BLOCKED_PREFIX = "completion_recrawl_refetch_blocked"
+_RICH_DETAIL_NO_STRUCTURED_DATA = "rich_detail_no_structured_data"
+_RICH_DETAIL_PROFILE_TOKENS = (
+    "个人简介",
+    "个人概况",
+    "学习工作经历",
+    "工作经历",
+    "教育经历",
+    "教学情况",
+    "管理经验",
+    "科研项目",
+    "论文著作",
+    "代表论文",
+    "科研成果",
+    "项目题名",
+)
+_ACADEMIC_TITLE_TOKENS = (
+    "院士",
+    "教授",
+    "副教授",
+    "讲师",
+    "研究员",
+    "副研究员",
+    "助理教授",
+    "高级工程师",
+)
 
 
 @dataclass(frozen=True)
@@ -2234,26 +2259,7 @@ class CrawlerAgent:
             task = current_task
 
             if not outcome.payloads:
-                async with self.db.session() as session:
-                    await crawler_db.set_crawl_task_status(
-                        session,
-                        task.task_id,
-                        status=CrawlTaskStatus.FAILED,
-                        attempt=task.attempt,
-                        last_error="no_structured_data",
-                    )
-                    await crawler_db.log_extraction_failure(
-                        session,
-                        task_id=task.task_id,
-                        failure_type="no_structured_data",
-                        org_unit_name=task.org_unit_name,
-                        source_url=task.source_url,
-                        attempt=task.attempt,
-                        resolver="dropped",
-                    )
-                self._pipeline_stats["failed"] += 1
-                self._increment_task_kind_stat(task, "failed")
-                self._pipeline_stats["no_structured_data_failures"] += 1
+                await self._handle_no_structured_data_task(task)
                 elapsed_ms = (time.perf_counter() - started) * 1000
                 self._update_pipeline_timing(elapsed_ms)
                 self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
@@ -2323,6 +2329,72 @@ class CrawlerAgent:
                 save_summary.get("deduped_by_homepage", 0),
             )
             db_queue.task_done()
+
+    async def _handle_no_structured_data_task(self, task: _ExtractionTaskItem) -> None:
+        if self._looks_like_rich_detail_profile_task(task):
+            async with self.db.session() as session:
+                await crawler_db.set_crawl_task_status(
+                    session,
+                    task.task_id,
+                    status=CrawlTaskStatus.RETRY,
+                    attempt=task.attempt,
+                    last_error=_RICH_DETAIL_NO_STRUCTURED_DATA,
+                )
+                await crawler_db.log_extraction_failure(
+                    session,
+                    task_id=task.task_id,
+                    failure_type="no_structured_data",
+                    org_unit_name=task.org_unit_name,
+                    source_url=task.source_url,
+                    attempt=task.attempt,
+                    resolver="retry",
+                )
+            self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
+            self._pipeline_stats["no_structured_data_recoverable"] = int(
+                self._pipeline_stats.get("no_structured_data_recoverable", 0)
+            ) + 1
+            self._pipeline_stats["no_structured_data_failures"] += 1
+            self.logger.warning(
+                "Keep rich detail task recoverable after no_structured_data task_id=%s org_unit=%s url=%s",
+                task.task_id,
+                task.org_unit_name,
+                task.source_url,
+            )
+            return
+
+        async with self.db.session() as session:
+            await crawler_db.set_crawl_task_status(
+                session,
+                task.task_id,
+                status=CrawlTaskStatus.FAILED,
+                attempt=task.attempt,
+                last_error="no_structured_data",
+            )
+            await crawler_db.log_extraction_failure(
+                session,
+                task_id=task.task_id,
+                failure_type="no_structured_data",
+                org_unit_name=task.org_unit_name,
+                source_url=task.source_url,
+                attempt=task.attempt,
+                resolver="dropped",
+            )
+        self._pipeline_stats["failed"] += 1
+        self._increment_task_kind_stat(task, "failed")
+        self._pipeline_stats["no_structured_data_failures"] += 1
+
+    def _looks_like_rich_detail_profile_task(self, task: _ExtractionTaskItem) -> bool:
+        if not task.detail_mode:
+            return False
+        text = str(task.page_text_snapshot or "")
+        if len(text.strip()) < 160:
+            return False
+        url = task.page_url or task.source_url
+        if not agent_detail._looks_like_profile_detail_url(url):
+            return False
+        if not any(token in text for token in _RICH_DETAIL_PROFILE_TOKENS):
+            return False
+        return any(token in text for token in _ACADEMIC_TITLE_TOKENS)
 
     async def _handle_invalid_json_retry(
         self,
@@ -2492,11 +2564,124 @@ class CrawlerAgent:
                         captured_payloads.append(normalized_payload)
                         used_fallback = True
 
+        snapshot_fallback_used = self._apply_detail_snapshot_profile_fallback(captured_payloads, task)
+        used_fallback = used_fallback or snapshot_fallback_used
+
         return _ExtractionOutcome(
             payloads=captured_payloads,
             invalid_json_events=invalid_events,
             content_fallback_used=used_fallback,
         )
+
+    def _apply_detail_snapshot_profile_fallback(
+        self,
+        payloads: list[dict[str, Any]],
+        task: _ExtractionTaskItem,
+    ) -> bool:
+        if not task.detail_mode:
+            return False
+        record = agent_detail.extract_detail_profile_record_from_snapshot(
+            task.page_text_snapshot,
+            page_url=task.page_url or task.source_url,
+        )
+        if not record:
+            return False
+
+        if payloads:
+            changed = self._fill_payloads_from_detail_snapshot_record(payloads, record)
+            if changed:
+                self._pipeline_stats["detail_snapshot_fields_filled"] = int(
+                    self._pipeline_stats.get("detail_snapshot_fields_filled", 0)
+                ) + changed
+                self.logger.info(
+                    "Filled missing detail fields from snapshot task_id=%s url=%s name=%s fields=%s",
+                    task.task_id,
+                    task.source_url,
+                    record.get("name"),
+                    changed,
+                )
+            return changed > 0
+
+        normalized_payload = self._normalize_extraction_payload_for_task(
+            {
+                "org_unit_name": task.org_unit_name,
+                "org_unit_url": task.org_unit_url,
+                "source_url": task.source_url,
+                "professors": [record],
+            },
+            task=task,
+        )
+        if normalized_payload is None:
+            return False
+        payloads.append(normalized_payload)
+        self._pipeline_stats["detail_snapshot_payloads_synthesized"] = int(
+            self._pipeline_stats.get("detail_snapshot_payloads_synthesized", 0)
+        ) + 1
+        self.logger.info(
+            "Synthesized detail payload from snapshot task_id=%s url=%s name=%s",
+            task.task_id,
+            task.source_url,
+            record.get("name"),
+        )
+        return True
+
+    def _fill_payloads_from_detail_snapshot_record(
+        self,
+        payloads: list[dict[str, Any]],
+        record: dict[str, Any],
+    ) -> int:
+        snapshot_name = normalize_name(record.get("name"))
+        if not snapshot_name:
+            return 0
+        fillable_fields = (
+            "title",
+            "email",
+            "phone",
+            "homepage",
+            "external_link",
+            "research_areas",
+            "bio",
+        )
+        changed = 0
+        for payload in payloads:
+            professors = payload.get("professors")
+            if not isinstance(professors, list):
+                continue
+            for index, professor in enumerate(professors):
+                if not isinstance(professor, dict):
+                    continue
+                if normalize_name(professor.get("name")) != snapshot_name:
+                    continue
+                updated = dict(professor)
+                for field_name in fillable_fields:
+                    if self._has_profile_value(updated.get(field_name)):
+                        continue
+                    value = record.get(field_name)
+                    if not self._has_profile_value(value):
+                        continue
+                    updated[field_name] = value
+                    changed += 1
+                if record.get("is_academician") is True and updated.get("is_academician") is not True:
+                    updated["is_academician"] = True
+                    changed += 1
+                if (
+                    record.get("_self_academician_evidence") is True
+                    and updated.get("_self_academician_evidence") is not True
+                ):
+                    updated["_self_academician_evidence"] = True
+                    changed += 1
+                professors[index] = updated
+        return changed
+
+    @staticmethod
+    def _has_profile_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, set, dict)):
+            return bool(value)
+        return True
 
     def _normalize_extraction_payload_for_task(
         self,

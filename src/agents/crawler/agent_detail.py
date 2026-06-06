@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 from sqlalchemy import or_, select
 
 from agents.crawler.models import Professor
+from agents.crawler.sanitizer import contains_self_academician_hint, normalize_name
 from agents.crawler.url_heuristics import (
     _is_explicit_faculty_directory_url,
     _is_faculty_platform,
@@ -99,12 +100,72 @@ _PROFILE_EVIDENCE_TOKENS = (
     "研究领域",
     "科研方向",
     "个人简介",
+    "个人概况",
+    "学习工作经历",
+    "工作经历",
     "教育经历",
+    "教学情况",
+    "管理经验",
     "代表论文",
+    "论文著作",
     "科研项目",
+    "科研成果",
     "homepage",
     "个人主页",
 )
+
+_SNAPSHOT_BIO_HEADINGS = (
+    "个人简介",
+    "个人概况",
+    "简介",
+)
+
+_SNAPSHOT_BIO_STOP_TOKENS = (
+    "要求",
+    "招生要求",
+    "部分论文",
+    "论文著作",
+    "项目成果",
+    "获奖荣誉",
+    "代表论文",
+    "科研项目",
+    "科研成果",
+    "footLogo",
+    "版权所有",
+    "如对我研究方向感兴趣",
+    "---",
+)
+
+_SNAPSHOT_FIELD_BOUNDARY_RE = re.compile(
+    r"(?:^|\s+)(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
+    r"研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
+    re.IGNORECASE,
+)
+
+_SNAPSHOT_EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+_SNAPSHOT_URL_RE = re.compile(r"https?://[^\s\])>\"']+")
+_SNAPSHOT_PHONE_RE = re.compile(r"(?:\+?\d[\d\-()（） ]{5,}\d)")
+_SNAPSHOT_RESEARCH_CONTACT_LABELS = {
+    "email",
+    "e-mail",
+    "mail",
+    "emailaddress",
+    "邮箱",
+    "电子邮箱",
+    "电子邮件",
+    "联系电话",
+    "电话",
+    "办公电话",
+    "phone",
+    "tel",
+    "telephone",
+    "homepage",
+    "home page",
+    "website",
+    "个人主页",
+    "主页",
+    "网址",
+}
 
 _PERSON_ANCHOR_BLOCKLIST = (
     "师资",
@@ -129,12 +190,35 @@ _PERSON_ANCHOR_BLOCKLIST = (
     "招聘",
     "人事",
     "政策",
+    "办事",
+    "指南",
+    "流程",
+    "资料下载",
+    "申请表",
+    "审批表",
+    "办理程序",
+    "薪酬福利",
     "通知",
     "公告",
     "news",
     "notice",
     "list",
     "more",
+)
+
+_SERVICE_GUIDE_TOKENS = (
+    "办事指南",
+    "办事流程",
+    "资料下载",
+    "人事政策",
+    "薪酬福利",
+    "办理程序",
+    "申请表",
+    "审批表",
+)
+_SERVICE_GUIDE_TITLE_RE = re.compile(
+    r"(?:^|\n)\s*#{1,4}\s*(?:【[^】]{1,30}】)?[^\n#]{0,120}"
+    r"(?:办事指南|办事流程|资料下载|办理程序|申请表|审批表|人事政策|薪酬福利)"
 )
 
 
@@ -225,6 +309,304 @@ def _looks_like_profile_detail_url(url: str) -> bool:
         return True
     path = urlparse(lowered).path
     return bool(re.search(r"/info/\d+/\d+(\.s?html?)?$", path))
+
+
+def extract_detail_profile_record_from_snapshot(text: str, *, page_url: str = "") -> dict[str, Any] | None:
+    """Extract a conservative single-profile record from stored detail text."""
+    raw = str(text or "")
+    if len(raw.strip()) < 120:
+        return None
+    if page_url and not _looks_like_profile_detail_url(page_url):
+        return None
+
+    relevant = _snapshot_relevant_text(raw)
+    if _looks_like_service_guide_snapshot(relevant, page_url=page_url):
+        return None
+    name = _extract_snapshot_name(relevant)
+    if not name:
+        return None
+    if _snapshot_has_multiple_labeled_names(relevant, name):
+        return None
+
+    research_areas = _extract_snapshot_research_areas(relevant)
+    bio = _extract_snapshot_bio(relevant, name)
+    email = _extract_snapshot_email(relevant)
+    phone = _extract_snapshot_phone(relevant)
+    if not any((research_areas, bio, email, phone)):
+        return None
+
+    title = _extract_snapshot_title(relevant, name)
+    personal_homepage = _extract_snapshot_personal_homepage(relevant)
+    record: dict[str, Any] = {"name": name}
+    if title:
+        record["title"] = title
+    if research_areas:
+        record["research_areas"] = research_areas
+    if email:
+        record["email"] = email
+    if phone:
+        record["phone"] = phone
+    if page_url:
+        record["homepage"] = page_url
+    elif personal_homepage:
+        record["homepage"] = personal_homepage
+    if personal_homepage and personal_homepage != record.get("homepage"):
+        record["external_link"] = personal_homepage
+    if bio:
+        record["bio"] = bio
+
+    if _snapshot_self_academician_evidence(name, title, bio, relevant):
+        record["is_academician"] = True
+        record["_self_academician_evidence"] = True
+    return record
+
+
+def _looks_like_service_guide_snapshot(text: str, *, page_url: str = "") -> bool:
+    if page_url and _is_non_faculty_noise_url(page_url):
+        return True
+    if _SERVICE_GUIDE_TITLE_RE.search(text or ""):
+        return True
+    token_hits = sum(1 for token in _SERVICE_GUIDE_TOKENS if token in (text or ""))
+    if token_hits <= 0:
+        return False
+    if "当前位置" in text and token_hits >= 1:
+        return True
+    if "联系人" in text and token_hits >= 2:
+        return True
+    return False
+
+
+def _snapshot_relevant_text(text: str) -> str:
+    stop_positions = [
+        index
+        for token in ("footLogo", "版权所有", "四川大学计算机学院版权所有", "邮编：610")
+        if (index := text.find(token)) >= 0
+    ]
+    if stop_positions:
+        return text[: min(stop_positions)]
+    return text
+
+
+def _snapshot_has_multiple_labeled_names(text: str, expected: str) -> bool:
+    names = {
+        _clean_snapshot_name(match.group("value"))
+        for match in re.finditer(r"(?:^|\n)\s*姓名\s*[：:]\s*(?P<value>[^\n|]+)", text)
+    }
+    names.discard("")
+    return len({name for name in names if name != expected}) > 0
+
+
+def _extract_snapshot_name(text: str) -> str | None:
+    for pattern in (
+        r"(?:^|\n)\s*姓名\s*[：:]\s*(?P<value>[^\n|]+)",
+        r"(?:^|\n)\s*#{1,3}\s*(?P<value>[^\n#]+)",
+    ):
+        for match in re.finditer(pattern, text):
+            name = _clean_snapshot_name(match.group("value"))
+            if _looks_like_person_name(name):
+                return name
+    return None
+
+
+def _clean_snapshot_name(value: str) -> str:
+    text = _clean_snapshot_text(value)
+    text = re.split(r"\s+(?:职称|职务|电话|电子邮箱|个人主页)\s*[：:]", text, maxsplit=1)[0]
+    return normalize_name(text.strip("：:|,，;；。 "))
+
+
+def _looks_like_person_name(value: str) -> bool:
+    text = (value or "").strip()
+    if not text or any(token in text for token in _PERSON_ANCHOR_BLOCKLIST):
+        return False
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
+    if 2 <= len(cjk_chars) <= 4 and len(text) <= 8:
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]+", text)
+    return 2 <= len(words) <= 4 and len(" ".join(words)) <= 60
+
+
+def _extract_snapshot_title(text: str, name: str) -> str | None:
+    title = _extract_snapshot_labeled_value(text, ("职称", "职务"), max_chars=80)
+    if title:
+        return title
+    name_index = text.find(name)
+    if name_index < 0:
+        return None
+    window = text[name_index : name_index + 260]
+    for token in (
+        "院士",
+        "副研究员",
+        "研究员",
+        "副教授",
+        "教授",
+        "助理教授",
+        "讲师",
+        "高级工程师",
+        "博士后",
+    ):
+        if token in window:
+            return token
+    return None
+
+
+def _extract_snapshot_research_areas(text: str) -> list[str] | None:
+    value = _extract_snapshot_labeled_value(text, ("研究方向", "研究领域", "科研方向"), max_chars=240)
+    if not value:
+        return None
+    value = _truncate_snapshot_value_at_stop(value)
+    terms: list[str] = []
+    for part in re.split(r"[；;、，,\n]|和", value):
+        term = _clean_snapshot_text(part).strip("：:，,；;。. ")
+        if not term or len(term) > 60 or _looks_like_snapshot_research_contact(term):
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms[:8] or None
+
+
+def _looks_like_snapshot_research_contact(value: str) -> bool:
+    text = _clean_snapshot_text(value).strip("：:，,；;。. ")
+    if not text:
+        return True
+    lowered = text.lower()
+    compact = re.sub(r"[\s_\-]+", "", lowered)
+    if lowered in _SNAPSHOT_RESEARCH_CONTACT_LABELS or compact in _SNAPSHOT_RESEARCH_CONTACT_LABELS:
+        return True
+    if _SNAPSHOT_EMAIL_RE.search(text) or _SNAPSHOT_URL_RE.search(text):
+        return True
+    if re.match(r"^(?:e-?mail|mail|email\s+address|邮箱|电子邮箱|电子邮件)\s*[：:]", text, re.IGNORECASE):
+        return True
+    if re.match(r"^(?:phone|tel|telephone|电话|办公电话|联系电话)\s*[：:]", text, re.IGNORECASE):
+        return True
+    return bool(_SNAPSHOT_PHONE_RE.fullmatch(text))
+
+
+def _extract_snapshot_email(text: str) -> str | None:
+    emails: list[str] = []
+    for match in _SNAPSHOT_EMAIL_RE.finditer(text):
+        email = match.group(0).strip().lower()
+        if email not in emails:
+            emails.append(email)
+    return "；".join(emails[:3]) if emails else None
+
+
+def _extract_snapshot_phone(text: str) -> str | None:
+    line_value = _extract_snapshot_labeled_value(text, ("办公电话", "电话"), max_chars=80)
+    if not line_value:
+        return None
+    match = _SNAPSHOT_PHONE_RE.search(line_value)
+    return match.group(0).strip() if match else None
+
+
+def _extract_snapshot_personal_homepage(text: str) -> str | None:
+    value = _extract_snapshot_labeled_value(text, ("个人主页", "主页", "Homepage"), max_chars=240)
+    if not value:
+        return None
+    urls = []
+    for match in _SNAPSHOT_URL_RE.finditer(value):
+        url = match.group(0).strip()
+        if url.lower().startswith("mailto:"):
+            continue
+        if url not in urls:
+            urls.append(url)
+    return urls[0] if urls else None
+
+
+def _extract_snapshot_bio(text: str, name: str) -> str | None:
+    name_index = text.find(name)
+    searchable = text[name_index:] if name_index >= 0 else text
+    lines = searchable.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = _clean_snapshot_text(raw_line)
+        if not line:
+            continue
+        heading = next((item for item in _SNAPSHOT_BIO_HEADINGS if item in line), None)
+        if not heading:
+            continue
+        fragments: list[str] = []
+        after_heading = line.split(heading, 1)[1].strip("：: 　")
+        after_heading = _truncate_snapshot_value_at_stop(after_heading)
+        if after_heading:
+            fragments.append(after_heading)
+        for next_line in lines[index + 1 :]:
+            cleaned = _clean_snapshot_text(next_line)
+            if not cleaned:
+                continue
+            cleaned = _strip_snapshot_bio_heading(cleaned)
+            truncated = _truncate_snapshot_value_at_stop(cleaned)
+            if truncated:
+                fragments.append(truncated)
+            if truncated != cleaned:
+                break
+            if any(token in cleaned for token in _SNAPSHOT_BIO_STOP_TOKENS):
+                break
+        bio = " ".join(fragments).strip()
+        bio = re.sub(r"\s+", " ", bio).strip("：:；;，,。 ")
+        if len(bio) > 900:
+            bio = bio[:900].rstrip("，,；;。 ") + "。"
+        if bio and name in bio:
+            return bio
+        if bio and len(bio) >= 20:
+            return bio
+    return None
+
+
+def _strip_snapshot_bio_heading(value: str) -> str:
+    for heading in _SNAPSHOT_BIO_HEADINGS:
+        if value.startswith(heading):
+            return value.split(heading, 1)[1].strip("：: 　")
+    return value
+
+
+def _extract_snapshot_labeled_value(text: str, labels: tuple[str, ...], *, max_chars: int) -> str | None:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    pattern = re.compile(
+        rf"(?:^|\n|[| ])(?:{label_pattern})\s*[：:]\s*(?P<value>[^\n]+)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        value = match.group("value")
+        value = value.split("|", 1)[0]
+        value = _SNAPSHOT_FIELD_BOUNDARY_RE.split(value, maxsplit=1)[0]
+        value = _clean_snapshot_text(value[:max_chars])
+        value = _truncate_snapshot_value_at_stop(value)
+        if value:
+            return value
+    return None
+
+
+def _truncate_snapshot_value_at_stop(value: str) -> str:
+    stop_positions = [index for token in _SNAPSHOT_BIO_STOP_TOKENS if (index := value.find(token)) >= 0]
+    if not stop_positions:
+        return value
+    return value[: min(stop_positions)].strip()
+
+
+def _clean_snapshot_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\((?:mailto:)?[^)]+\)", r"\1", text)
+    text = text.replace("\\.", ".")
+    text = text.replace("**", "")
+    text = text.strip().strip("|").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _snapshot_self_academician_evidence(name: str, title: str | None, bio: str | None, text: str) -> bool:
+    if contains_self_academician_hint(name, title, bio):
+        return True
+    if title and "院士" in title:
+        return True
+    window = _snapshot_name_context_window(text, name)
+    return bool(window and contains_self_academician_hint(name, window))
+
+
+def _snapshot_name_context_window(text: str, name: str, *, radius: int = 260) -> str:
+    index = text.find(name)
+    if index < 0:
+        return ""
+    return text[max(0, index - radius) : min(len(text), index + len(name) + radius)]
 
 
 async def enrich_profiles_with_detail_backend(
