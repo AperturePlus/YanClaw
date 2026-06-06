@@ -2,6 +2,7 @@ import { failCurrent, overrideUrl, skipCurrent, submitCurrent, switchPendingDeci
 import { setAutoMode, setMinimized, state, togglePaused } from '../state';
 import type { FetchJob } from '../types';
 import { statusIcon, timeAgo, truncUrl, urlMatches } from '../utils';
+import { performFetchAction } from '../formPagination';
 
 let panelEl: HTMLDivElement | null = null;
 
@@ -84,6 +85,7 @@ function renderJobDetail(job: FetchJob): string {
     <div>阶段: ${c.agent_state || '-'}</div>
     ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ''}
     ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ''}
+    ${job.action?.label ? `<div class="ycl-hint">动作: ${job.action.label}</div>` : ''}
     <div class="ycl-label" style="margin-top:4px">目标 URL</div>
     <div class="ycl-url">${job.url}</div>
     ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ''}
@@ -154,7 +156,9 @@ function bindEvents(): void {
     if (job) void navigator.clipboard.writeText(job.url);
   });
   bind('ycl-open', 'click', () => {
-    if (job) window.location.href = job.url;
+    if (!job) return;
+    if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
+    window.location.href = job.url;
   });
   bind('ycl-submit', 'click', submitCurrent);
   bind('ycl-skip', 'click', skipCurrent);

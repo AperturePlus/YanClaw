@@ -1,4 +1,5 @@
 import * as api from './api';
+import { actionMatchesCurrentPage, collectFormPaginationStates, performFetchAction } from './formPagination';
 import { addHistory, clearJob, notify, setJob, state } from './state';
 import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
@@ -24,6 +25,7 @@ let polling = false;
 let decisionPromptedId: string | null = null;
 let resolvingDecision = false;
 let lastDecisionCheckAt = 0;
+let actionSubmittedForJobId: string | null = null;
 
 /** Sync persisted state with backend on page load. */
 export async function recoverState(): Promise<void> {
@@ -126,6 +128,13 @@ function autoCheck(): void {
   errorRetries = 0;
 
   if (urlMatches(window.location.href, job.url)) {
+    if (job.action && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+      if (actionSubmittedForJobId !== job.id && performFetchAction(job.action)) {
+        actionSubmittedForJobId = job.id;
+        matchedSince = null;
+      }
+      return;
+    }
     if (matchedSince === null) {
       matchedSince = Date.now();
     } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -170,6 +179,7 @@ async function pollNext(): Promise<void> {
 
 function assignJob(job: import('./types').FetchJob): void {
   errorRetries = 0;
+  actionSubmittedForJobId = null;
   setJob(job);
   if (state.autoMode) {
     // Navigate — the auto watcher will handle submission after page loads.
@@ -249,10 +259,20 @@ export async function submitCurrent(): Promise<void> {
     showToast('当前是错误页面，无法提交');
     return;
   }
+  if (job.action && urlMatches(window.location.href, job.url) && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+    if (performFetchAction(job.action)) {
+      actionSubmittedForJobId = job.id;
+      showToast('已执行分页动作，等待页面更新后再提交');
+    } else {
+      showToast('分页动作执行失败，请手动处理');
+    }
+    return;
+  }
   submitting = true;
   try {
     const html = await captureCurrentHtml();
-    const res = await api.completeJob(job.id, html, window.location.href, document.title);
+    const paginationStates = collectFormPaginationStates(window.location.href);
+    const res = await api.completeJob(job.id, html, window.location.href, document.title, paginationStates);
     addHistory(job, 'completed');
     clearJob();
     if (res?.next_job) {

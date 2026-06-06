@@ -106,8 +106,13 @@
   async function fetchNextJob() {
     return request("GET", "/jobs/next");
   }
-  async function completeJob(id, html, url, title) {
-    return request("POST", `/jobs/${id}/complete`, { html, url, title });
+  async function completeJob(id, html, url, title, paginationStates) {
+    return request("POST", `/jobs/${id}/complete`, {
+      html,
+      url,
+      title,
+      pagination_states: paginationStates ?? []
+    });
   }
   async function failJob(id, message) {
     await request("POST", `/jobs/${id}/fail`, { message });
@@ -126,6 +131,142 @@
   }
   async function resolveDecision(id, action) {
     await request("POST", `/decision/${id}/resolve`, { action });
+  }
+  const PAGE_ASSIGN_RE = /document\.forms\[['"]([^'"]+)['"]\]\.([A-Za-z0-9_]+)\.value\s*=\s*['"]?(\d+)['"]?/i;
+  const GOTO_FIELD_RE = /\b([A-Za-z0-9_]*?)GOPAGE\b/i;
+  function collectFormPaginationStates(currentUrl = window.location.href) {
+    const anchors = [...document.querySelectorAll('a[href^="javascript:"]')];
+    const byFormField = new Map();
+    for (const anchor of anchors) {
+      const parsed = parsePageAssignment(anchor.getAttribute("href") || "");
+      if (!parsed) continue;
+      const key = `${parsed.formName}\0${parsed.fieldName}`;
+      const existing = byFormField.get(key) ?? {
+        formName: parsed.formName,
+        fieldName: parsed.fieldName,
+        pages: new Set()
+      };
+      existing.pages.add(parsed.pageIndex);
+      byFormField.set(key, existing);
+    }
+    const currentPage = detectCurrentPage(currentUrl);
+    const states = [];
+    const seen = new Set();
+    for (const item of byFormField.values()) {
+      const pageIndexes = expandPageIndexes(item.formName, item.fieldName, item.pages);
+      const totalPages = Math.max(...pageIndexes, ...item.pages);
+      for (const pageIndex of pageIndexes) {
+        if (pageIndex <= 1 || pageIndex === currentPage) continue;
+        const syntheticUrl = buildSyntheticUrl(currentUrl, item.formName, item.fieldName, pageIndex);
+        if (seen.has(syntheticUrl)) continue;
+        seen.add(syntheticUrl);
+        states.push({
+          kind: "form_submit",
+          state_id: `form:${item.formName}:${item.fieldName}:${pageIndex}`,
+          label: `${item.formName} 第 ${pageIndex} 页`,
+          page_index: pageIndex,
+          total_pages: totalPages,
+          form_name: item.formName,
+          fields: { [item.fieldName]: String(pageIndex) },
+          submit: true,
+          synthetic_url: syntheticUrl,
+          url: currentUrl
+        });
+      }
+    }
+    return states.sort((a, b) => a.page_index - b.page_index || a.synthetic_url.localeCompare(b.synthetic_url));
+  }
+  function actionMatchesCurrentPage(action, currentUrl, targetUrl) {
+    if (!action || action.kind !== "form_submit") return true;
+    const desired = Number(action.page_index || firstFieldValue(action.fields));
+    const current = detectCurrentPage(currentUrl);
+    if (!desired || !current) return false;
+    return desired === current && sameBaseUrl(currentUrl, targetUrl);
+  }
+  function performFetchAction(action) {
+    if (!action || action.kind !== "form_submit") return false;
+    const formName = action.form_name || "";
+    const form = document.forms.namedItem(formName);
+    if (!form) return false;
+    for (const [name, value] of Object.entries(action.fields ?? {})) {
+      const control = form.elements.namedItem(name);
+      if (!control) continue;
+      setControlValue(control, value);
+    }
+    if (action.submit !== false) {
+      form.submit();
+    }
+    return true;
+  }
+  function parsePageAssignment(href) {
+    const match = PAGE_ASSIGN_RE.exec(href);
+    if (!match) return null;
+    const pageIndex = Number(match[3]);
+    if (!Number.isFinite(pageIndex) || pageIndex <= 0) return null;
+    return { formName: match[1], fieldName: match[2], pageIndex };
+  }
+  function expandPageIndexes(formName, fieldName, pages) {
+    const hasGoto = [...document.querySelectorAll("input[name]")].some((input) => {
+      const name = input.name || "";
+      const match = GOTO_FIELD_RE.exec(name);
+      if (!match) return false;
+      const prefix = match[1] || "";
+      const form = input.form;
+      return (!form || form.name === formName) && (!prefix || fieldName.toLowerCase().startsWith(prefix.toLowerCase()));
+    });
+    if (!hasGoto) return [...pages].sort((a, b) => a - b);
+    const maxPage = Math.max(...pages);
+    return Array.from({ length: maxPage }, (_unused, index) => index + 1);
+  }
+  function detectCurrentPage(currentUrl) {
+    var _a, _b;
+    const current = Number(((_b = (_a = document.querySelector(".this-page")) == null ? void 0 : _a.textContent) == null ? void 0 : _b.trim()) || "0");
+    if (Number.isFinite(current) && current > 0) return current;
+    try {
+      const url = new URL(currentUrl);
+      for (const key of ["PAGENUM", "page", "p", "pn", "fromWenNOWPAGE"]) {
+        const value = Number(url.searchParams.get(key) || "0");
+        if (Number.isFinite(value) && value > 0) return value;
+      }
+    } catch {
+    }
+    return 1;
+  }
+  function buildSyntheticUrl(url, formName, fieldName, pageIndex) {
+    const parsed = new URL(url);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (key.startsWith("__ycl_")) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.set("__ycl_kind", "form");
+    parsed.searchParams.set("__ycl_form", formName);
+    parsed.searchParams.set("__ycl_field", fieldName);
+    parsed.searchParams.set("__ycl_page", String(pageIndex));
+    parsed.hash = "";
+    return parsed.toString();
+  }
+  function setControlValue(control, value) {
+    if (control instanceof RadioNodeList) {
+      control.value = value;
+      return;
+    }
+    if ("value" in control) {
+      control.value = value;
+    }
+  }
+  function firstFieldValue(fields) {
+    return Object.values(fields ?? {})[0] ?? "";
+  }
+  function sameBaseUrl(a, b) {
+    try {
+      const aUrl = new URL(a);
+      const bUrl = new URL(b);
+      return aUrl.hostname === bUrl.hostname && stripSlash(aUrl.pathname) === stripSlash(bUrl.pathname);
+    } catch {
+      return false;
+    }
+  }
+  function stripSlash(value) {
+    return value.replace(/\/+$/, "");
   }
   const YCL_PREFIX = "ycl_";
   const UI_PREFS_KEY = "ycl_ui_prefs_v2";
@@ -415,6 +556,7 @@
   let decisionPromptedId = null;
   let resolvingDecision = false;
   let lastDecisionCheckAt = 0;
+  let actionSubmittedForJobId = null;
   async function recoverState() {
     var _a, _b, _c;
     let changed = false;
@@ -503,6 +645,13 @@
     }
     errorRetries = 0;
     if (urlMatches(window.location.href, job.url)) {
+      if (job.action && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+        if (actionSubmittedForJobId !== job.id && performFetchAction(job.action)) {
+          actionSubmittedForJobId = job.id;
+          matchedSince = null;
+        }
+        return;
+      }
       if (matchedSince === null) {
         matchedSince = Date.now();
       } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
@@ -543,6 +692,7 @@
   }
   function assignJob(job) {
     errorRetries = 0;
+    actionSubmittedForJobId = null;
     setJob(job);
     if (state.autoMode) {
       window.location.href = job.url;
@@ -616,10 +766,20 @@
       showToast("当前是错误页面，无法提交");
       return;
     }
+    if (job.action && urlMatches(window.location.href, job.url) && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+      if (performFetchAction(job.action)) {
+        actionSubmittedForJobId = job.id;
+        showToast("已执行分页动作，等待页面更新后再提交");
+      } else {
+        showToast("分页动作执行失败，请手动处理");
+      }
+      return;
+    }
     submitting = true;
     try {
       const html = await captureCurrentHtml();
-      const res = await completeJob(job.id, html, window.location.href, document.title);
+      const paginationStates = collectFormPaginationStates(window.location.href);
+      const res = await completeJob(job.id, html, window.location.href, document.title, paginationStates);
       addHistory(job, "completed");
       clearJob();
       if (res == null ? void 0 : res.next_job) {
@@ -876,7 +1036,7 @@
   </div>`;
   }
   function renderJobDetail(job) {
-    var _a;
+    var _a, _b;
     const c = job.context;
     return `<div class="ycl-section">
     <div class="ycl-label">当前任务 #${job.id}</div>
@@ -884,11 +1044,12 @@
     <div>阶段: ${c.agent_state || "-"}</div>
     ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ""}
     ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ""}
+    ${((_a = job.action) == null ? void 0 : _a.label) ? `<div class="ycl-hint">动作: ${job.action.label}</div>` : ""}
     <div class="ycl-label" style="margin-top:4px">目标 URL</div>
     <div class="ycl-url">${job.url}</div>
     ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ""}
     ${c.depth != null ? `<div>深度: ${c.depth}</div>` : ""}
-    ${((_a = c.hints) == null ? void 0 : _a.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
+    ${((_b = c.hints) == null ? void 0 : _b.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
   </div>`;
   }
   function renderEmpty(isStandby) {
@@ -942,7 +1103,9 @@
       if (job) void navigator.clipboard.writeText(job.url);
     });
     bind("ycl-open", "click", () => {
-      if (job) window.location.href = job.url;
+      if (!job) return;
+      if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
+      window.location.href = job.url;
     });
     bind("ycl-submit", "click", submitCurrent);
     bind("ycl-skip", "click", skipCurrent);
