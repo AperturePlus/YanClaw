@@ -84,6 +84,36 @@ _TRAILING_CJK_ALIAS_RE = re.compile(
 _RESEARCH_LABEL_RE = re.compile(
     r"(?:研究方向|研究领域|主要研究方向|主要研究领域|研究兴趣|主要研究兴趣)\s*[:：]\s*(?P<value>[^。\n\r]+)"
 )
+_RESEARCH_AREA_SEPARATOR_RE = re.compile(r"[；;\n\r|]+")
+_RESEARCH_CONTACT_LABEL_PREFIX_RE = re.compile(
+    r"^(?:e-?mail|mail|email\s+address|邮箱|电子邮箱|电子邮件|phone|tel|telephone|"
+    r"电话|办公电话|联系电话|homepage|home\s+page|website|个人主页|主页|网址)\s*[：:]",
+    re.IGNORECASE,
+)
+_EMAIL_VALUE_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+_URL_VALUE_RE = re.compile(r"https?://[^\s\])>\"']+", re.IGNORECASE)
+_PHONE_VALUE_RE = re.compile(r"(?:\+?\d[\d\-()（） ]{5,}\d)")
+_RESEARCH_CONTACT_LABELS = {
+    "email",
+    "e-mail",
+    "mail",
+    "emailaddress",
+    "邮箱",
+    "电子邮箱",
+    "电子邮件",
+    "phone",
+    "tel",
+    "telephone",
+    "联系电话",
+    "电话",
+    "办公电话",
+    "homepage",
+    "home page",
+    "website",
+    "个人主页",
+    "主页",
+    "网址",
+}
 _RESEARCH_ACHIEVEMENT_RE = re.compile(
     r"在(?P<value>[^。；\n\r]{2,120}?)(?:等)?方面(?:取得|开展|进行|做出)[^。；\n\r]{0,40}?(?:研究成果|成果|研究)"
 )
@@ -92,6 +122,16 @@ _MAINLY_ENGAGED_RE = re.compile(
 )
 _ADVOCATE_RESEARCH_RE = re.compile(
     r"(?:倡导|推动|率先倡导)(?:进行|开展)?(?P<value>[^。；\n\r]{2,100}?)研究"
+)
+_NON_PERSON_NAME_HINTS = (
+    "办事指南",
+    "办事流程",
+    "资料下载",
+    "申请表",
+    "审批表",
+    "办理程序",
+    "人事政策",
+    "薪酬福利",
 )
 
 
@@ -103,6 +143,8 @@ def sanitize_professor_payload(
     name = normalize_name(record.get("name"))
     if not name:
         raise ValueError("Professor name is required")
+    if looks_like_non_person_name(name):
+        raise ValueError(f"Invalid professor name: {name}")
 
     raw_title = _to_text(record.get("title"))
     bio = normalize_optional_text(record.get("bio"))
@@ -123,7 +165,9 @@ def sanitize_professor_payload(
         title = "院士"
     elif title == "院士":
         title = normalize_non_academician_title(raw_title)
-    research_areas = normalize_multivalue(record.get("research_areas")) or infer_research_areas_from_bio(bio)
+    research_areas = _normalize_research_areas(record.get("research_areas")) or _normalize_research_areas(
+        infer_research_areas_from_bio(bio)
+    )
 
     cleaned = {
         "name": name,
@@ -139,6 +183,13 @@ def sanitize_professor_payload(
         "publications": normalize_multivalue(record.get("publications")),
     }
     return cleaned, is_academician
+
+
+def looks_like_non_person_name(value: Any) -> bool:
+    text = normalize_name(value)
+    if not text:
+        return False
+    return any(hint in text for hint in _NON_PERSON_NAME_HINTS)
 
 
 def is_truthy(value: Any) -> bool:
@@ -264,6 +315,38 @@ def normalize_multivalue(value: Any) -> str | None:
     if not text:
         return None
     return text
+
+
+def _normalize_research_areas(value: Any) -> str | None:
+    text = normalize_multivalue(value)
+    if not text:
+        return None
+    terms: list[str] = []
+    for part in _RESEARCH_AREA_SEPARATOR_RE.split(text):
+        term = normalize_optional_text(part)
+        if not term:
+            continue
+        term = term.strip("：:，,；;。. ")
+        if not term or _looks_like_research_contact_value(term):
+            continue
+        if term not in terms:
+            terms.append(term)
+    return "；".join(terms) if terms else None
+
+
+def _looks_like_research_contact_value(value: str) -> bool:
+    text = _to_text(value).strip("：:，,；;。. ")
+    if not text:
+        return True
+    lowered = text.lower()
+    compact = re.sub(r"[\s_\-]+", "", lowered)
+    if lowered in _RESEARCH_CONTACT_LABELS or compact in _RESEARCH_CONTACT_LABELS:
+        return True
+    if _EMAIL_VALUE_RE.search(text) or _URL_VALUE_RE.search(text):
+        return True
+    if _RESEARCH_CONTACT_LABEL_PREFIX_RE.match(text):
+        return True
+    return bool(_PHONE_VALUE_RE.fullmatch(text))
 
 
 def infer_research_areas_from_bio(value: Any) -> str | None:
