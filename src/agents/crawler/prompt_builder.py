@@ -17,12 +17,17 @@ CRAWLER_SYSTEM_PROMPT = "You are a cautious university faculty crawler. Stay on 
 PROFESSOR_DETAIL_INSTRUCTION_TEMPLATE = (
     "Extract professor records from this detail page and call save_professors when records are found. "
     "Use org_unit_name={org_unit_name}. Set source_url to the current page URL. "
-    "Prioritize fields: email, phone, research_areas. "
-    "Only save records that include at least one of email/phone/research_areas. "
+    "Prioritize fields: email, phone, research_areas, bio. "
+    "Only save records that include at least one of email/phone/research_areas/bio. "
+    "If this is an individual profile with a visible name, academic title, and extractable facts, "
+    "call save_professors; do not return explanatory prose only. "
+    "Official same-domain profile pages under sections such as 名师风采/院士 should be saved when "
+    "they present the person as part of the university site, even if office address or affiliations mention another institute. "
     "Research areas may appear as text under headings like 研究方向/研究领域 or as linked anchor text; "
-    "save those visible phrases in research_areas. "
-    "If visible body text follows headings like 个人简介/简介/个人概况, save that paragraph in bio without "
-    "inventing missing content. "
+    "they may also be short technical phrases in sections such as 科研项目/论文著作/代表论文/科研成果/项目题名. "
+    "Save only concise visible phrases in research_areas. "
+    "If visible body text follows headings like 个人简介/简介/个人概况/学习工作经历/工作经历/教育经历/教学情况/管理经验, "
+    "save a short factual summary in bio without inventing missing content. "
     "If this page only contains category/list names without these fields, do not save placeholders. "
     "Do not include retired/emeritus records. "
     "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
@@ -40,8 +45,9 @@ PROFESSOR_LIST_INSTRUCTION_TEMPLATE = (
 
 PROFESSOR_STRICT_RETRY_SUFFIX = (
     " Retry mode: call save_professors with only key fields "
-    "{name,title,email,phone,research_areas}; keep response concise, max 25 records, "
-    "avoid bio, publications, long arrays, and extra keys."
+    "{name,title,email,phone,research_areas,bio}; keep response concise, max 25 records, "
+    "include a short bio when visible, escape quotes inside JSON strings, "
+    "avoid publications, long arrays, and extra keys."
 )
 
 TOOL_CALL_POLICY_TEMPLATE = "Tool call policy: {policy}"
