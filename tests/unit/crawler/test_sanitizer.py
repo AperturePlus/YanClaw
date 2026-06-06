@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from agents.crawler.sanitizer import (
     contains_self_academician_hint,
     infer_research_areas_from_bio,
@@ -87,6 +89,27 @@ def test_sanitize_professor_payload_ignores_unverified_academician_flag():
 
     assert is_academician is False
     assert cleaned["title"] == "教授"
+
+
+@pytest.mark.parametrize(
+    "research_areas",
+    [
+        "Email",
+        "hmy@uestc.edu.cn",
+        "Email：hmy@uestc.edu.cn",
+    ],
+)
+def test_sanitize_professor_payload_drops_contact_values_from_research_areas(research_areas):
+    cleaned, _ = sanitize_professor_payload(
+        {
+            "name": "何明耘",
+            "title": "教授",
+            "research_areas": research_areas,
+        },
+        org_unit_name="信息与软件工程学院",
+    )
+
+    assert cleaned["research_areas"] is None
 
 
 def test_sanitize_professor_payload_accepts_trusted_snapshot_academician_evidence():
