@@ -1105,6 +1105,30 @@ async def test_upsert_professor_separates_internal_homepage_and_external_link(tm
     await db.close()
 
 
+async def test_upsert_professor_keeps_faculty_platform_as_external_link(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "faculty_platform_external.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "张三",
+                "org_unit_name": "电子科学与工程学院",
+                "org_unit_url": "https://www.ese.uestc.edu.cn/",
+                "source_url": "https://www.ese.uestc.edu.cn/info/1001/1234.htm",
+                "homepage": "https://faculty.uestc.edu.cn/zhangsan/zh_CN/index.htm",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor))).scalar_one()
+        assert professor.homepage == "https://www.ese.uestc.edu.cn/info/1001/1234.htm"
+        assert professor.external_link == "https://faculty.uestc.edu.cn/zhangsan/zh_CN/index.htm"
+
+    await db.close()
+
+
 async def test_get_or_create_org_unit_dedupes_same_name_with_different_urls(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "org_unit_name.db"))
     await db.init_db()

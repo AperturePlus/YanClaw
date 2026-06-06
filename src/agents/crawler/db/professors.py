@@ -18,7 +18,7 @@ from agents.crawler.sanitizer import (
     normalize_org_unit_name,
     normalize_title,
 )
-from agents.crawler.url_heuristics import _is_query_profile_detail_url
+from agents.crawler.url_heuristics import _is_faculty_platform, _is_query_profile_detail_url
 from agents.crawler.db.university import get_or_create_org_unit
 from agents.crawler.db.utils import (
     _merge_org_unit_names,
@@ -480,11 +480,19 @@ def _split_profile_and_external_urls(
             if not external_link:
                 external_link = candidate
             continue
+        if _is_faculty_platform(candidate):
+            if not external_link:
+                external_link = candidate
+            continue
         homepage = _choose_better_profile_url(homepage, normalize_professor_homepage(candidate))
 
     source_homepage = normalize_professor_homepage(source_url)
     if source_homepage:
-        homepage = _choose_better_profile_url(homepage, source_homepage)
+        if _is_faculty_platform(source_homepage):
+            if not external_link:
+                external_link = source_homepage
+        else:
+            homepage = _choose_better_profile_url(homepage, source_homepage)
 
     return homepage, external_link
 

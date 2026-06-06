@@ -4,9 +4,9 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
-from agents.crawler.models import Professor
+from agents.crawler.models import CrawlTask, CrawlTaskKind, Professor, ProfessorAffiliation
 from agents.crawler.sanitizer import contains_self_academician_hint, normalize_name
 from agents.crawler.url_heuristics import (
     _is_explicit_faculty_directory_url,
@@ -16,8 +16,10 @@ from agents.crawler.url_heuristics import (
     _is_query_profile_detail_url,
     _looks_like_retired_content,
     _looks_like_retired_url,
+    _same_site,
     _sanitize_url,
 )
+from agents.crawler.db.professors import normalize_professor_homepage
 
 _FACULTY_CATEGORY_STEMS = frozenset(
     {
@@ -138,7 +140,7 @@ _SNAPSHOT_BIO_STOP_TOKENS = (
 
 _SNAPSHOT_FIELD_BOUNDARY_RE = re.compile(
     r"(?:^|\s+)(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
-    r"研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
+    r"主要研究方向|研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
     re.IGNORECASE,
 )
 
@@ -450,7 +452,7 @@ def _extract_snapshot_title(text: str, name: str) -> str | None:
 
 
 def _extract_snapshot_research_areas(text: str) -> list[str] | None:
-    value = _extract_snapshot_labeled_value(text, ("研究方向", "研究领域", "科研方向"), max_chars=240)
+    value = _extract_snapshot_labeled_value(text, ("主要研究方向", "研究方向", "研究领域", "科研方向"), max_chars=240)
     if not value:
         return None
     value = _truncate_snapshot_value_at_stop(value)
@@ -646,6 +648,8 @@ async def enrich_profiles_with_human(
         fetched.url,
         link_signals=getattr(fetched, "link_signals", ()) or (),
     )
+    db_candidates = await _load_homepage_backfill_detail_urls(self, current, fetched.url)
+    candidates = _merge_ordered_urls(candidates, db_candidates)
     if not candidates:
         return
 
@@ -721,12 +725,21 @@ async def enrich_profiles_with_human(
 
 async def process_detail_urls_with_human(self: Any, urls: list[str], current: Any, skills: str) -> None:
     next_depth = current.depth + 1
-    if not self._within_depth(next_depth):
+    allow_profile_depth = not self._within_depth(next_depth)
+    if allow_profile_depth and next_depth > getattr(self, "max_depth", 0) + 1:
         return
     for url in urls:
+        if allow_profile_depth and not _is_same_site_primary_profile_url(
+            url,
+            start_url=getattr(self, "start_url", ""),
+        ):
+            self._pipeline_stats["detail_profile_depth_gate_skipped"] = int(
+                self._pipeline_stats.get("detail_profile_depth_gate_skipped", 0)
+            ) + 1
+            continue
         if url in self.visited_urls:
             continue
-        fetched = await self._fetch_url(url, next_depth)
+        fetched = await self._fetch_url(url, next_depth, allow_depth_excess=allow_profile_depth)
         if fetched is None:
             continue
         if self._is_retired_page(fetched):
@@ -756,6 +769,102 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
             detail_mode=True,
             requested_url=url,
         )
+
+
+def _merge_ordered_urls(primary: list[str], secondary: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for url in [*primary, *secondary]:
+        normalized = _sanitize_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(normalized)
+    return merged
+
+
+async def _load_homepage_backfill_detail_urls(self: Any, current: Any, current_url: str) -> list[str]:
+    org_unit_name = (getattr(current, "label", "") or "").strip()
+    org_unit_id = getattr(current, "org_unit_id", None)
+    if not org_unit_name and org_unit_id is None:
+        return []
+    async with self.db.session() as session:
+        filters = [
+            Professor.homepage.is_not(None),
+            func.trim(Professor.homepage) != "",
+            or_(Professor.research_areas.is_(None), func.trim(Professor.research_areas) == ""),
+        ]
+        if org_unit_id is not None:
+            filters.append(ProfessorAffiliation.org_unit_id == int(org_unit_id))
+            statement = (
+                select(Professor.homepage)
+                .join(ProfessorAffiliation, ProfessorAffiliation.professor_id == Professor.id)
+                .where(*filters)
+                .order_by(Professor.id.asc())
+            )
+        else:
+            filters.append(Professor.org_unit_name == org_unit_name)
+            statement = select(Professor.homepage).where(*filters).order_by(Professor.id.asc())
+        rows = (await session.execute(statement)).scalars().all()
+        existing_detail_urls = set(
+            (
+                await session.execute(
+                    select(CrawlTask.source_url).where(
+                        CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value,
+                        CrawlTask.org_unit_name == (org_unit_name or "Unknown"),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for raw_url in rows:
+        homepage = _normalize_homepage_backfill_url(
+            raw_url,
+            current_url=current_url,
+            start_url=getattr(self, "start_url", ""),
+        )
+        if not homepage or homepage in seen or homepage in existing_detail_urls:
+            continue
+        seen.add(homepage)
+        urls.append(homepage)
+    if urls:
+        self._pipeline_stats["detail_backfill_homepages_found"] = int(
+            self._pipeline_stats.get("detail_backfill_homepages_found", 0)
+        ) + len(urls)
+        self.logger.debug(
+            "Detail homepage backfill found %s urls org_unit=%s page=%s sample=%s",
+            len(urls),
+            org_unit_name or org_unit_id or "Unknown",
+            current_url,
+            urls[:3],
+        )
+    return urls
+
+
+def _normalize_homepage_backfill_url(raw_url: Any, *, current_url: str, start_url: str) -> str | None:
+    homepage = normalize_professor_homepage(raw_url)
+    if not homepage:
+        return None
+    if not _is_same_site_primary_profile_url(homepage, start_url=start_url or current_url):
+        return None
+    if current_url and not _same_site(homepage, current_url):
+        return None
+    return homepage
+
+
+def _is_same_site_primary_profile_url(url: str, *, start_url: str) -> bool:
+    homepage = normalize_professor_homepage(url)
+    if not homepage:
+        return False
+    if _is_faculty_platform(homepage):
+        return False
+    if start_url and not _same_site(homepage, start_url):
+        return False
+    return _looks_like_profile_detail_url(homepage)
 
 
 def extract_detail_profile_links(

@@ -13,6 +13,7 @@ from agents.crawler import db as crawler_db
 from agents.crawler.agent import (
     CrawlerState,
     CrawlerAgent,
+    _ExtractionTaskItem,
     _QueuedUrl,
     _dedupe_query_terms,
     _is_core_academic_kind,
@@ -26,6 +27,7 @@ from agents.crawler.agent import (
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.agent_detail import extract_detail_profile_record_from_snapshot
 from agents.crawler.fetchers import FetchResult, Fetcher
+from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
     Academician,
     CrawlExtractionFailure,
@@ -262,6 +264,19 @@ UESTC_EMPTY_RESEARCH_EMAIL_DETAIL_TEXT = """当前位置：信息与软件工程
 办公地址：清水河校区主楼
 个人简介：
 何明耘，电子科技大学信息与软件工程学院教师，长期从事教学科研工作，主持和参与多项科研项目。
+代表成果：
+发表论文多篇，指导研究生参与科研训练。
+"""
+
+UESTC_EMPTY_MAIN_RESEARCH_DETAIL_TEXT = """当前位置：自动化工程学院 > 师资队伍 > 教师详情
+## 李四
+姓名：李四
+职称：教授
+主要研究方向：
+电子邮箱：lisi@uestc.edu.cn
+办公电话：028-12345678
+个人简介：
+李四，电子科技大学自动化工程学院教师，长期从事教学科研工作，主持和参与多项科研项目。
 代表成果：
 发表论文多篇，指导研究生参与科研训练。
 """
@@ -1293,6 +1308,18 @@ def test_detail_snapshot_does_not_treat_email_label_as_research_area():
     assert record["name"] == "何明耘"
     assert record.get("research_areas") is None
     assert record["email"] == "hmy@uestc.edu.cn"
+
+
+def test_detail_snapshot_does_not_fabricate_empty_main_research_area():
+    record = extract_detail_profile_record_from_snapshot(
+        UESTC_EMPTY_MAIN_RESEARCH_DETAIL_TEXT,
+        page_url="https://auto.uestc.edu.cn/info/1037/5755.htm",
+    )
+
+    assert record is not None
+    assert record["name"] == "李四"
+    assert record.get("research_areas") is None
+    assert record["email"] == "lisi@uestc.edu.cn"
 
 
 @pytest.mark.live_llm
@@ -2404,6 +2431,117 @@ async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path
     assert detail_url in llm.extract_urls
     assert int(agent._pipeline_stats.get("detail_enqueued", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_processed", 0)) == 1
+    await db.close()
+
+
+async def test_list_page_anchor_links_fill_missing_homepage_before_save(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+
+    class ListLinkHomepageLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="CS",
+                    org_unit_url="https://www.example.edu.cn/cs",
+                    source_url=payload["url"],
+                    professors=[{"name": "张三", "title": "Professor"}],
+                )
+                return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, _fetcher, db = await _agent(tmp_path, ListLinkHomepageLLM())
+    await agent._extract_professors_from_page(
+        _QueuedUrl(list_url, 1, "CS"),
+        FetchResult(
+            list_url,
+            "faculty list [张三](https://www.example.edu.cn/cs/info/1001/ada.htm)",
+            [detail_url],
+            200,
+            link_signals=(LinkSignal(url=detail_url, anchor_text="张三", link_order=1),),
+        ),
+        "save professors",
+        detail_mode=False,
+    )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "张三"))).scalar_one()
+    assert professor.homepage == detail_url
+    assert int(agent._pipeline_stats.get("homepage_filled_from_list_links", 0)) == 1
+    await db.close()
+
+
+async def test_detail_enrichment_backfills_db_homepages_without_detail_tasks(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages={
+            list_url: FetchResult(list_url, "faculty list Ada", [], 200),
+            homepage: FetchResult(homepage, "Ada 教授\n研究方向: systems", [], 200),
+        },
+        fetcher_cls=FakeHumanFetcher,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": homepage,
+                "source_url": list_url,
+            },
+        )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask).where(CrawlTask.source_url == homepage))).scalar_one()
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+    assert task.task_kind == CrawlTaskKind.DETAIL_PAGE.value
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert professor.research_areas == "systems"
+    assert int(agent._pipeline_stats.get("detail_backfill_homepages_found", 0)) == 1
+    await db.close()
+
+
+async def test_profile_detail_depth_exception_does_not_open_normal_followups(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    followup_url = "https://www.example.edu.cn/cs/szdw/more.htm"
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "faculty list [张三](https://www.example.edu.cn/cs/info/1001/ada.htm) [More](https://www.example.edu.cn/cs/szdw/more.htm)",
+            [detail_url, followup_url],
+            200,
+            link_signals=(
+                LinkSignal(url=detail_url, anchor_text="张三", link_order=1),
+                LinkSignal(url=followup_url, anchor_text="More", link_order=2),
+            ),
+        ),
+        detail_url: FetchResult(detail_url, "张三 教授\n研究方向: systems", [], 200),
+        followup_url: FetchResult(followup_url, "faculty more Grace", [], 200),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        max_depth=1,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    assert detail_url in fetcher.calls
+    assert followup_url not in fetcher.calls
+    async with db.session() as session:
+        task_urls = {row.source_url: row.task_kind for row in (await session.execute(select(CrawlTask))).scalars().all()}
+    assert task_urls[detail_url] == CrawlTaskKind.DETAIL_PAGE.value
+    assert followup_url not in task_urls
     await db.close()
 
 
@@ -4645,5 +4783,76 @@ async def test_professor_gate_skips_rszc_without_strong_faculty_evidence(tmp_pat
     )
     assert not keep
     assert keep_reason == ""
+    await db.close()
+
+
+async def test_professor_gate_skips_notice_issuance_title(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    skip, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/1234.htm",
+        text="# 关于印发《教师岗位聘任办法》的通知\n发布时间：2026-01-01\n各单位：",
+    )
+    assert skip
+    assert reason == "notice_issuance_title"
+
+    spaced_skip, spaced_reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/1235.htm",
+        text="关于 印发 教师岗位聘任办法 的 通知\n各学院：",
+    )
+    assert spaced_skip
+    assert spaced_reason == "notice_issuance_title"
+    await db.close()
+
+
+async def test_professor_gate_keeps_profile_with_incidental_notice_words(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    keep, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/teacher-zhang.htm",
+        text=(
+            "# 张三\n"
+            "职称：教授\n"
+            "邮箱：zhangsan@example.edu.cn\n"
+            "研究方向：网络安全。曾参与学院关于印发科研通知材料的整理工作。"
+        ),
+    )
+    assert not keep
+    assert reason == ""
+    await db.close()
+
+
+async def test_run_extraction_task_skips_notice_issuance_without_llm_call(tmp_path):
+    class CountingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            self.calls += 1
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    llm = CountingLLM()
+    agent, _fetcher, db = await _agent(tmp_path, llm)
+    task = _ExtractionTaskItem(
+        task_id=42,
+        university="TestU",
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/info/1010/notice.htm",
+        page_url="https://www.example.edu.cn/cs/info/1010/notice.htm",
+        page_hash="notice",
+        page_text_snapshot="# 关于印发《教师岗位聘任办法》的通知\n各单位：请遵照执行。",
+        allowed_tools=["save_professors"],
+        task_kind=CrawlTaskKind.LIST_PAGE.value,
+    )
+
+    outcome = await agent._run_extraction_task(task, "save professors")
+
+    assert outcome.skipped_by_gate is True
+    assert outcome.skip_reason == "notice_issuance_title"
+    assert outcome.payloads == []
+    assert outcome.invalid_json_events == []
+    assert llm.calls == 0
+    assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) == 1
+    assert int(agent._pipeline_stats.get("llm_calls_total", 0)) == 0
     await db.close()
 

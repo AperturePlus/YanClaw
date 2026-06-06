@@ -35,7 +35,12 @@ from agents.crawler.org_unit_filter import (
     org_unit_filter_item_keys,
 )
 from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
-from agents.crawler.sanitizer import contains_academician_hint, contains_self_academician_hint, normalize_name
+from agents.crawler.sanitizer import (
+    contains_academician_hint,
+    contains_self_academician_hint,
+    normalize_name,
+    normalize_name_key,
+)
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
@@ -73,6 +78,7 @@ from agents.crawler.url_heuristics import (
     _select_balanced_faculty_candidates,
     _url_found_on_page,
 )
+from agents.crawler.db.professors import normalize_professor_homepage
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
@@ -117,6 +123,9 @@ _ACADEMIC_TITLE_TOKENS = (
     "助理教授",
     "高级工程师",
 )
+_NOTICE_ISSUANCE_TITLE_RE = re.compile(
+    r"^关于印发.{1,160}?的通知(?:[（(【\[].{0,80}[\)）】\]])?(?:[。.!！])?$"
+)
 
 
 @dataclass(frozen=True)
@@ -159,6 +168,7 @@ class _ExtractionTaskItem:
     detail_mode: bool = False
     task_kind: str = CrawlTaskKind.LIST_PAGE.value
     recovered: bool = False
+    name_homepage_candidates: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -172,6 +182,8 @@ class _ExtractionOutcome:
     payloads: list[dict[str, Any]]
     invalid_json_events: list[dict[str, Any]]
     content_fallback_used: bool = False
+    skipped_by_gate: bool = False
+    skip_reason: str = ""
 
 
 class CrawlerAgent:
@@ -1975,6 +1987,11 @@ class CrawlerAgent:
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
         allowed_tools = ["save_professors"]
         task_kind = CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value
+        name_homepage_candidates = self._extract_name_homepage_candidates(
+            fetched,
+            source_url=source_url,
+            detail_mode=detail_mode,
+        )
         async with self.db.session() as session:
             row = await crawler_db.upsert_crawl_task(
                 session,
@@ -2021,6 +2038,7 @@ class CrawlerAgent:
                 strict_retry=False,
                 detail_mode=detail_mode,
                 task_kind=str(getattr(row, "task_kind", None) or task_kind),
+                name_homepage_candidates=name_homepage_candidates,
             )
         await llm_queue.put(task)
         self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
@@ -2029,6 +2047,96 @@ class CrawlerAgent:
         else:
             self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
         self._pipeline_stats["queue_depth"] = llm_queue.qsize()
+
+    def _extract_name_homepage_candidates(
+        self,
+        fetched: FetchResult | None,
+        *,
+        source_url: str,
+        detail_mode: bool,
+    ) -> dict[str, str]:
+        if detail_mode or fetched is None:
+            return {}
+        candidates: dict[str, str] = {}
+        signals = getattr(fetched, "link_signals", ()) or ()
+        for sig in signals:
+            anchor = str(getattr(sig, "anchor_text", "") or "").strip()
+            url = str(getattr(sig, "url", "") or "").strip()
+            self._add_name_homepage_candidate(candidates, anchor, url, source_url=source_url)
+        text = str(getattr(fetched, "text", "") or "")
+        for match in re.finditer(r"\[([^\]\n]{1,40})\]\(([^)\s]+)\)", text):
+            self._add_name_homepage_candidate(
+                candidates,
+                match.group(1),
+                match.group(2),
+                source_url=source_url,
+            )
+        return candidates
+
+    def _extract_name_homepage_candidates_from_snapshot(self, snapshot: str, *, source_url: str) -> dict[str, str]:
+        candidates: dict[str, str] = {}
+        for match in re.finditer(r"\[([^\]\n]{1,40})\]\(([^)\s]+)\)", str(snapshot or "")):
+            self._add_name_homepage_candidate(
+                candidates,
+                match.group(1),
+                match.group(2),
+                source_url=source_url,
+            )
+        return candidates
+
+    def _add_name_homepage_candidate(
+        self,
+        candidates: dict[str, str],
+        anchor: str,
+        url: str,
+        *,
+        source_url: str,
+    ) -> None:
+        key = self._name_homepage_anchor_key(anchor)
+        if not key:
+            return
+        homepage = self._normalize_primary_profile_homepage(url, source_url=source_url)
+        if not homepage:
+            return
+        existing = candidates.get(key)
+        if existing and len(existing) >= len(homepage):
+            return
+        candidates[key] = homepage
+
+    def _name_homepage_anchor_key(self, anchor: Any) -> str:
+        cleaned = agent_detail._normalize_anchor_for_name_match(str(anchor or ""))
+        if not cleaned:
+            return ""
+        compact = re.sub(r"[\s·•\-_/|:：,，.。()（）\[\]【】]+", "", cleaned)
+        if not compact:
+            return ""
+        if any(token in compact for token in agent_detail._PERSON_ANCHOR_BLOCKLIST):
+            return ""
+        cjk_chars = re.findall(r"[\u4e00-\u9fff]", compact)
+        if 2 <= len(cjk_chars) <= 4 and len(compact) <= 6:
+            return normalize_name_key(compact)
+        words = re.findall(r"[a-z][a-z'.-]+", cleaned.lower())
+        if 2 <= len(words) <= 4 and len("".join(words)) >= 4:
+            return normalize_name_key(" ".join(words))
+        return ""
+
+    def _normalize_primary_profile_homepage(self, url: Any, *, source_url: str) -> str | None:
+        candidate = str(url or "").strip()
+        if not candidate:
+            return None
+        parsed = urlparse(candidate)
+        if not parsed.scheme or not parsed.netloc:
+            candidate = urljoin(source_url or self.start_url, candidate)
+        homepage = normalize_professor_homepage(candidate)
+        if not homepage:
+            return None
+        if _is_faculty_platform(homepage):
+            return None
+        if not _same_site(homepage, source_url or self.start_url):
+            return None
+        if not agent_detail._looks_like_profile_detail_url(homepage):
+            return None
+        return homepage
 
     async def _recover_pipeline_tasks(
         self,
@@ -2091,6 +2199,14 @@ class CrawlerAgent:
                 detail_mode=detail_mode,
                 task_kind=task_kind,
                 recovered=True,
+                name_homepage_candidates=(
+                    {}
+                    if detail_mode
+                    else self._extract_name_homepage_candidates_from_snapshot(
+                        str(row_data["page_text_snapshot"] or ""),
+                        source_url=str(row_data["source_url"] or row_data["page_url"] or ""),
+                    )
+                ),
             )
             if row_data["status"] == CrawlTaskStatus.RETRY.value:
                 self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
@@ -2234,6 +2350,26 @@ class CrawlerAgent:
             )
         self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
 
+    async def _mark_extraction_task_skipped_by_gate(self, task: _ExtractionTaskItem, reason: str) -> None:
+        async with self.db.session() as session:
+            await crawler_db.set_crawl_task_status(
+                session,
+                task.task_id,
+                status=CrawlTaskStatus.DONE,
+                attempt=task.attempt,
+                last_error=f"skipped_by_gate:{reason or 'unknown'}",
+            )
+        self._pipeline_stats["done"] += 1
+        self._pipeline_stats["processed_tasks"] += 1
+        self._increment_task_kind_stat(task, "skipped")
+        self.logger.info(
+            "Skip extraction task by gate task_id=%s org_unit=%s url=%s reason=%s",
+            task.task_id,
+            task.org_unit_name,
+            task.source_url,
+            reason or "unknown",
+        )
+
     async def _pipeline_llm_worker(
         self,
         llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
@@ -2265,6 +2401,14 @@ class CrawlerAgent:
                     )
 
                 outcome = await self._run_extraction_task(current_task, skills)
+                if outcome.skipped_by_gate:
+                    await self._mark_extraction_task_skipped_by_gate(current_task, outcome.skip_reason)
+                    elapsed_ms = (time.perf_counter() - started) * 1000
+                    self._update_pipeline_timing(elapsed_ms)
+                    self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
+                    llm_queue.task_done()
+                    retry_exhausted = True
+                    break
                 invalid_events = [
                     event for event in outcome.invalid_json_events if event.get("name") == "save_professors"
                 ]
@@ -2447,6 +2591,7 @@ class CrawlerAgent:
                 detail_mode=task.detail_mode,
                 task_kind=task.task_kind,
                 recovered=task.recovered,
+                name_homepage_candidates=task.name_homepage_candidates,
             )
             async with self.db.session() as session:
                 await crawler_db.set_crawl_task_status(
@@ -2493,6 +2638,27 @@ class CrawlerAgent:
         return None
 
     async def _run_extraction_task(self, task: _ExtractionTaskItem, skills: str) -> _ExtractionOutcome:
+        skip_llm, skip_reason = self._should_skip_professor_llm(
+            url=task.page_url or task.source_url,
+            text=task.page_text_snapshot,
+        )
+        if skip_llm:
+            self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
+                self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
+            ) + 1
+            self.logger.info(
+                "Skip professor LLM task by gate task_id=%s url=%s detail_mode=%s reason=%s",
+                task.task_id,
+                task.page_url or task.source_url,
+                task.detail_mode,
+                skip_reason,
+            )
+            return _ExtractionOutcome(
+                payloads=[],
+                invalid_json_events=[],
+                skipped_by_gate=True,
+                skip_reason=skip_reason,
+            )
         instruction = self._build_professor_instruction(task.org_unit_name, detail_mode=task.detail_mode, strict_retry=task.strict_retry)
         allowed_tools = {"save_professors"}
         tool_defs = [tool for tool in get_crawler_tool_definitions() if tool.get("name") in allowed_tools]
@@ -2750,6 +2916,7 @@ class CrawlerAgent:
                 incoming_name,
                 normalized.get("source_url") or task.source_url,
             )
+            self._fill_missing_homepages_from_name_links(normalized, task=task)
             self._infer_academician_flags_from_detail_context(normalized, task=task)
             return normalized
 
@@ -2758,8 +2925,50 @@ class CrawlerAgent:
             normalized["org_unit_url"] = task.org_unit_url
         if not normalized.get("source_url"):
             normalized["source_url"] = task.source_url
+        self._fill_missing_homepages_from_name_links(normalized, task=task)
         self._infer_academician_flags_from_detail_context(normalized, task=task)
         return normalized
+
+    def _fill_missing_homepages_from_name_links(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: _ExtractionTaskItem,
+    ) -> int:
+        name_homepage_candidates = getattr(task, "name_homepage_candidates", None) or {}
+        if getattr(task, "detail_mode", False) or not name_homepage_candidates:
+            return 0
+        professors = payload.get("professors")
+        if not isinstance(professors, list):
+            return 0
+        changed = 0
+        for index, professor in enumerate(professors):
+            if not isinstance(professor, dict):
+                continue
+            if self._has_profile_value(professor.get("homepage")):
+                continue
+            name_key = normalize_name_key(professor.get("name"))
+            if not name_key:
+                continue
+            homepage = name_homepage_candidates.get(name_key)
+            if not homepage:
+                continue
+            updated = dict(professor)
+            updated["homepage"] = homepage
+            professors[index] = updated
+            changed += 1
+        if changed:
+            self._pipeline_stats["homepage_filled_from_list_links"] = int(
+                self._pipeline_stats.get("homepage_filled_from_list_links", 0)
+            ) + changed
+            self.logger.debug(
+                "Filled %s missing professor homepages from list links task_id=%s org_unit=%s source=%s",
+                changed,
+                task.task_id,
+                task.org_unit_name,
+                task.source_url,
+            )
+        return changed
 
     def _infer_academician_flags_from_detail_context(
         self,
@@ -3266,6 +3475,9 @@ class CrawlerAgent:
             "hr",
         )
 
+        if self._looks_like_notice_issuance_page(text):
+            return True, "notice_issuance_title"
+
         has_faculty_signal = ("@" in (text or "")) or any(token in lowered_text for token in faculty_signal_tokens)
         evidence_hits = sum(1 for token in strong_faculty_evidence_tokens if token in lowered_text)
         has_strong_faculty_evidence = ("@" in (text or "")) or evidence_hits >= 2
@@ -3280,6 +3492,25 @@ class CrawlerAgent:
         if noise_ratio >= 0.35 and not has_faculty_signal:
             return True, f"text_noise_ratio={noise_ratio:.2f}"
         return False, ""
+
+    @staticmethod
+    def _looks_like_notice_issuance_page(text: str) -> bool:
+        lines = [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
+        for line in lines[:8]:
+            normalized = CrawlerAgent._normalize_notice_issuance_title_candidate(line)
+            if normalized and _NOTICE_ISSUANCE_TITLE_RE.search(normalized):
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_notice_issuance_title_candidate(line: str) -> str:
+        cleaned = str(line or "").strip()
+        cleaned = re.sub(r"^\s*#{1,6}\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*(?:当前位置|您现在的位置|位置)\s*[:：].*?[>›»]\s*", "", cleaned)
+        cleaned = re.sub(r"^\s*(?:标题|题目)\s*[:：]\s*", "", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        cleaned = cleaned.strip(" \t\r\n\"'“”‘’")
+        return cleaned
 
     async def _extract_professors_from_page(
         self,
@@ -3322,6 +3553,11 @@ class CrawlerAgent:
             self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode),
         )
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+        name_homepage_candidates = self._extract_name_homepage_candidates(
+            fetched,
+            source_url=source_url,
+            detail_mode=detail_mode,
+        )
         task = _ExtractionTaskItem(
             task_id=0,
             university=self.university_name,
@@ -3337,13 +3573,18 @@ class CrawlerAgent:
             strict_retry=False,
             detail_mode=detail_mode,
             task_kind=CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value,
+            name_homepage_candidates=name_homepage_candidates,
         )
         outcome = await self._run_extraction_task(task, skills)
+        if outcome.skipped_by_gate:
+            return self.saved_professors - saved_before
         invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
         if invalid_events and self.invalid_json_max_retry > 0:
             task.attempt = 1
             task.strict_retry = True
             outcome = await self._run_extraction_task(task, skills)
+            if outcome.skipped_by_gate:
+                return self.saved_professors - saved_before
             invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
 
         if invalid_events:
@@ -3531,8 +3772,15 @@ class CrawlerAgent:
         *,
         action: dict[str, Any] | None = None,
         identity_url: str | None = None,
+        allow_depth_excess: bool = False,
     ) -> FetchResult | None:
-        return await self.fetch_scheduler.fetch_url(url, depth, action=action, identity_url=identity_url)
+        return await self.fetch_scheduler.fetch_url(
+            url,
+            depth,
+            action=action,
+            identity_url=identity_url,
+            allow_depth_excess=allow_depth_excess,
+        )
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
         payload = self._parse_json_from_text(content)

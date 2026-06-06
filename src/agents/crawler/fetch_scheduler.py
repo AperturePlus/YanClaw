@@ -23,6 +23,7 @@ class FetchScheduler:
         *,
         action: dict[str, Any] | None = None,
         identity_url: str | None = None,
+        allow_depth_excess: bool = False,
     ) -> FetchResult | None:
         agent = self.agent
         url = _sanitize_url(url)
@@ -38,7 +39,7 @@ class FetchScheduler:
             agent.logger.warning("Skipping invalid URL before fetch: %s", url)
             return None
         url = normalized_url
-        if not agent._within_depth(depth):
+        if not agent._within_depth(depth) and not allow_depth_excess:
             agent.execution_log.append(f"skip depth url={url} depth={depth}")
             agent.logger.info("Skipping %s: depth %s exceeds max_depth=%s", url, depth, agent.max_depth)
             return None
