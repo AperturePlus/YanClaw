@@ -34,6 +34,37 @@ async def test_fetch_returns_result_on_complete():
     assert result.link_signals[0].url == "https://example.edu.cn/page"
 
 
+async def test_fetch_preserves_reported_pagination_states():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    state = {
+        "kind": "form_submit",
+        "state_id": "form:fromWen:fromWenNOWPAGE:2",
+        "label": "fromWen 第 2 页",
+        "page_index": 2,
+        "total_pages": 19,
+        "form_name": "fromWen",
+        "fields": {"fromWenNOWPAGE": "2"},
+        "submit": True,
+        "synthetic_url": "https://example.edu.cn/xylb.jsp?__ycl_page=2",
+        "url": "https://example.edu.cn/xylb.jsp",
+    }
+
+    async def _simulate_human():
+        for _ in range(50):
+            job = await bridge.queue.next(timeout=0.05)
+            if job:
+                bridge.queue.complete(job.id, html="<html><body>ok</body></html>", pagination_states=[state])
+                return
+            await asyncio.sleep(0.02)
+
+    task = asyncio.create_task(_simulate_human())
+    result = await bridge.fetch("https://example.edu.cn/xylb.jsp")
+    await task
+
+    assert [item.page_index for item in result.pagination_states] == [2]
+    assert result.pagination_states[0].synthetic_url.endswith("__ycl_page=2")
+
+
 async def test_fetch_returns_empty_on_skip():
     bridge = HumanFetcherBridge(job_timeout_seconds=5)
 
