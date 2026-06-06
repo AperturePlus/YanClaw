@@ -7,6 +7,7 @@ from agents.crawler.sanitizer import (
     infer_research_areas_from_bio,
     normalize_name,
     normalize_name_key,
+    normalize_title,
     sanitize_professor_payload,
 )
 
@@ -30,6 +31,13 @@ def test_sanitize_professor_payload_normalizes_title_and_nullish_fields():
     assert cleaned["phone"] is None
     assert cleaned["enrollment_pref"] == "PhD Supervisor"
     assert is_academician is False
+
+
+def test_normalize_title_accepts_medical_titles_by_specificity():
+    assert normalize_title("副主任医师") == "副主任医师"
+    assert normalize_title("主任医师") == "主任医师"
+    assert normalize_title("主治医师") == "主治医师"
+    assert normalize_title("住院医师") == "住院医师"
 
 
 def test_sanitize_professor_payload_detects_academician_and_infers_enrollment():

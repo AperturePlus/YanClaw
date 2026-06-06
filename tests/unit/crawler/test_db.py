@@ -129,6 +129,77 @@ async def test_upsert_professor_dedupes_cross_org_unit_by_email_and_tracks_affil
     await db.close()
 
 
+async def test_upsert_professor_upgrades_lecturer_to_medical_senior_title(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "title_upgrade.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "肖力",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.med.uestc.edu.cn",
+                "source_url": "https://www.med.uestc.edu.cn/szdw/dsml.htm",
+                "title": "讲师",
+                "homepage": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "肖力",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.med.uestc.edu.cn",
+                "source_url": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+                "title": "副主任医师",
+                "homepage": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+                "research_areas": "临床护理",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "肖力"))).scalar_one()
+    assert professor.title == "副主任医师"
+    assert professor.research_areas == "临床护理"
+    await db.close()
+
+
+async def test_upsert_professor_does_not_downgrade_medical_title_to_lecturer(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "title_no_downgrade.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "肖力",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.med.uestc.edu.cn",
+                "source_url": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+                "title": "副主任医师",
+                "homepage": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+                "research_areas": "临床护理",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "肖力",
+                "org_unit_name": "医学院",
+                "org_unit_url": "https://www.med.uestc.edu.cn",
+                "source_url": "https://www.med.uestc.edu.cn/szdw/dsml.htm",
+                "title": "讲师",
+                "homepage": "https://www.med.uestc.edu.cn/info/1311/2638.htm",
+            },
+        )
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "肖力"))).scalar_one()
+    assert professor.title == "副主任医师"
+    await db.close()
+
+
 async def test_crawl_page_cache_roundtrips_fetch_result_by_requested_and_final_url(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "page_cache.db"))
     await db.init_db()

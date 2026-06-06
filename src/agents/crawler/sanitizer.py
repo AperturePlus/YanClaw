@@ -21,6 +21,10 @@ _NULLISH_TEXTS = {
 
 _TITLE_RULES: list[tuple[str, tuple[str, ...]]] = [
     ("院士", ("院士", "academician")),
+    ("副主任医师", ("副主任医师", "associate chief physician")),
+    ("主任医师", ("主任医师", "chief physician")),
+    ("主治医师", ("主治医师", "attending physician")),
+    ("住院医师", ("住院医师", "resident physician")),
     ("副教授", ("副教授", "associate professor")),
     ("助理教授", ("助理教授", "assistant professor")),
     ("教授", ("教授", "professor", "chair professor")),

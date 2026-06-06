@@ -394,6 +394,12 @@ def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite:
                 setattr(professor, key, best)
                 changed = True
             continue
+        if key == "title":
+            best = _choose_better_title(current, value)
+            if best and best != current:
+                setattr(professor, key, best)
+                changed = True
+            continue
         if key == "external_link":
             if current in {None, ""}:
                 setattr(professor, key, value)
@@ -454,6 +460,38 @@ def _choose_better_name(current: Any, incoming: Any) -> str:
     if normalize_name_key(current_name) == normalize_name_key(incoming_name) and current_name != incoming_name:
         return incoming_name
     return current_name
+
+
+_TITLE_QUALITY: dict[str, int] = {
+    "院士": 100,
+    "教授": 80,
+    "研究员": 78,
+    "主任医师": 76,
+    "副教授": 70,
+    "副研究员": 68,
+    "副主任医师": 66,
+    "助理教授": 55,
+    "助理研究员": 53,
+    "主治医师": 50,
+    "讲师": 40,
+    "工程师": 35,
+    "住院医师": 30,
+    "博士后": 25,
+}
+
+
+def _choose_better_title(current: Any, incoming: Any) -> str | None:
+    current_title = normalize_title(current)
+    incoming_title = normalize_title(incoming)
+    if not current_title:
+        return incoming_title
+    if not incoming_title:
+        return current_title
+    current_quality = _TITLE_QUALITY.get(current_title, 0)
+    incoming_quality = _TITLE_QUALITY.get(incoming_title, 0)
+    if incoming_quality > current_quality:
+        return incoming_title
+    return current_title
 
 
 def _split_profile_and_external_urls(
