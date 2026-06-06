@@ -86,6 +86,7 @@ async def _handle_complete(request: web.Request) -> web.Response:
             html=html,
             url=body.get("url"),
             title=body.get("title"),
+            pagination_states=body.get("pagination_states") if isinstance(body.get("pagination_states"), list) else None,
         )
     except KeyError:
         return _json_response({"error": "not found"}, status=404)

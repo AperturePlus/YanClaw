@@ -18,6 +18,7 @@ class FetchResult:
     status_code: int
     block_reason: str | None = None
     link_signals: tuple[Any, ...] = ()
+    pagination_states: tuple[Any, ...] = ()
 
 
 class _LinkParser(HTMLParser):
