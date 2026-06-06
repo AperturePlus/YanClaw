@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
@@ -21,6 +23,8 @@ from agents.crawler.agent import (
     _rank_org_unit_page_candidates,
     ORG_UNIT_PAGE_KEYWORDS,
 )
+from agents.crawler.config import CrawlerSettings
+from agents.crawler.agent_detail import extract_detail_profile_record_from_snapshot
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.models import (
     Academician,
@@ -38,7 +42,7 @@ from agents.crawler.models import (
 from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
 from runtime.context import ContextManager
 from runtime.database import DatabaseManager
-from runtime.llm import LLMResult, ToolCallErrorRecord, ToolCallRecord
+from runtime.llm import LLMClient, LLMResult, ToolCallErrorRecord, ToolCallRecord
 from runtime.skills import SkillManager
 from tests.conftest import sqlite_url
 
@@ -165,6 +169,113 @@ class FakeLLMWithFacultyFollowup(FakeLLM):
         if state == "FIND_FACULTY_PAGES":
             return LLMResult('{"links": ["https://www.example.edu.cn/cs/landing"]}')
         return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+YAN_BINYU_DETAIL_TEXT = """## 严斌宇
+计算机系、副院长
+副教授
+四川大学 计算机学院
+学习工作经历
+1993年9月-1997年6月年就读于四川大学物理系，获学士学位。
+1999年9月-2002年6月在四川大学计算机学院攻读研究生，获得工学硕士学位。
+2002年7月至2017年8月，在四川大学电子信息学院，副教授。
+2022年1月-今，四川大学计算机学院（软件学院），副院长，副教授。
+教学情况
+长期工作在教学工作第一线，主讲必修、选修课、全校文化素质公选课课程共四门。
+2020年，主讲的计算机通信与网络课程荣获首批国家级一流课程。
+论文著作
+四川省科技厅，国际合作项目，基于大数据与神经网络深度学习技术的智慧多维学生评价系统研究。
+国家自然科学基金委员会，中韩国际合作交流项目，红外图像超分辨率技术研究。
+国家自然科学基金委员会，面上项目，联合基于学习的超分辨率技术和多传感器超分辨率技术在红外图像复原中的研究。
+管理经验
+2022年1月起任四川大学计算机学院（软件学院）副院长，全面负责本科教学工作。
+"""
+
+
+HOU_CHAOHUAN_DETAIL_TEXT = """[学院首页](../../index.htm) / [师资队伍](../../szdw.htm) / [名师风采](../../szdw/msfc.htm) / [院士](../../szdw/msfc/ys.htm) / 正文
+## 侯朝焕
+日期：2019-01-24 来源： 作者： 浏览：20446 次
+姓名：侯朝焕
+职称：博士生导师/中科院院士 | 职务：
+所在系所： | 电话：010-82547700
+电子邮箱： | 个人主页：
+办公地址：中国科学院声学研究所
+研究方向：声学信号处理、VLSI信号处理、JC电路设计
+![](/__local/2/9A/2C/profile.gif)个人简介
+| **个人简介** 侯朝焕，于1995年当选中国科学院院士，现任中国科学院声学所研究员、博士生导师、中国声学学会名誉理事长，历任中科院信息技术学部副主任、中国声学学会理事长、国家自然科学基金委信息技术科学部主任等职。侯朝焕院士在声学和信息处理领域成果卓越，发表论文200多篇，先后完成12项国家重大项目。
+**项目成果及****获奖荣誉** 侯朝焕院士在声学和信息处理领域成果卓越。
+![](../../2020/img/footLogo.png)
+四川大学计算机学院版权所有 © 2020
+"""
+
+
+SUN_YUAN_DETAIL_TEXT = """[学院首页](../../index.htm) / [师资队伍](../../szdw.htm) / [创新中心](../../szdw/cxzx.htm) / 正文
+## 孙元
+日期：2026-04-17 来源： 作者： 浏览：276 次
+姓名：孙元
+研究方向：多模态智能、AI for CFD
+个人主页：[https://sunyuan-cs.github.io/](https://sunyuan-cs.github.io/)
+电子邮箱：[sunyuan_work@163.com](mailto:sunyuan_work@163.com)，sunyuan@scu.edu.cn
+办公地址：四川大学江安校区多学科交叉创新大楼522室
+**个人简介：**
+孙元，入选四川大学“海纳博士后”资助计划（15名），主要研究方向为多模态智能（多模态学习、图像融合、四足机器人等）与AI for CFD（智能科学计算、物理信息人工智能等）。近年来，共发表学术论文50余篇，其中以第一作者或通讯作者在TIP、TKDE、CVPR、ICML等人工智能领域中科院一区和CCF-A类会议上发表论文近30余篇。
+如对我研究方向感兴趣，并有意和我一起做研究的同学欢迎联系。
+**要求： 1. 对科研工作富有热情、感兴趣；2. 勤奋务实、态度积极。**
+**部分论文：**
+1. Yuan Sun, External Vision Guided Incomplete Multi-view Classification, CVPR 2026.
+![](../../2020/img/footLogo.png)
+四川大学计算机学院版权所有 © 2020
+"""
+
+
+WANG_JINGYU_DETAIL_TEXT = """## 王靖宇
+副研究员
+四川大学空天科学与工程学院
+邮箱：wangjingyu@scu.edu.cn
+研究方向：航空发动机旋转机械数值模拟方法研究
+个人简介：
+王靖宇，四川大学空天科学与工程学院副研究员，主要从事航空发动机旋转机械数值模拟方法、叶轮机械气动热力学与高性能计算方法研究。
+代表成果：
+主持和参与多项航空发动机相关科研项目。
+"""
+
+
+BUAA_TEACHERSHOW_DETAIL_TEXT = """当前位置：软件学院 > 师资队伍 > 教师详情
+## 陈越
+教授
+北京航空航天大学 软件学院
+电子邮箱：chenyue@buaa.edu.cn
+研究方向：软件工程、程序分析、智能软件测试
+个人简介：
+陈越，北京航空航天大学软件学院教师，长期从事软件工程、程序分析与智能软件测试研究，承担本科生和研究生课程教学。
+论文著作：
+近年发表软件工程方向论文多篇。
+"""
+
+
+UESTC_EMPTY_RESEARCH_EMAIL_DETAIL_TEXT = """当前位置：信息与软件工程学院 > 师资队伍 > 教师详情
+## 何明耘
+姓名：何明耘
+职称：教授
+所在系所：信息与软件工程学院
+研究方向： Email：hmy@uestc.edu.cn
+办公地址：清水河校区主楼
+个人简介：
+何明耘，电子科技大学信息与软件工程学院教师，长期从事教学科研工作，主持和参与多项科研项目。
+代表成果：
+发表论文多篇，指导研究生参与科研训练。
+"""
+
+
+SCU_COMPUTER_ROSTER_TEXT = """# 四川大学计算机学院师资队伍
+软件工程系教师列表
+
+| 姓名 | 职称 | 邮箱 | 研究方向 | 个人主页 |
+| --- | --- | --- | --- | --- |
+| 严斌宇 | 副教授 | yanbinyu@scu.edu.cn | 大数据与神经网络深度学习技术、红外图像超分辨率技术 | https://cs.scu.edu.cn/info/1292/17098.htm |
+| 孙元 | 特聘研究员 | sunyuan@scu.edu.cn | 多模态智能、AI for CFD | https://cs.scu.edu.cn/info/1416/19827.htm |
+| 张蕾 | 教授 | zhanglei@scu.edu.cn | 数据库与数据挖掘、智能数据管理 | https://cs.scu.edu.cn/info/1293/18001.htm |
+"""
 
 
 class FakeLLMSubDepartmentProfessor(FakeLLM):
@@ -699,6 +810,510 @@ async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_
     assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
     assert int(agent._pipeline_stats.get("records_created", 0)) == 1
     await db.close()
+
+
+async def test_pipeline_extracts_yan_binyu_profile_from_project_and_bio_sections(tmp_path):
+    class PromptSensitiveYanLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            instruction = payload["instruction"]
+            required_prompt_terms = [
+                "科研项目",
+                "论文著作",
+                "项目题名",
+                "学习工作经历",
+                "教学情况",
+                "管理经验",
+            ]
+            if payload.get("state") != "EXTRACT_PROFESSORS" or not all(
+                term in instruction for term in required_prompt_terms
+            ):
+                return LLMResult("profile analysis without tool call")
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机学院",
+                org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+                source_url=payload["url"],
+                professors=[
+                    {
+                        "name": "严斌宇",
+                        "title": "副教授",
+                        "research_areas": [
+                            "大数据与神经网络深度学习技术",
+                            "红外图像超分辨率技术",
+                            "多传感器超分辨率技术",
+                            "计算机通信与网络",
+                        ],
+                        "bio": "长期工作在教学工作第一线，主讲必修、选修课、全校文化素质公选课课程共四门。2022年1月起任四川大学计算机学院（软件学院）副院长。",
+                    }
+                ],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    homepage = "https://cs.scu.edu.cn/info/1292/17098.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        PromptSensitiveYanLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="yan-binyu-detail",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot=YAN_BINYU_DETAIL_TEXT,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "严斌宇"))).scalar_one()
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert "大数据与神经网络深度学习技术" in professor.research_areas
+    assert "教学工作第一线" in professor.bio
+    assert not any(failure.failure_type == "no_structured_data" for failure in failures)
+    await db.close()
+
+
+async def test_pipeline_keeps_rich_detail_without_payload_recoverable(tmp_path):
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("This is an individual professor profile but I will not call a tool.")
+
+    homepage = "https://cs.scu.edu.cn/info/1292/17098.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="yan-binyu-prose-only",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot=YAN_BINYU_DETAIL_TEXT,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.RETRY.value
+    assert task.last_error == "rich_detail_no_structured_data"
+    assert any(failure.failure_type == "no_structured_data" and failure.resolver == "retry" for failure in failures)
+    await db.close()
+
+
+async def test_pipeline_synthesizes_hou_chaohuan_academician_from_detail_snapshot(tmp_path):
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("This profile is not saved because the office address is outside SCU.")
+
+    homepage = "https://cs.scu.edu.cn/info/1301/13765.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_academician(
+            session,
+            {
+                "name": "侯朝焕",
+                "org_unit_name": "计算机学院",
+                "org_unit_url": "https://cs.scu.edu.cn/",
+                "homepage": homepage,
+            },
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="hou-chaohuan-detail",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot=HOU_CHAOHUAN_DETAIL_TEXT,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+
+    async with db.session() as session:
+        academician = (await session.execute(select(Academician).where(Academician.name == "侯朝焕"))).scalar_one()
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert "声学信号处理" in academician.research_areas
+    assert "1995年当选中国科学院院士" in academician.bio
+    assert academician.phone == "010-82547700"
+    assert not any(failure.failure_type == "no_structured_data" for failure in failures)
+    await db.close()
+
+
+async def test_pipeline_fills_sun_yuan_bio_from_snapshot_after_sparse_invalid_json_retry(tmp_path):
+    class InvalidThenSparseSunLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            self.calls += 1
+            payload = json.loads(messages[-1]["content"])
+            if self.calls == 1:
+                return LLMResult(
+                    "",
+                    invalid_tool_calls=[
+                        ToolCallErrorRecord(
+                            "save_professors",
+                            '{"org_unit_name":"计算机学院","professors":[{"name":"孙元","bio":"孙元，入选四川大学"海纳博士后"资助计划"}]}',
+                            "invalid_json",
+                        )
+                    ],
+                )
+            result = await tool_handlers["save_professors"](
+                org_unit_name="计算机学院",
+                org_unit_url="https://cs.scu.edu.cn/",
+                source_url=payload["url"],
+                professors=[
+                    {
+                        "name": "孙元",
+                        "research_areas": "多模态智能、AI for CFD",
+                    }
+                ],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+
+    homepage = "https://cs.scu.edu.cn/info/1416/19827.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        InvalidThenSparseSunLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="sun-yuan-detail",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot=SUN_YUAN_DETAIL_TEXT,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "孙元"))).scalar_one()
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert "多模态智能" in professor.research_areas
+    assert "海纳博士后" in professor.bio
+    assert professor.homepage == homepage
+    assert professor.external_link == "https://sunyuan-cs.github.io"
+    assert any(failure.failure_type == "invalid_json" and failure.resolver == "retry" for failure in failures)
+    await db.close()
+
+
+async def test_pipeline_marks_plain_detail_without_payload_failed(tmp_path):
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("No extractable structured data.")
+
+    homepage = "https://cs.scu.edu.cn/info/1292/plain.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="计算机学院",
+            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+            source_url=homepage,
+            page_url=homepage,
+            page_hash="plain-detail-prose-only",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="## 严斌宇\n副教授\n四川大学 计算机学院\n",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    assert task.status == CrawlTaskStatus.FAILED.value
+    assert task.last_error == "no_structured_data"
+    assert any(failure.failure_type == "no_structured_data" and failure.resolver == "dropped" for failure in failures)
+    await db.close()
+
+
+def _live_llm_client() -> LLMClient:
+    if os.getenv("YANCLAW_LLM_LIVE_TESTS") != "1":
+        pytest.skip("Set YANCLAW_LLM_LIVE_TESTS=1 to run live LLM prompt validation.")
+    settings = CrawlerSettings()
+    if not settings.openai_api_key:
+        pytest.skip("YANCLAW_OPENAI_API_KEY is empty.")
+
+    return LLMClient(
+        settings.openai_base_url,
+        settings.openai_api_key,
+        settings.openai_model,
+        max_rounds=1,
+        max_concurrent=settings.llm_max_concurrent,
+        min_interval=settings.llm_min_interval_seconds,
+        timeout_seconds=settings.llm_timeout_seconds,
+        temperature=settings.llm_temperature,
+        top_p=settings.llm_top_p,
+        seed=settings.llm_seed,
+    )
+
+
+async def _run_live_llm_task_case(
+    tmp_path,
+    *,
+    homepage: str,
+    snapshot: str,
+    expected_names: tuple[str, ...],
+    entity_model: type[Professor] | type[Academician],
+    task_kind: CrawlTaskKind,
+    university_name: str,
+    start_url: str,
+    location: str,
+    org_unit_name: str,
+    org_unit_url: str,
+):
+    task_kind_value = task_kind.value
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        _live_llm_client(),
+        pages={},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    agent.university_name = university_name
+    agent.start_url = start_url
+    agent.location = location
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university=university_name,
+            org_unit_name=org_unit_name,
+            org_unit_url=org_unit_url,
+            source_url=homepage,
+            page_url=homepage,
+            page_hash=hashlib.sha1(f"{homepage}:{task_kind_value}".encode("utf-8")).hexdigest(),
+            task_kind=task_kind,
+            page_text_snapshot=snapshot,
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=180)
+
+    async with db.session() as session:
+        entities = (
+            await session.execute(select(entity_model).where(entity_model.name.in_(expected_names)))
+        ).scalars().all()
+        task = (await session.execute(select(CrawlTask))).scalar_one()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    entities_by_name = {entity.name: entity for entity in entities}
+    missing = [name for name in expected_names if name not in entities_by_name]
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert not missing
+    result = SimpleNamespace(
+        entity=entities_by_name[expected_names[0]],
+        entities=entities_by_name,
+        task=SimpleNamespace(status=task.status, last_error=task.last_error, task_kind=task.task_kind),
+        failures=[
+            SimpleNamespace(failure_type=failure.failure_type, resolver=failure.resolver) for failure in failures
+        ],
+        stats=dict(agent._pipeline_stats),
+    )
+    await db.close()
+    return result
+
+
+async def _run_live_llm_detail_case(
+    tmp_path,
+    *,
+    homepage: str,
+    snapshot: str,
+    expected_name: str,
+    entity_model: type[Professor] | type[Academician],
+    university_name: str = "四川大学",
+    start_url: str = "https://www.scu.edu.cn/",
+    location: str = "成都",
+    org_unit_name: str = "计算机学院",
+    org_unit_url: str = "https://cs.scu.edu.cn/szdw/rjgcx.htm",
+):
+    return await _run_live_llm_task_case(
+        tmp_path,
+        homepage=homepage,
+        snapshot=snapshot,
+        expected_names=(expected_name,),
+        entity_model=entity_model,
+        task_kind=CrawlTaskKind.DETAIL_PAGE,
+        university_name=university_name,
+        start_url=start_url,
+        location=location,
+        org_unit_name=org_unit_name,
+        org_unit_url=org_unit_url,
+    )
+
+
+@pytest.mark.live_llm
+async def test_live_llm_yan_binyu_detail_prompt_calls_save_professors(tmp_path):
+    result = await _run_live_llm_detail_case(
+        tmp_path,
+        homepage="https://cs.scu.edu.cn/info/1292/17098.htm",
+        snapshot=YAN_BINYU_DETAIL_TEXT,
+        expected_name="严斌宇",
+        entity_model=Professor,
+    )
+    professor = result.entity
+    assert professor.research_areas or professor.bio
+    assert int(result.stats.get("detail_snapshot_payloads_synthesized", 0)) == 0
+
+
+@pytest.mark.live_llm
+async def test_live_llm_hou_chaohuan_detail_snapshot_fills_academician_fields(tmp_path):
+    result = await _run_live_llm_detail_case(
+        tmp_path,
+        homepage="https://cs.scu.edu.cn/info/1301/13765.htm",
+        snapshot=HOU_CHAOHUAN_DETAIL_TEXT,
+        expected_name="侯朝焕",
+        entity_model=Academician,
+        org_unit_url="https://cs.scu.edu.cn/",
+    )
+    academician = result.entity
+    assert academician.research_areas
+    assert academician.bio
+
+
+@pytest.mark.live_llm
+async def test_live_llm_sun_yuan_detail_snapshot_fills_bio(tmp_path):
+    result = await _run_live_llm_detail_case(
+        tmp_path,
+        homepage="https://cs.scu.edu.cn/info/1416/19827.htm",
+        snapshot=SUN_YUAN_DETAIL_TEXT,
+        expected_name="孙元",
+        entity_model=Professor,
+        org_unit_url="https://cs.scu.edu.cn/",
+    )
+    professor = result.entity
+    assert professor.research_areas
+    assert professor.bio
+
+
+@pytest.mark.live_llm
+async def test_live_llm_scu_teamlist_query_detail_saves_professor(tmp_path):
+    result = await _run_live_llm_detail_case(
+        tmp_path,
+        homepage="https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854",
+        snapshot=WANG_JINGYU_DETAIL_TEXT,
+        expected_name="王靖宇",
+        entity_model=Professor,
+        org_unit_name="空天科学与工程学院",
+        org_unit_url="https://saa.scu.edu.cn/teamlist.htm",
+    )
+    professor = result.entity
+    assert "航空发动机旋转机械数值模拟方法研究" in (professor.research_areas or "")
+    assert int(result.stats.get("detail_snapshot_payloads_synthesized", 0)) == 0
+
+
+@pytest.mark.live_llm
+async def test_live_llm_buaa_teachershouw_news_query_detail_saves_professor(tmp_path):
+    result = await _run_live_llm_detail_case(
+        tmp_path,
+        homepage="https://soft.buaa.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=9633",
+        snapshot=BUAA_TEACHERSHOW_DETAIL_TEXT,
+        expected_name="陈越",
+        entity_model=Professor,
+        university_name="北京航空航天大学",
+        start_url="https://www.buaa.edu.cn/",
+        location="北京",
+        org_unit_name="软件学院",
+        org_unit_url="https://soft.buaa.edu.cn/tu-list-1.jsp?urltype=tree.TreeTempUrl&wbtreeid=1262",
+    )
+    professor = result.entity
+    assert "软件工程" in (professor.research_areas or "")
+    assert int(result.stats.get("detail_snapshot_payloads_synthesized", 0)) == 0
+
+
+def test_detail_snapshot_does_not_treat_email_label_as_research_area():
+    record = extract_detail_profile_record_from_snapshot(
+        UESTC_EMPTY_RESEARCH_EMAIL_DETAIL_TEXT,
+        page_url="https://sise.uestc.edu.cn/info/1037/5755.htm",
+    )
+
+    assert record is not None
+    assert record["name"] == "何明耘"
+    assert record.get("research_areas") is None
+    assert record["email"] == "hmy@uestc.edu.cn"
+
+
+@pytest.mark.live_llm
+async def test_live_llm_scu_computer_roster_list_snapshot_saves_professors(tmp_path):
+    result = await _run_live_llm_task_case(
+        tmp_path,
+        homepage="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+        snapshot=SCU_COMPUTER_ROSTER_TEXT,
+        expected_names=("严斌宇", "孙元", "张蕾"),
+        entity_model=Professor,
+        task_kind=CrawlTaskKind.LIST_PAGE,
+        university_name="四川大学",
+        start_url="https://www.scu.edu.cn/",
+        location="成都",
+        org_unit_name="计算机学院",
+        org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
+    )
+    assert "大数据" in (result.entities["严斌宇"].research_areas or "")
+    assert "多模态智能" in (result.entities["孙元"].research_areas or "")
+    assert "数据库" in (result.entities["张蕾"].research_areas or "")
+    assert int(result.stats.get("records_created", 0)) >= 3
 
 
 async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_serializes(tmp_path):
@@ -1710,9 +2325,15 @@ def test_professor_prompt_templates_include_retry_constraints():
     )
 
     assert CRAWLER_SYSTEM_PROMPT.startswith("You are a cautious university faculty crawler")
-    assert "Only save records that include at least one of email/phone/research_areas" in detail_instruction
+    assert "Only save records that include at least one of email/phone/research_areas/bio" in detail_instruction
+    assert "科研项目/论文著作/代表论文/科研成果/项目题名" in detail_instruction
+    assert "学习工作经历/工作经历/教育经历/教学情况/管理经验" in detail_instruction
+    assert "do not return explanatory prose only" in detail_instruction
+    assert "名师风采/院士" in detail_instruction
     assert "save visible names and academic titles" in list_instruction
-    assert "avoid bio, publications, long arrays, and extra keys" in retry_instruction
+    assert "include a short bio when visible" in retry_instruction
+    assert "escape quotes inside JSON strings" in retry_instruction
+    assert "avoid bio" not in retry_instruction
     assert dynamic_policy == "Tool call policy: Only call save_professors. Do not invent tool names. Keep output short and strict JSON."
 
 
@@ -2201,9 +2822,10 @@ async def test_professor_instruction_distinguishes_list_and_detail_field_strictn
 
     assert "save visible names and academic titles" in list_instruction
     assert "email/phone/research_areas are absent" in list_instruction
-    assert "Only save records that include at least one of email/phone/research_areas" in detail_instruction
+    assert "Only save records that include at least one of email/phone/research_areas/bio" in detail_instruction
     assert "linked anchor text" in detail_instruction
-    assert "个人简介/简介/个人概况" in detail_instruction
+    assert "科研项目/论文著作/代表论文/科研成果/项目题名" in detail_instruction
+    assert "个人简介/简介/个人概况/学习工作经历/工作经历/教育经历/教学情况/管理经验" in detail_instruction
     await db.close()
 
 

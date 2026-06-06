@@ -39,3 +39,6 @@ packages = ["src/runtime", "src/agents"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live_llm: live LLM prompt validation tests gated by YANCLAW_LLM_LIVE_TESTS=1",
+]
