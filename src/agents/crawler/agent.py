@@ -34,6 +34,7 @@ from agents.crawler.org_unit_filter import (
     normalize_org_unit_match_text,
     org_unit_filter_item_keys,
 )
+from agents.crawler.professor_noise import should_skip_professor_llm
 from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
 from agents.crawler.sanitizer import (
     contains_academician_hint,
@@ -123,11 +124,6 @@ _ACADEMIC_TITLE_TOKENS = (
     "助理教授",
     "高级工程师",
 )
-_NOTICE_ISSUANCE_TITLE_RE = re.compile(
-    r"^关于印发.{1,160}?的通知(?:[（(【\[].{0,80}[\)）】\]])?(?:[。.!！])?$"
-)
-
-
 @dataclass(frozen=True)
 class AgentResult:
     university_name: str
@@ -203,7 +199,7 @@ class CrawlerAgent:
         logger_name: str | None = None,
         max_depth: int = 4,
         max_backtracks: int = 3,
-        max_org_units_per_university: int = 50,
+        max_org_units_per_university: int = 100,
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
         detail_enrich_enabled: bool = True,
@@ -3389,128 +3385,7 @@ class CrawlerAgent:
         return False, ""
 
     def _should_skip_professor_llm(self, *, url: str, text: str) -> tuple[bool, str]:
-        lowered_url = (url or "").lower()
-        lowered_text = (text or "").lower()
-
-        strong_noise_url_tokens = (
-            "/news",
-            "/notice",
-            "/tzgg",
-            "/gonggao",
-            "/announcement",
-            "/policy",
-            "/zcwj",
-            "规章制度",
-            "/renshi",
-            "/rszc",
-            "/hr",
-            "/rczp",
-            "/zhaopin",
-            "/jobs",
-            "/dangjian",
-            "/party",
-            "/xsgz",
-            "/zsjy",
-        )
-        faculty_signal_tokens = (
-            "faculty",
-            "teacher",
-            "staff",
-            "professor",
-            "research",
-            "email",
-            "phone",
-            "导师",
-            "教师",
-            "师资",
-            "教授",
-            "副教授",
-            "讲师",
-            "研究员",
-            "邮箱",
-            "电话",
-            "研究方向",
-            "博导",
-            "硕导",
-        )
-        strong_faculty_evidence_tokens = (
-            "email",
-            "mail",
-            "phone",
-            "tel",
-            "professor",
-            "associate professor",
-            "assistant professor",
-            "lecturer",
-            "researcher",
-            "\u5bfc\u5e08",
-            "\u6559\u5e08",
-            "\u6559\u6388",
-            "\u526f\u6559\u6388",
-            "\u8bb2\u5e08",
-            "\u7814\u7a76\u5458",
-            "\u90ae\u7bb1",
-            "\u7535\u8bdd",
-            "\u535a\u5bfc",
-            "\u7855\u5bfc",
-        )
-        noise_text_tokens = (
-            "通知",
-            "公告",
-            "新闻",
-            "政策",
-            "规章制度",
-            "规章",
-            "招聘",
-            "人事",
-            "党建",
-            "招生",
-            "就业",
-            "notice",
-            "announcement",
-            "news",
-            "policy",
-            "recruit",
-            "personnel",
-            "hr",
-        )
-
-        if self._looks_like_notice_issuance_page(text):
-            return True, "notice_issuance_title"
-
-        has_faculty_signal = ("@" in (text or "")) or any(token in lowered_text for token in faculty_signal_tokens)
-        evidence_hits = sum(1 for token in strong_faculty_evidence_tokens if token in lowered_text)
-        has_strong_faculty_evidence = ("@" in (text or "")) or evidence_hits >= 2
-        if any(token in lowered_url for token in strong_noise_url_tokens) and not has_strong_faculty_evidence:
-            return True, "url_noise_token"
-
-        lines = [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
-        if not lines:
-            return False, ""
-        noise_hits = sum(1 for line in lines if any(token in line.lower() for token in noise_text_tokens))
-        noise_ratio = noise_hits / float(len(lines))
-        if noise_ratio >= 0.35 and not has_faculty_signal:
-            return True, f"text_noise_ratio={noise_ratio:.2f}"
-        return False, ""
-
-    @staticmethod
-    def _looks_like_notice_issuance_page(text: str) -> bool:
-        lines = [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
-        for line in lines[:8]:
-            normalized = CrawlerAgent._normalize_notice_issuance_title_candidate(line)
-            if normalized and _NOTICE_ISSUANCE_TITLE_RE.search(normalized):
-                return True
-        return False
-
-    @staticmethod
-    def _normalize_notice_issuance_title_candidate(line: str) -> str:
-        cleaned = str(line or "").strip()
-        cleaned = re.sub(r"^\s*#{1,6}\s*", "", cleaned)
-        cleaned = re.sub(r"^\s*(?:当前位置|您现在的位置|位置)\s*[:：].*?[>›»]\s*", "", cleaned)
-        cleaned = re.sub(r"^\s*(?:标题|题目)\s*[:：]\s*", "", cleaned)
-        cleaned = re.sub(r"\s+", "", cleaned)
-        cleaned = cleaned.strip(" \t\r\n\"'“”‘’")
-        return cleaned
+        return should_skip_professor_llm(url=url, text=text)
 
     async def _extract_professors_from_page(
         self,
