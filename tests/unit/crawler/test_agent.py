@@ -282,6 +282,18 @@ UESTC_EMPTY_MAIN_RESEARCH_DETAIL_TEXT = """当前位置：自动化工程学院 
 """
 
 
+UESTC_MEDICAL_EMPTY_SHELL_DETAIL_TEXT = """__ [![logo](../../images/logo.png)](../../index.htm)
+* [学院概况](../../xygk/xyjj.htm)
+* [师资队伍](../../szdw/dsml.htm)
+* [教师名录](../../szdw/jsml.htm)
+## 姓名：何芳
+姓名：何芳
+职称：研究员
+教师简介
+校园地图 VI系统 校园图库 网上服务大厅 校友邮箱 图书馆 电子科技大学医学院
+"""
+
+
 SCU_COMPUTER_ROSTER_TEXT = """# 四川大学计算机学院师资队伍
 软件工程系教师列表
 
@@ -1320,6 +1332,15 @@ def test_detail_snapshot_does_not_fabricate_empty_main_research_area():
     assert record["name"] == "李四"
     assert record.get("research_areas") is None
     assert record["email"] == "lisi@uestc.edu.cn"
+
+
+def test_detail_snapshot_rejects_uestc_medical_empty_shell_navigation_bio():
+    record = extract_detail_profile_record_from_snapshot(
+        UESTC_MEDICAL_EMPTY_SHELL_DETAIL_TEXT,
+        page_url="https://www.med.uestc.edu.cn/info/1310/2404.htm",
+    )
+
+    assert record is None
 
 
 @pytest.mark.live_llm
@@ -2503,6 +2524,116 @@ async def test_detail_enrichment_backfills_db_homepages_without_detail_tasks(tmp
         professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
     assert task.task_kind == CrawlTaskKind.DETAIL_PAGE.value
     assert task.status == CrawlTaskStatus.DONE.value
+    assert professor.research_areas == "systems"
+    assert int(agent._pipeline_stats.get("detail_backfill_homepages_found", 0)) == 1
+    await db.close()
+
+
+async def test_detail_enrichment_existing_detail_tasks_do_not_consume_cap(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    existing_detail = "https://www.example.edu.cn/cs/info/1001/existing.htm"
+    new_detail = "https://www.example.edu.cn/cs/info/1001/new.htm"
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "faculty list [旧师](https://www.example.edu.cn/cs/info/1001/existing.htm) [Ada](https://www.example.edu.cn/cs/info/1001/new.htm)",
+            [existing_detail, new_detail],
+            200,
+            link_signals=(
+                LinkSignal(url=existing_detail, anchor_text="旧师", link_order=1),
+                LinkSignal(url=new_detail, anchor_text="Ada", link_order=2),
+            ),
+        ),
+        new_detail: FetchResult(new_detail, "Ada 教授\n研究方向: systems", [], 200),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        detail_profile_hard_cap_per_org_unit=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=existing_detail,
+            page_url=existing_detail,
+            page_hash=hashlib.sha1(f"{existing_detail}|old".encode("utf-8")).hexdigest(),
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="old",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.DONE,
+        )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    assert existing_detail not in fetcher.calls
+    assert new_detail in fetcher.calls
+    async with db.session() as session:
+        task = (await session.execute(select(CrawlTask).where(CrawlTask.source_url == new_detail))).scalar_one()
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+    assert task.task_kind == CrawlTaskKind.DETAIL_PAGE.value
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert professor.research_areas == "systems"
+    assert int(agent._pipeline_stats.get("detail_links_skipped_existing_task", 0)) == 1
+    await db.close()
+
+
+async def test_sparse_homepage_backfill_is_prioritized_over_large_candidate_list(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    noisy_detail = "https://www.example.edu.cn/cs/info/1001/noisy.htm"
+    sparse_homepage = "https://www.example.edu.cn/cs/info/1001/sparse.htm"
+    pages = {
+        list_url: FetchResult(
+            list_url,
+            "faculty list [旧师](https://www.example.edu.cn/cs/info/1001/noisy.htm)",
+            [noisy_detail],
+            200,
+            link_signals=(LinkSignal(url=noisy_detail, anchor_text="旧师", link_order=1),),
+        ),
+        sparse_homepage: FetchResult(sparse_homepage, "Ada 教授\n研究方向: systems", [], 200),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLMResearchDetail(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        detail_profile_hard_cap_per_org_unit=1,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "homepage": sparse_homepage,
+                "source_url": list_url,
+            },
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://www.example.edu.cn/cs",
+            source_url=noisy_detail,
+            page_url=noisy_detail,
+            page_hash=hashlib.sha1(f"{noisy_detail}|old".encode("utf-8")).hexdigest(),
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="old",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.DONE,
+        )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    assert sparse_homepage in fetcher.calls
+    assert noisy_detail not in fetcher.calls
+    async with db.session() as session:
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
     assert professor.research_areas == "systems"
     assert int(agent._pipeline_stats.get("detail_backfill_homepages_found", 0)) == 1
     await db.close()
@@ -4820,6 +4951,74 @@ async def test_professor_gate_keeps_profile_with_incidental_notice_words(tmp_pat
     await db.close()
 
 
+async def test_professor_gate_skips_event_kickoff_phrase(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    skip, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/activity.htm",
+        text="学院举办教师发展活动。上午九点，活动正式拉开帷幕，师生代表参加。",
+    )
+    assert skip
+    assert reason == "event_kickoff_phrase"
+
+    spaced_skip, spaced_reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/activity-2.htm",
+        text="学院举办教师发展活动。活动 正式\n拉开帷幕，师生代表参加。",
+    )
+    assert spaced_skip
+    assert spaced_reason == "event_kickoff_phrase"
+    await db.close()
+
+
+async def test_professor_gate_keeps_profile_with_partial_event_phrase(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    keep, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/teacher-li.htm",
+        text=(
+            "# 李四\n"
+            "职称：教授\n"
+            "邮箱：lisi@example.edu.cn\n"
+            "研究方向：智能制造。课程建设工作拉开帷幕后，团队持续推进。"
+        ),
+    )
+    assert not keep
+    assert reason == ""
+    await db.close()
+
+
+async def test_professor_gate_skips_recent_school_news_opening(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    skip, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/news.htm",
+        text="近日，我院举办青年教师教学研讨活动，学院领导和教师代表参加。",
+    )
+    assert skip
+    assert reason == "recent_school_news_opening"
+
+    school_skip, school_reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/news-2.htm",
+        text="# 近日我校召开人才工作会议\n会议围绕教师队伍建设展开。",
+    )
+    assert school_skip
+    assert school_reason == "recent_school_news_opening"
+    await db.close()
+
+
+async def test_professor_gate_keeps_profile_with_later_recent_school_phrase(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    keep, reason = agent._should_skip_professor_llm(
+        url="https://www.example.edu.cn/szdw/info/1010/teacher-wang.htm",
+        text=(
+            "# 王五\n"
+            "职称：教授\n"
+            "邮箱：wangwu@example.edu.cn\n"
+            "研究方向：机器学习。近日，我院相关平台发布了他的团队成果报道。"
+        ),
+    )
+    assert not keep
+    assert reason == ""
+    await db.close()
+
+
 async def test_run_extraction_task_skips_notice_issuance_without_llm_call(tmp_path):
     class CountingLLM(FakeLLM):
         def __init__(self):
@@ -4849,6 +5048,80 @@ async def test_run_extraction_task_skips_notice_issuance_without_llm_call(tmp_pa
 
     assert outcome.skipped_by_gate is True
     assert outcome.skip_reason == "notice_issuance_title"
+    assert outcome.payloads == []
+    assert outcome.invalid_json_events == []
+    assert llm.calls == 0
+    assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) == 1
+    assert int(agent._pipeline_stats.get("llm_calls_total", 0)) == 0
+    await db.close()
+
+
+async def test_run_extraction_task_skips_recent_school_news_opening_without_llm_call(tmp_path):
+    class CountingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            self.calls += 1
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    llm = CountingLLM()
+    agent, _fetcher, db = await _agent(tmp_path, llm)
+    task = _ExtractionTaskItem(
+        task_id=44,
+        university="TestU",
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/info/1010/news.htm",
+        page_url="https://www.example.edu.cn/cs/info/1010/news.htm",
+        page_hash="recent-news",
+        page_text_snapshot="近日我院举办教师发展活动，学院领导和教师代表参加。",
+        allowed_tools=["save_professors"],
+        task_kind=CrawlTaskKind.LIST_PAGE.value,
+    )
+
+    outcome = await agent._run_extraction_task(task, "save professors")
+
+    assert outcome.skipped_by_gate is True
+    assert outcome.skip_reason == "recent_school_news_opening"
+    assert outcome.payloads == []
+    assert outcome.invalid_json_events == []
+    assert llm.calls == 0
+    assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) == 1
+    assert int(agent._pipeline_stats.get("llm_calls_total", 0)) == 0
+    await db.close()
+
+
+async def test_run_extraction_task_skips_event_kickoff_without_llm_call(tmp_path):
+    class CountingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            self.calls += 1
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    llm = CountingLLM()
+    agent, _fetcher, db = await _agent(tmp_path, llm)
+    task = _ExtractionTaskItem(
+        task_id=43,
+        university="TestU",
+        org_unit_name="CS",
+        org_unit_url="https://www.example.edu.cn/cs",
+        source_url="https://www.example.edu.cn/cs/info/1010/activity.htm",
+        page_url="https://www.example.edu.cn/cs/info/1010/activity.htm",
+        page_hash="event",
+        page_text_snapshot="学院举办教师发展活动。活动正式拉开帷幕，师生代表参加。",
+        allowed_tools=["save_professors"],
+        task_kind=CrawlTaskKind.LIST_PAGE.value,
+    )
+
+    outcome = await agent._run_extraction_task(task, "save professors")
+
+    assert outcome.skipped_by_gate is True
+    assert outcome.skip_reason == "event_kickoff_phrase"
     assert outcome.payloads == []
     assert outcome.invalid_json_events == []
     assert llm.calls == 0

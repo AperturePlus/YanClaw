@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy import func, or_, select
 
-from agents.crawler.models import CrawlTask, CrawlTaskKind, Professor, ProfessorAffiliation
+from agents.crawler.models import CrawlTask, CrawlTaskKind, OrgUnit, Professor, ProfessorAffiliation
 from agents.crawler.sanitizer import contains_self_academician_hint, normalize_name
 from agents.crawler.url_heuristics import (
     _is_explicit_faculty_directory_url,
@@ -138,8 +138,22 @@ _SNAPSHOT_BIO_STOP_TOKENS = (
     "---",
 )
 
+_SNAPSHOT_NAVIGATION_BIO_TOKENS = (
+    "校园地图",
+    "VI系统",
+    "校园图库",
+    "网上服务大厅",
+    "校友邮箱",
+    "图书馆",
+)
+
 _SNAPSHOT_FIELD_BOUNDARY_RE = re.compile(
     r"(?:^|\s+)(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
+    r"主要研究方向|研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
+    re.IGNORECASE,
+)
+_SNAPSHOT_LEADING_FIELD_LABEL_RE = re.compile(
+    r"^\s*(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
     r"主要研究方向|研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
     re.IGNORECASE,
 )
@@ -418,6 +432,8 @@ def _clean_snapshot_name(value: str) -> str:
 
 def _looks_like_person_name(value: str) -> bool:
     text = (value or "").strip()
+    if _SNAPSHOT_LEADING_FIELD_LABEL_RE.match(text):
+        return False
     if not text or any(token in text for token in _PERSON_ANCHOR_BLOCKLIST):
         return False
     cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
@@ -437,6 +453,10 @@ def _extract_snapshot_title(text: str, name: str) -> str | None:
     window = text[name_index : name_index + 260]
     for token in (
         "院士",
+        "副主任医师",
+        "主任医师",
+        "主治医师",
+        "住院医师",
         "副研究员",
         "研究员",
         "副教授",
@@ -544,6 +564,8 @@ def _extract_snapshot_bio(text: str, name: str) -> str | None:
                 break
         bio = " ".join(fragments).strip()
         bio = re.sub(r"\s+", " ", bio).strip("：:；;，,。 ")
+        if _looks_like_snapshot_navigation_bio(bio):
+            return None
         if len(bio) > 900:
             bio = bio[:900].rstrip("，,；;。 ") + "。"
         if bio and name in bio:
@@ -551,6 +573,14 @@ def _extract_snapshot_bio(text: str, name: str) -> str | None:
         if bio and len(bio) >= 20:
             return bio
     return None
+
+
+def _looks_like_snapshot_navigation_bio(value: str) -> bool:
+    text = re.sub(r"\s+", "", str(value or ""))
+    if not text or len(text) > 220:
+        return False
+    hits = sum(1 for token in _SNAPSHOT_NAVIGATION_BIO_TOKENS if token in text)
+    return hits >= 3
 
 
 def _strip_snapshot_bio_heading(value: str) -> str:
@@ -648,8 +678,14 @@ async def enrich_profiles_with_human(
         fetched.url,
         link_signals=getattr(fetched, "link_signals", ()) or (),
     )
-    db_candidates = await _load_homepage_backfill_detail_urls(self, current, fetched.url)
-    candidates = _merge_ordered_urls(candidates, db_candidates)
+    existing_detail_task_urls = await _load_existing_detail_task_urls(self, current)
+    db_candidates = await _load_homepage_backfill_detail_urls(
+        self,
+        current,
+        fetched.url,
+        existing_detail_task_urls=existing_detail_task_urls,
+    )
+    candidates = _merge_ordered_urls(db_candidates, candidates)
     if not candidates:
         return
 
@@ -664,20 +700,26 @@ async def enrich_profiles_with_human(
     pending: list[str] = []
     skipped_by_name = 0
     skipped_reserved = 0
+    skipped_existing_task = 0
     for link in candidates:
         if len(pending) >= remaining:
             break
         normalized = _sanitize_url(link)
+        if not normalized:
+            continue
+        if normalized in existing_detail_task_urls:
+            skipped_existing_task += 1
+            continue
         if normalized in reserved:
             skipped_reserved += 1
             continue
-        if link in self._detail_visited_urls or link in self.visited_urls:
+        if normalized in self._detail_visited_urls or normalized in self.visited_urls:
             continue
-        if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(link), enriched_names):
+        if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(normalized) or sig_by_url.get(link), enriched_names):
             skipped_by_name += 1
             continue
-        self._detail_visited_urls.add(link)
-        pending.append(link)
+        self._detail_visited_urls.add(normalized)
+        pending.append(normalized)
 
     if skipped_by_name:
         self._pipeline_stats["detail_links_dropped_already_enriched"] = int(
@@ -699,21 +741,37 @@ async def enrich_profiles_with_human(
             current.label or "Unknown",
             fetched.url,
         )
+    if skipped_existing_task:
+        self._pipeline_stats["detail_links_skipped_existing_task"] = int(
+            self._pipeline_stats.get("detail_links_skipped_existing_task", 0)
+        ) + skipped_existing_task
+        self.logger.debug(
+            "Detail enrichment skipped %s links with existing detail tasks org_unit=%s page=%s",
+            skipped_existing_task,
+            current.label or "Unknown",
+            fetched.url,
+        )
 
     if not pending:
         if candidates and skipped_reserved < len(candidates):
             self._pipeline_stats["detail_pending_empty_with_candidates"] = int(
                 self._pipeline_stats.get("detail_pending_empty_with_candidates", 0)
             ) + 1
-            sample_visited = [c for c in candidates if c in self._detail_visited_urls or c in self.visited_urls][:3]
+            sample_visited = [
+                c
+                for c in candidates
+                if c in self._detail_visited_urls or c in self.visited_urls or c in existing_detail_task_urls
+            ][:3]
             self.logger.warning(
                 "Detail enrichment found %s candidates but produced 0 pending org_unit=%s page=%s "
-                "(all already visited or matched enriched names; sample=%s skipped_by_name=%s)",
+                "(all already visited, already tasked, or matched enriched names; sample=%s skipped_by_name=%s "
+                "skipped_existing_task=%s)",
                 len(candidates),
                 current.label or "Unknown",
                 fetched.url,
                 sample_visited,
                 skipped_by_name,
+                skipped_existing_task,
             )
         return
     self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
@@ -783,7 +841,32 @@ def _merge_ordered_urls(primary: list[str], secondary: list[str]) -> list[str]:
     return merged
 
 
-async def _load_homepage_backfill_detail_urls(self: Any, current: Any, current_url: str) -> list[str]:
+async def _load_existing_detail_task_urls(self: Any, current: Any) -> set[str]:
+    org_unit_name = (getattr(current, "label", "") or "").strip()
+    org_unit_id = getattr(current, "org_unit_id", None)
+    if not org_unit_name and org_unit_id is None:
+        return set()
+    async with self.db.session() as session:
+        if not org_unit_name and org_unit_id is not None:
+            org_unit = await session.get(OrgUnit, int(org_unit_id))
+            org_unit_name = (getattr(org_unit, "name", "") or "").strip()
+        if not org_unit_name:
+            return set()
+        existing_filters = [CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value]
+        existing_filters.append(CrawlTask.org_unit_name == org_unit_name)
+        rows = (
+            await session.execute(select(CrawlTask.source_url).where(*existing_filters))
+        ).scalars().all()
+    return {_sanitize_url(url) for url in rows if _sanitize_url(url)}
+
+
+async def _load_homepage_backfill_detail_urls(
+    self: Any,
+    current: Any,
+    current_url: str,
+    *,
+    existing_detail_task_urls: set[str] | None = None,
+) -> list[str]:
     org_unit_name = (getattr(current, "label", "") or "").strip()
     org_unit_id = getattr(current, "org_unit_id", None)
     if not org_unit_name and org_unit_id is None:
@@ -792,7 +875,12 @@ async def _load_homepage_backfill_detail_urls(self: Any, current: Any, current_u
         filters = [
             Professor.homepage.is_not(None),
             func.trim(Professor.homepage) != "",
-            or_(Professor.research_areas.is_(None), func.trim(Professor.research_areas) == ""),
+            or_(
+                Professor.research_areas.is_(None),
+                func.trim(Professor.research_areas) == "",
+                Professor.bio.is_(None),
+                func.trim(Professor.bio) == "",
+            ),
         ]
         if org_unit_id is not None:
             filters.append(ProfessorAffiliation.org_unit_id == int(org_unit_id))
@@ -806,21 +894,10 @@ async def _load_homepage_backfill_detail_urls(self: Any, current: Any, current_u
             filters.append(Professor.org_unit_name == org_unit_name)
             statement = select(Professor.homepage).where(*filters).order_by(Professor.id.asc())
         rows = (await session.execute(statement)).scalars().all()
-        existing_detail_urls = set(
-            (
-                await session.execute(
-                    select(CrawlTask.source_url).where(
-                        CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value,
-                        CrawlTask.org_unit_name == (org_unit_name or "Unknown"),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
 
     urls: list[str] = []
     seen: set[str] = set()
+    existing_detail_urls = existing_detail_task_urls or set()
     for raw_url in rows:
         homepage = _normalize_homepage_backfill_url(
             raw_url,
