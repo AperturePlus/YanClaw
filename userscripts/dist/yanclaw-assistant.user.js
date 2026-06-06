@@ -29,7 +29,7 @@
 
   const d=new Set;const importCSS = async e=>{d.has(e)||(d.add(e),(t=>{typeof GM_addStyle=="function"?GM_addStyle(t):(document.head||document.documentElement).appendChild(document.createElement("style")).append(t);})(e));};
 
-  const styleCss = '#ycl-panel{position:fixed;bottom:16px;right:16px;z-index:2147483647;width:380px;max-height:80vh;overflow-y:auto;background:#1e1e2e;color:#cdd6f4;border-radius:12px;box-shadow:0 8px 32px #00000073;font:13px/1.5 system-ui,sans-serif;-webkit-user-select:none;user-select:none;transition:all .2s}#ycl-panel.ycl-minimized{width:48px;height:48px;overflow:hidden;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center}#ycl-panel.ycl-minimized:after{content:"🦀";font-size:22px}#ycl-panel.ycl-minimized *{display:none!important}#ycl-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#313244;border-radius:12px 12px 0 0;cursor:move}#ycl-header span{font-weight:600;font-size:14px}#ycl-header button{background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px;padding:0 4px}.ycl-section{padding:8px 12px;border-top:1px solid #45475a}.ycl-label{color:#a6adc8;font-size:11px;text-transform:uppercase;letter-spacing:.5px}.ycl-url{color:#89b4fa;word-break:break-all;font-size:12px}.ycl-intent{color:#f9e2af;margin:4px 0}.ycl-hint{color:#94e2d5;font-size:12px}.ycl-btn-row{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px}.ycl-btn{padding:5px 10px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:filter .15s}.ycl-btn:hover{filter:brightness(1.15)}.ycl-btn:disabled{cursor:not-allowed;opacity:.55;filter:none}.ycl-btn-primary{background:#89b4fa;color:#1e1e2e}.ycl-btn-success{background:#a6e3a1;color:#1e1e2e}.ycl-btn-warn{background:#f9e2af;color:#1e1e2e}.ycl-btn-danger{background:#f38ba8;color:#1e1e2e}.ycl-btn-muted{background:#585b70;color:#cdd6f4}.ycl-toggle{display:flex;align-items:center;gap:6px;padding:4px 12px}.ycl-toggle input{accent-color:#89b4fa}.ycl-history{max-height:120px;overflow-y:auto}.ycl-history-item{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#a6adc8}.ycl-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.ycl-dot-on{background:#a6e3a1}.ycl-dot-off{background:#f38ba8}.ycl-match-banner{background:#a6e3a1;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-standby-banner{background:#fab387;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-role-badge{display:inline-flex;align-items:center;margin-left:6px;padding:0 6px;border-radius:999px;font-size:10px;line-height:16px;vertical-align:middle}.ycl-role-owner{background:#a6e3a1;color:#1e1e2e}.ycl-role-standby{background:#f9e2af;color:#1e1e2e}#ycl-toast{position:fixed;top:16px;right:16px;z-index:2147483647;background:#f38ba8;color:#1e1e2e;padding:8px 16px;border-radius:8px;font:13px system-ui,sans-serif;display:none}';
+  const styleCss = '#ycl-panel{position:fixed;bottom:16px;right:16px;z-index:2147483647;width:380px;max-height:80vh;overflow-y:auto;background:#1e1e2e;color:#cdd6f4;border-radius:12px;box-shadow:0 8px 32px #00000073;font:13px/1.5 system-ui,sans-serif;-webkit-user-select:none;user-select:none;transition:all .2s}#ycl-panel.ycl-minimized{width:48px;height:48px;overflow:hidden;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center}#ycl-panel.ycl-minimized:after{content:"🦀";font-size:22px}#ycl-panel.ycl-minimized *{display:none!important}#ycl-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#313244;border-radius:12px 12px 0 0;cursor:move}#ycl-header span{font-weight:600;font-size:14px}#ycl-header button{background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px;padding:0 4px}.ycl-section{padding:8px 12px;border-top:1px solid #45475a}.ycl-label{color:#a6adc8;font-size:11px;text-transform:uppercase;letter-spacing:.5px}.ycl-url{color:#89b4fa;word-break:break-all;font-size:12px}.ycl-intent{color:#f9e2af;margin:4px 0}.ycl-hint{color:#94e2d5;font-size:12px}.ycl-btn-row{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px}.ycl-btn{padding:5px 10px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:filter .15s}.ycl-btn:hover{filter:brightness(1.15)}.ycl-btn:disabled{cursor:not-allowed;opacity:.55;filter:none}.ycl-btn-primary{background:#89b4fa;color:#1e1e2e}.ycl-btn-success{background:#a6e3a1;color:#1e1e2e}.ycl-btn-warn{background:#f9e2af;color:#1e1e2e}.ycl-btn-danger{background:#f38ba8;color:#1e1e2e}.ycl-btn-muted{background:#585b70;color:#cdd6f4}.ycl-toggle{display:flex;align-items:center;gap:6px;padding:4px 12px}.ycl-toggle input{accent-color:#89b4fa}.ycl-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.ycl-dot-on{background:#a6e3a1}.ycl-dot-off{background:#f38ba8}.ycl-match-banner{background:#a6e3a1;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-standby-banner{background:#fab387;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-role-badge{display:inline-flex;align-items:center;margin-left:6px;padding:0 6px;border-radius:999px;font-size:10px;line-height:16px;vertical-align:middle}.ycl-role-owner{background:#a6e3a1;color:#1e1e2e}.ycl-role-standby{background:#f9e2af;color:#1e1e2e}#ycl-toast{position:fixed;top:16px;right:16px;z-index:2147483647;background:#f38ba8;color:#1e1e2e;padding:8px 16px;border-radius:8px;font:13px system-ui,sans-serif;display:none}';
   importCSS(styleCss);
   var _GM = (() => typeof GM != "undefined" ? GM : void 0)();
   var _GM_deleteValue = (() => typeof GM_deleteValue != "undefined" ? GM_deleteValue : void 0)();
@@ -271,7 +271,6 @@
   const YCL_PREFIX = "ycl_";
   const UI_PREFS_KEY = "ycl_ui_prefs_v2";
   const INSTANCE_LOCK_KEY = "ycl_instance_lock_v1";
-  const MAX_HISTORY = 20;
   const LEGACY_LOCAL_FALLBACK_KEY = "ycl_state_fallback";
   const listeners = [];
   const prefsFallbackKey = `${UI_PREFS_KEY}_fallback`;
@@ -288,7 +287,6 @@
     connected: false,
     minimized: false,
     pendingDecision: null,
-    history: [],
     instanceRole: "standby"
   };
   function isCleanupTarget(key) {
@@ -472,10 +470,6 @@
     state.currentJob = null;
     notify();
   }
-  function addHistory(job, status) {
-    state.history.unshift({ id: job.id, url: job.url, status, time: new Date() });
-    if (state.history.length > MAX_HISTORY) state.history.pop();
-  }
   let toastEl = null;
   let hideTimer = null;
   function mountToast() {
@@ -515,19 +509,6 @@
     } catch {
       return url.slice(0, max);
     }
-  }
-  function timeAgo(date) {
-    const s = Math.round((Date.now() - date.getTime()) / 1e3);
-    if (s < 60) return `${s}s ago`;
-    return `${Math.round(s / 60)}m ago`;
-  }
-  const STATUS_ICONS = {
-    completed: "✅",
-    skipped: "⏭",
-    failed: "❌"
-  };
-  function statusIcon(status) {
-    return STATUS_ICONS[status] ?? "❓";
   }
   const ERROR_PATTERNS = /502 bad gateway|503 service|504 gateway|500 internal|error occurred|server error|nginx/i;
   function isErrorPage() {
@@ -780,7 +761,6 @@
       const html = await captureCurrentHtml();
       const paginationStates = collectFormPaginationStates(window.location.href);
       const res = await completeJob(job.id, html, window.location.href, document.title, paginationStates);
-      addHistory(job, "completed");
       clearJob();
       if (res == null ? void 0 : res.next_job) {
         setTimeout(() => assignJob(res.next_job), 100);
@@ -844,7 +824,6 @@
     if (!job) return;
     try {
       await skipJob(job.id);
-      addHistory(job, "skipped");
     } catch {
     }
     clearJob();
@@ -856,7 +835,6 @@
     if (!job) return;
     try {
       await failJob(job.id, msg || "手动标记失败");
-      addHistory(job, "failed");
     } catch {
     }
     clearJob();
@@ -972,6 +950,80 @@
     onRoleChange$1 = null;
     currentRole = "standby";
   }
+  function disabledAttr(disabled) {
+    return disabled ? "disabled" : "";
+  }
+  function renderHeader() {
+    const dot = state.connected ? "ycl-dot-on" : "ycl-dot-off";
+    const roleLabel = state.instanceRole === "owner" ? "主实例" : "待机";
+    const roleClass = state.instanceRole === "owner" ? "ycl-role-owner" : "ycl-role-standby";
+    return `<div id="ycl-header">
+    <span><span class="ycl-status-dot ${dot}"></span> Yanclaw Assistant <span class="ycl-role-badge ${roleClass}">${roleLabel}</span></span>
+    <button id="ycl-min" title="最小化">─</button>
+  </div>`;
+  }
+  function renderStandbyBanner() {
+    return `<div class="ycl-standby-banner">当前 Tab 为待机实例，由其他 Tab 执行轮询与操作</div>`;
+  }
+  function renderMatchBanner() {
+    return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
+  }
+  function renderDecision(disabled) {
+    var _a;
+    const decision = state.pendingDecision;
+    if (!decision) return "";
+    const sample = ((_a = decision.sample_urls) == null ? void 0 : _a[0]) || "-";
+    return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
+    <div class="ycl-label">待决策</div>
+    <div>院系: <b>${decision.org_unit_name || "-"}</b></div>
+    <div>连续失败: ${decision.failure_count}</div>
+    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch" ${disabledAttr(disabled)}>失败链接切人工</button>
+  </div>`;
+  }
+  function renderJobDetail(job) {
+    var _a, _b;
+    const c = job.context;
+    return `<div class="ycl-section">
+    <div class="ycl-label">当前任务 #${job.id}</div>
+    <div>大学: <b>${c.university_name || "-"}</b></div>
+    <div>阶段: ${c.agent_state || "-"}</div>
+    ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ""}
+    ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ""}
+    ${((_a = job.action) == null ? void 0 : _a.label) ? `<div class="ycl-hint">动作: ${job.action.label}</div>` : ""}
+    <div class="ycl-label" style="margin-top:4px">目标 URL</div>
+    <div class="ycl-url">${job.url}</div>
+    ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ""}
+    ${c.depth != null ? `<div>深度: ${c.depth}</div>` : ""}
+    ${((_b = c.hints) == null ? void 0 : _b.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
+  </div>`;
+  }
+  function renderEmpty(isStandby) {
+    const msg = isStandby ? "📡 待机中，等待主实例接管任务" : state.connected ? "⏳ 等待新任务..." : "🔴 未连接到后端";
+    return `<div class="ycl-section" style="text-align:center;padding:16px 12px;">${msg}</div>`;
+  }
+  function renderActions(disabled) {
+    const disabledValue = disabledAttr(disabled);
+    return `<div class="ycl-btn-row">
+    <button class="ycl-btn ycl-btn-primary" id="ycl-copy" ${disabledValue}>📋 复制URL</button>
+    <button class="ycl-btn ycl-btn-primary" id="ycl-open" ${disabledValue}>🔗 打开URL</button>
+    <button class="ycl-btn ycl-btn-success" id="ycl-submit" ${disabledValue}>✅ 提交当前页</button>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-skip" ${disabledValue}>⏭ 跳过</button>
+    <button class="ycl-btn ycl-btn-muted" id="ycl-override" ${disabledValue}>✏️ 修改URL</button>
+    <button class="ycl-btn ycl-btn-danger" id="ycl-fail" ${disabledValue}>❌ 失败</button>
+  </div>`;
+  }
+  function renderToggles(disabled) {
+    const disabledValue = disabledAttr(disabled);
+    return `<div class="ycl-toggle">
+    <input type="checkbox" id="ycl-auto" ${state.autoMode ? "checked" : ""} ${disabledValue}>
+    <label for="ycl-auto">自动模式 (自动导航+提交)</label>
+  </div>
+  <div class="ycl-toggle">
+    <input type="checkbox" id="ycl-pause" ${state.paused ? "checked" : ""} ${disabledValue}>
+    <label for="ycl-pause">暂停轮询</label>
+  </div>`;
+  }
   let panelEl = null;
   function mountPanel() {
     panelEl = document.createElement("div");
@@ -1001,92 +1053,9 @@
       matched ? renderMatchBanner() : "",
       job ? renderJobDetail(job) : renderEmpty(isStandby),
       job ? renderActions(isStandby) : "",
-      renderToggles(isStandby),
-      renderHistory()
+      renderToggles(isStandby)
     ].join("");
     bindEvents();
-  }
-  function renderHeader() {
-    const dot = state.connected ? "ycl-dot-on" : "ycl-dot-off";
-    const roleLabel = state.instanceRole === "owner" ? "主实例" : "待机";
-    const roleClass = state.instanceRole === "owner" ? "ycl-role-owner" : "ycl-role-standby";
-    return `<div id="ycl-header">
-    <span><span class="ycl-status-dot ${dot}"></span> Yanclaw Assistant <span class="ycl-role-badge ${roleClass}">${roleLabel}</span></span>
-    <button id="ycl-min" title="最小化">─</button>
-  </div>`;
-  }
-  function renderStandbyBanner() {
-    return `<div class="ycl-standby-banner">当前 Tab 为待机实例，由其他 Tab 执行轮询与操作</div>`;
-  }
-  function renderMatchBanner() {
-    return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
-  }
-  function renderDecision(disabled) {
-    var _a;
-    const decision = state.pendingDecision;
-    if (!decision) return "";
-    const sample = ((_a = decision.sample_urls) == null ? void 0 : _a[0]) || "-";
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
-    <div class="ycl-label">待决策</div>
-    <div>院系: <b>${decision.org_unit_name || "-"}</b></div>
-    <div>连续失败: ${decision.failure_count}</div>
-    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
-    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch" ${disableAttr}>失败链接切人工</button>
-  </div>`;
-  }
-  function renderJobDetail(job) {
-    var _a, _b;
-    const c = job.context;
-    return `<div class="ycl-section">
-    <div class="ycl-label">当前任务 #${job.id}</div>
-    <div>大学: <b>${c.university_name || "-"}</b></div>
-    <div>阶段: ${c.agent_state || "-"}</div>
-    ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ""}
-    ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ""}
-    ${((_a = job.action) == null ? void 0 : _a.label) ? `<div class="ycl-hint">动作: ${job.action.label}</div>` : ""}
-    <div class="ycl-label" style="margin-top:4px">目标 URL</div>
-    <div class="ycl-url">${job.url}</div>
-    ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ""}
-    ${c.depth != null ? `<div>深度: ${c.depth}</div>` : ""}
-    ${((_b = c.hints) == null ? void 0 : _b.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
-  </div>`;
-  }
-  function renderEmpty(isStandby) {
-    const msg = isStandby ? "📡 待机中，等待主实例接管任务" : state.connected ? "⏳ 等待新任务..." : "🔴 未连接到后端";
-    return `<div class="ycl-section" style="text-align:center;padding:16px 12px;">${msg}</div>`;
-  }
-  function renderActions(disabled) {
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-btn-row">
-    <button class="ycl-btn ycl-btn-primary" id="ycl-copy" ${disableAttr}>📋 复制URL</button>
-    <button class="ycl-btn ycl-btn-primary" id="ycl-open" ${disableAttr}>🔗 打开URL</button>
-    <button class="ycl-btn ycl-btn-success" id="ycl-submit" ${disableAttr}>✅ 提交当前页</button>
-    <button class="ycl-btn ycl-btn-warn" id="ycl-skip" ${disableAttr}>⏭ 跳过</button>
-    <button class="ycl-btn ycl-btn-muted" id="ycl-override" ${disableAttr}>✏️ 修改URL</button>
-    <button class="ycl-btn ycl-btn-danger" id="ycl-fail" ${disableAttr}>❌ 失败</button>
-  </div>`;
-  }
-  function renderToggles(disabled) {
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-toggle">
-    <input type="checkbox" id="ycl-auto" ${state.autoMode ? "checked" : ""} ${disableAttr}>
-    <label for="ycl-auto">自动模式 (自动导航+提交)</label>
-  </div>
-  <div class="ycl-toggle">
-    <input type="checkbox" id="ycl-pause" ${state.paused ? "checked" : ""} ${disableAttr}>
-    <label for="ycl-pause">暂停轮询</label>
-  </div>`;
-  }
-  function renderHistory() {
-    if (!state.history.length) return "";
-    const items = state.history.map(
-      (h) => `<div class="ycl-history-item"><span>${statusIcon(h.status)} ${truncUrl(h.url, 35)}</span><span>${timeAgo(h.time)}</span></div>`
-    ).join("");
-    return `<div class="ycl-section">
-    <div class="ycl-label">历史 (${state.history.length})</div>
-    <div class="ycl-history">${items}</div>
-  </div>`;
   }
   function bindEvents() {
     var _a;

@@ -1,6 +1,6 @@
 import * as api from './api';
 import { actionMatchesCurrentPage, collectFormPaginationStates, performFetchAction } from './formPagination';
-import { addHistory, clearJob, notify, setJob, state } from './state';
+import { clearJob, notify, setJob, state } from './state';
 import type { PendingDecision } from './types';
 import { showToast } from './ui/toast';
 import { isErrorPage, urlMatches } from './utils';
@@ -273,7 +273,6 @@ export async function submitCurrent(): Promise<void> {
     const html = await captureCurrentHtml();
     const paginationStates = collectFormPaginationStates(window.location.href);
     const res = await api.completeJob(job.id, html, window.location.href, document.title, paginationStates);
-    addHistory(job, 'completed');
     clearJob();
     if (res?.next_job) {
       // Defer navigation so the current response is fully processed.
@@ -345,7 +344,6 @@ export async function skipCurrent(): Promise<void> {
   if (!job) return;
   try {
     await api.skipJob(job.id);
-    addHistory(job, 'skipped');
   } catch { /* ignore */ }
   clearJob();
   triggerFastPollBurst();
@@ -357,7 +355,6 @@ export async function failCurrent(msg?: string): Promise<void> {
   if (!job) return;
   try {
     await api.failJob(job.id, msg || '手动标记失败');
-    addHistory(job, 'failed');
   } catch { /* ignore */ }
   clearJob();
   triggerFastPollBurst();

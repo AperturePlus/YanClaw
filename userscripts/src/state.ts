@@ -1,8 +1,7 @@
 import { GM, GM_deleteValue, GM_getValue, GM_listValues, GM_setValue } from '$';
 import { INSTANCE_LOCK_KEY, UI_PREFS_KEY, YCL_PREFIX } from './storageKeys';
-import type { FetchJob, HistoryEntry, PendingDecision } from './types';
+import type { FetchJob, PendingDecision } from './types';
 
-const MAX_HISTORY = 20;
 const LEGACY_LOCAL_FALLBACK_KEY = 'ycl_state_fallback';
 
 export type InstanceRole = 'owner' | 'standby';
@@ -14,7 +13,6 @@ export interface AppState {
   connected: boolean;
   minimized: boolean;
   pendingDecision: PendingDecision | null;
-  history: HistoryEntry[];
   instanceRole: InstanceRole;
 }
 
@@ -41,7 +39,6 @@ export const state: AppState = {
   connected: false,
   minimized: false,
   pendingDecision: null,
-  history: [],
   instanceRole: 'standby',
 };
 
@@ -254,9 +251,4 @@ export function setJob(job: FetchJob | null): void {
 export function clearJob(): void {
   state.currentJob = null;
   notify();
-}
-
-export function addHistory(job: FetchJob, status: HistoryEntry['status']): void {
-  state.history.unshift({ id: job.id, url: job.url, status, time: new Date() });
-  if (state.history.length > MAX_HISTORY) state.history.pop();
 }

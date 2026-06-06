@@ -59,23 +59,6 @@ export function truncUrl(url: string, max = 40): string {
   }
 }
 
-export function timeAgo(date: Date): string {
-  const s = Math.round((Date.now() - date.getTime()) / 1000);
-  if (s < 60) return `${s}s ago`;
-  return `${Math.round(s / 60)}m ago`;
-}
-
-const STATUS_ICONS: Record<string, string> = {
-  completed: '✅',
-  skipped: '⏭',
-  failed: '❌',
-};
-
-export function statusIcon(status: string): string {
-  return STATUS_ICONS[status] ?? '❓';
-}
-
-
 const ERROR_PATTERNS = /502 bad gateway|503 service|504 gateway|500 internal|error occurred|server error|nginx/i;
 
 /** Detect if the current page is a server error page (502, 503, etc.). */

@@ -79,10 +79,3 @@ export interface StatusResponse {
   agent?: Record<string, unknown>;
   server_uptime_seconds: number;
 }
-
-export interface HistoryEntry {
-  id: string;
-  url: string;
-  status: 'completed' | 'skipped' | 'failed';
-  time: Date;
-}
