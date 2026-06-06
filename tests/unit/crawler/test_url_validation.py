@@ -167,6 +167,11 @@ def test_non_faculty_noise_url_matches_rszc_variants():
     assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/rszc2.htm")
 
 
+def test_non_faculty_noise_url_matches_rules_and_regulations_pages():
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/规章制度/")
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/规章制度.htm")
+
+
 def test_non_faculty_noise_url_does_not_block_regular_faculty_paths():
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/jsdw.htm")
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/faculty/teacher_list.htm")
@@ -244,6 +249,17 @@ def test_assess_faculty_candidate_classifies_noise_or_login_hard_reject():
     assert item.page_type == FACULTY_PAGE_TYPE_NOISE
     assert item.hard_reject is True
     assert item.score < 0
+
+
+def test_assess_faculty_candidate_classifies_rules_and_regulations_as_noise():
+    item = _assess_faculty_candidate(
+        "https://www.example.edu.cn/szdw/规章制度.htm",
+        anchor_text="规章制度",
+        heading_text="师资队伍",
+    )
+
+    assert item.page_type == FACULTY_PAGE_TYPE_NOISE
+    assert item.score <= 0
 
 
 def test_assess_faculty_candidate_classifies_full_category_and_elite():
