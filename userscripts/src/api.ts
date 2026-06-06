@@ -1,6 +1,6 @@
 import { GM, GM_xmlhttpRequest } from '$';
 import { isAssistantBlockedHost } from './hostPolicy';
-import type { CompleteResponse, FetchJob, PendingDecision, StatusResponse } from './types';
+import type { CompleteResponse, FetchJob, PaginationState, PendingDecision, StatusResponse } from './types';
 
 const API_BASE = 'http://127.0.0.1:21520/api';
 const TIMEOUT = 10_000;
@@ -76,8 +76,14 @@ export async function completeJob(
   html: string,
   url: string,
   title: string,
+  paginationStates?: PaginationState[],
 ): Promise<CompleteResponse | null> {
-  return request<CompleteResponse>('POST', `/jobs/${id}/complete`, { html, url, title });
+  return request<CompleteResponse>('POST', `/jobs/${id}/complete`, {
+    html,
+    url,
+    title,
+    pagination_states: paginationStates ?? [],
+  });
 }
 
 export async function failJob(id: string, message: string): Promise<void> {
