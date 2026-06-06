@@ -115,7 +115,7 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
+        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s max_org_units_per_university=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
         settings.max_concurrency,
         settings.human_server_host,
         settings.human_server_port,
@@ -125,6 +125,7 @@ def crawl(
         settings.llm_max_concurrent,
         settings.llm_min_interval_seconds,
         settings.pipeline_llm_workers,
+        settings.max_org_units_per_university,
         resume,
         ",".join(selected) if selected else "*",
         ",".join(settings.target_org_units) if settings.target_org_units else "*",

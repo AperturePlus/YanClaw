@@ -146,6 +146,7 @@ def test_crawler_settings_removed_human_only_fake_knobs():
 def test_crawler_settings_default_llm_parallelism_has_no_rate_limit():
     settings = CrawlerSettings(_env_file=None)
 
+    assert settings.max_org_units_per_university == 100
     assert settings.pipeline_llm_workers == 4
     assert settings.pipeline_db_workers == 1
     assert settings.llm_max_concurrent == 8
@@ -215,6 +216,7 @@ async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
     assert summary.success == 1
     assert CaptureAgent.last_kwargs is not None
     assert CaptureAgent.last_kwargs.get("target_org_units") == ["计算机学院", "软件学院"]
+    assert CaptureAgent.last_kwargs.get("max_org_units_per_university") == 100
     assert CaptureAgent.last_kwargs.get("org_unit_match_threshold") == 0.7
     assert CaptureAgent.last_kwargs.get("org_unit_exclude_enabled") is True
     assert CaptureAgent.last_kwargs.get("org_unit_exclude_keywords") == ["艺术学院", "体育学院"]

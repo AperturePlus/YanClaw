@@ -26,6 +26,7 @@ class CrawlerSettings(BaseSettings):
     max_concurrency: int = Field(default=3, ge=1)
     llm_timeout_seconds: float = Field(default=120.0, gt=0)
     university_timeout_seconds: float = Field(default=36000.0, gt=0)
+    max_org_units_per_university: int = Field(default=100, ge=1)
     model_max_tokens: int = Field(default=128000, gt=0)
     response_reserved_tokens: int = Field(default=2000, ge=0)
     log_dir: Path = Path("logs")

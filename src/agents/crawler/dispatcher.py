@@ -443,7 +443,7 @@ class CrawlDispatcher:
         async with semaphore:
             timeout_seconds = float(self.settings.university_timeout_seconds)
             self.logger.info(
-                "Dispatching %s (timeout=%ss human_bridge=%s:%s human_job_timeout=%ss llm_timeout=%ss llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s)",
+                "Dispatching %s (timeout=%ss human_bridge=%s:%s human_job_timeout=%ss llm_timeout=%ss llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s max_org_units_per_university=%s)",
                 university.name,
                 timeout_seconds,
                 self.settings.human_server_host,
@@ -453,6 +453,7 @@ class CrawlDispatcher:
                 self.settings.llm_max_concurrent,
                 self.settings.llm_min_interval_seconds,
                 self.settings.pipeline_llm_workers,
+                self.settings.max_org_units_per_university,
             )
 
             db = DatabaseManager(_sqlite_url(university.db_path))
@@ -482,6 +483,7 @@ class CrawlDispatcher:
                         skill_manager=skill_manager,
                         context_manager=ContextManager(self.settings.openai_model),
                         fetcher=fetcher,
+                        max_org_units_per_university=self.settings.max_org_units_per_university,
                         model_max_tokens=self.settings.model_max_tokens - self.settings.response_reserved_tokens,
                         detail_enrich_enabled=self.settings.detail_enrich_enabled,
                         detail_profile_hard_cap_per_org_unit=self.settings.detail_profile_hard_cap_per_org_unit,
