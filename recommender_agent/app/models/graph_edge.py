@@ -12,5 +12,9 @@ class GraphEdge(SQLModel, table=True):
     target_type: str
     relation: str
     weight: float = 1.0
+    confidence: float = 1.0
     evidence: Optional[str] = None
+    data_source_id: Optional[str] = None
+    batch_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)

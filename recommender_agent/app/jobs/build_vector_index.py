@@ -7,25 +7,29 @@ from chromadb.config import Settings as ChromaSettings
 from sqlmodel import Session, select
 
 from app.core.config import get_settings
+from app.core.logging import get_logger
 from app.models.base import engine
 from app.models import Item
 
 settings = get_settings()
+logger = get_logger()
 
 
 def build_vector_text(item: Item) -> str:
     """Construct text for vector embedding from item data"""
     parts = []
     if item.title:
-        parts.append(f"Name: {item.title}")
+        parts.append(f"姓名: {item.title}")
+    if item.source_id:
+        parts.append(f"数据源: {item.source_id}")
     if item.research_areas:
-        parts.append(f"Research: {item.research_areas}")
+        parts.append(f"研究方向: {item.research_areas}")
     if item.description:
-        parts.append(f"Bio: {item.description}")
+        parts.append(f"简介: {item.description}")
     if item.org_unit:
-        parts.append(f"Department: {item.org_unit}")
+        parts.append(f"学院: {item.org_unit}")
     if item.tags:
-        parts.append(f"Tags: {item.tags}")
+        parts.append(f"标签: {item.tags}")
     return "\n".join(parts)
 
 
@@ -61,6 +65,10 @@ def build_vector_index():
             documents.append(text)
             metadatas.append({
                 "item_id": item.id,
+                "entity_id": item.entity_id or "",
+                "entity_type": item.source_entity_type or "professor",
+                "source_id": item.source_id or "",
+                "source_external_id": item.source_external_id or item.external_id or "",
                 "title": item.title,
                 "category": item.category or "",
                 "org_unit": item.org_unit or "",
@@ -75,9 +83,9 @@ def build_vector_index():
                 metadatas=metadatas,
             )
             session.commit()
-            print(f"Indexed {len(ids)} items into ChromaDB")
+            logger.info("Indexed %s items into ChromaDB", len(ids))
         else:
-            print("No items to index (all up to date)")
+            logger.info("No items to index (all up to date)")
 
 
 if __name__ == "__main__":

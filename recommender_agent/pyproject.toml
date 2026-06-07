@@ -19,3 +19,8 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "realdata: test requires prepared local data/app.db or other runtime data",
+]

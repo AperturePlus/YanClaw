@@ -1,6 +1,6 @@
 # LightGraphRec AI 导师推荐系统
 
-LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `scu.edu.cn.db` 导入四川大学教师数据，写入业务库 `data/app.db`，再基于 SQLite、ChromaDB、NetworkX 和 LLM 组合完成导师召回、排序与推荐理由生成。
+LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `raw_data/` 下登记的数据源导入教师数据，写入统一业务库 `data/app.db`，再基于 SQLite、ChromaDB、NetworkX 和 LLM 组合完成导师召回、排序与推荐理由生成。
 
 当前版本已经覆盖 `项目规划.md` 的核心演示路径：数据导入、FastAPI 后端、Streamlit 前端、结构化召回、向量索引、知识图谱边构建、推荐接口和基础测试。它还不是规划文档里的完整终态：Repository 层、Engine 层、完整图谱路径解释、CI/CD 和隔离测试夹具仍属于后续完善项。
 
@@ -8,12 +8,14 @@ LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `scu.edu.c
 
 - 后端 API：FastAPI，入口 `app.main:app`，默认端口 `8000`。
 - 前端 Demo：Streamlit，入口 `frontend/streamlit_app.py`，默认端口 `8501`。
-- 数据源：`scu.edu.cn.db` 原始教师库。
+- 数据源：`raw_data/*.db` 原始教师库，通过 `configs/sources.yaml` 登记。
 - 业务库：`data/app.db`，包含 `items`、`org_units`、`graph_edges` 等推荐运行表。
-- 数据准备：`app.jobs.import_dataset.import_scu_data()` 导入 SCU 教师为 `Item`。
-- 图谱构建：`app.jobs.build_graph` 从 `items` 构建 `graph_edges`。
-- 向量索引：`app.jobs.build_vector_index` 将 `items` 写入 `data/chroma`。
-- 推荐接口：`POST /api/v1/recommend` 返回导师列表、分数、来源和推荐理由。
+- 数据准备：`app.jobs.import_dataset.import_all_sources()` 将已启用数据源导入 `Item`，并归档 `raw_records`。
+- 图谱构建：`app.jobs.build_graph` 从统一 `items` 构建 `graph_edges`。
+- 向量索引：`app.jobs.build_vector_index` 将统一 `items` 写入 `data/chroma`。
+- 一键重建：`app.jobs.rebuild_all` 执行导入、图谱和向量索引重建。
+- 推荐接口：`POST /api/v1/recommend` 返回需求解析、匹配等级、证据、限制说明、追问建议和图谱路径。
+- 追问接口：`POST /api/v1/recommend/follow-up` 基于上一轮 `request_id` 继续收窄推荐条件。
 - 管理接口：`POST /api/v1/admin/import` 会导入数据并重建图谱/向量索引。
 
 ## 与项目规划的对齐情况
@@ -21,10 +23,10 @@ LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `scu.edu.c
 | 模块 | 状态 | 说明 |
 |---|---|---|
 | FastAPI 基础框架 | 已实现 | `/health`、统一响应、API 路由可用。 |
-| 数据导入 | 已实现 | `scu.edu.cn.db -> data/app.db`，教师映射为 `items`。 |
+| 数据导入 | 已实现 | `raw_data/*.db -> data/app.db`，使用复合 `external_id` 防止多源主键冲突。 |
 | 结构化召回 | 已实现 | 无过滤时可从活跃 `items` 返回候选。 |
 | ChromaDB 向量索引 | 已实现 | 可构建 `professors_vector` collection。 |
-| NetworkX 图谱 | 部分实现 | 已构建 `Item -> OrgUnit` 边；复杂研究方向/合作路径仍较简单。 |
+| NetworkX 图谱 | 部分实现 | 已构建来源、学院、研究方向和相似研究边；复杂合作路径仍较简单。 |
 | 推荐排序 | 已实现 MVP | 按语义、图谱、画像、热度权重融合。 |
 | LLM 意图/理由 | 部分实现 | 支持 DeepSeek/OpenAI 风格接口和模板降级；成本控制较简单。 |
 | Streamlit 前端 | 已实现 MVP | 可输入查询、查看推荐结果和耗时。 |
@@ -41,7 +43,7 @@ LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `scu.edu.c
 - Python 3.10+，推荐 3.11
 - `uv`
 - Doppler CLI 或 Doppler MCP 访问权限
-- `scu.edu.cn.db` 放在项目根目录
+- 将原始库放入 `raw_data/`，并在 `configs/sources.yaml` 登记
 
 配置来源：
 
@@ -54,17 +56,35 @@ LightGraphRec 是 `recommender_agent` 的导师推荐 MVP。系统从 `scu.edu.c
 APP_NAME=LightGraphRec
 APP_ENV=local
 DATABASE_URL=sqlite:///data/app.db
-SCU_SOURCE_DB=scu.edu.cn.db
+SCU_SOURCE_DB=raw_data/scu.edu.cn.db
+SOURCE_CONFIG=configs/sources.yaml
+SOURCE_DB_DIR=raw_data
+SOURCE_DB_GLOB=*.db
+SOURCE_DBS=
+DATA_DIR=data
+PIPELINE_REPORT_DIR=data/pipeline_reports
 CHROMA_PATH=data/chroma
 CHROMA_COLLECTION=professors_vector
 LLM_PROVIDER=deepseek
-LLM_API_KEY=...
+LLM_API_KEY=
 LLM_BASE_URL=https://api.deepseek.com/v1
 LLM_MODEL=deepseek-chat
 ENABLE_LLM=true
 ENABLE_VECTOR=true
 ENABLE_GRAPH=true
+ENABLE_DOMAIN_GATE=true
+DOMAIN_GATE_MODE=soft
+DOMAIN_ONTOLOGY_PATH=configs/discipline_ontology.yaml
+GRAPH_DIFFUSION_ENABLED=true
+GRAPH_RELATION_WEIGHTS=
+ENABLE_RERANKER=false
+RERANK_PROVIDER=heuristic
+RERANK_MODEL=
+RERANK_BASE_URL=
+RERANK_API_KEY=
 ```
+
+外部 reranking 默认关闭，`ENABLE_RERANKER=false` 时本地运行和测试不需要配置任何 rerank provider。后续如需接入外部 reranker，请只在本机 `.env`、Doppler 或其他密钥管理工具中设置 `ENABLE_RERANKER=true`、`RERANK_PROVIDER`、`RERANK_MODEL`、`RERANK_BASE_URL` 和 `RERANK_API_KEY`；不要把真实 key 写入 `.env.example` 或提交到仓库。
 
 ## 安装依赖
 
@@ -79,18 +99,18 @@ uv pip install -e ".[dev]"
 
 ## 准备推荐数据
 
-首次运行前必须把 `scu.edu.cn.db` 导入业务库，并构建图谱/向量索引。
+首次运行前必须把原始库放入 `raw_data/`，确认 `configs/sources.yaml` 已启用对应数据源，然后导入业务库并构建图谱/向量索引。
 
-推荐一条命令完成导入和图谱构建：
+推荐一条命令完成全量重建：
 
 ```bash
-doppler run --project yanclaw --config dev_personal -- uv run python -c "from app.jobs.import_dataset import import_scu_data; from app.jobs.build_graph import build_knowledge_graph, save_graph_edges; r=import_scu_data(); print(r); g=build_knowledge_graph(); print(g.number_of_nodes(), g.number_of_edges()); save_graph_edges(g)"
+doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.rebuild_all
 ```
 
-然后构建 ChromaDB 向量索引：
+如只想验证导入和图谱，不重建向量索引：
 
 ```bash
-doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.build_vector_index
+doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.rebuild_all --skip-vector
 ```
 
 也可以在后端启动后调用管理接口：
@@ -166,12 +186,125 @@ curl -X POST http://127.0.0.1:8000/api/v1/recommend \
 
 正常情况下，`data/app.db` 已导入数据后会返回非空 `recommendations`。
 
+## API 示例与响应结构
+
+### 推荐接口
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/recommend \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "医学影像和计算机视觉方向导师推荐",
+    "top_k": 3,
+    "filters": {
+      "org_unit": null,
+      "title": null
+    },
+    "options": {
+      "enable_vector": true,
+      "enable_graph": true
+    }
+  }'
+```
+
+推荐结果核心结构如下。真实接口外层还会包含统一响应字段 `code`、`message`、`data` 和 `request_id`，其中 `data.request_id` 用于后续追问。
+
+```json
+{
+  "query_understanding": {
+    "research_interests": ["医学影像", "计算机视觉"],
+    "preferred_locations": ["上海"],
+    "preferred_universities": [],
+    "degree_stage": "硕士",
+    "constraints": [],
+    "uncertainties": ["未明确是否偏理论或应用"]
+  },
+  "recommendations": [
+    {
+      "professor_id": "p_001",
+      "name": "张三",
+      "university": "某某大学",
+      "college": "计算机学院",
+      "title": "教授",
+      "research_fields": ["医学影像", "深度学习", "计算机视觉"],
+      "homepage_url": "https://example.edu.cn/professor/zhangsan",
+      "match_level": "高",
+      "match_score": 0.91,
+      "reasons": [
+        "研究方向包含医学影像和计算机视觉",
+        "所在学校位于上海，符合地域偏好",
+        "个人简介中包含深度学习相关内容"
+      ],
+      "limitations": [
+        "公开资料中未明确招生信息"
+      ]
+    }
+  ],
+  "follow_up_questions": [
+    "你更倾向于理论研究还是应用研究？",
+    "是否只考虑 985 高校？"
+  ]
+}
+```
+
+当前实现的单条推荐还会返回 `item_id`、`summary`、`source_url`、`updated_at`、`evidence`、`graph_paths` 等字段；前端会在字段缺失时显示“暂无”而不是报错。
+
+### 追问接口
+
+把上一轮响应中的 `data.request_id` 或外层 `request_id` 填入 `previous_request_id`：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/recommend/follow-up \
+  -H "Content-Type: application/json" \
+  -d '{
+    "previous_request_id": "req_1700000000000_abcd1234",
+    "query": "更希望导师在成都，偏应用研究",
+    "top_k": 3,
+    "filters": {},
+    "options": {
+      "enable_vector": true,
+      "enable_graph": true
+    }
+  }'
+```
+
+追问成功时返回同样的推荐响应结构，并在 `data.changes` 中补充新增约束、排名变化和说明。
+
+### 管理员修正导师数据
+
+```bash
+curl -X PATCH http://127.0.0.1:8000/api/v1/admin/items/1 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operator_id": "admin-local",
+    "reason": "修正公开主页和研究方向",
+    "updates": {
+      "research_areas": "医学影像、计算机视觉、深度学习",
+      "metadata_json": "{\"homepage_url\":\"https://example.edu.cn/professor/zhangsan\",\"source_url\":\"https://example.edu.cn/faculty/zhangsan\",\"updated_at\":\"2026-01-02\"}"
+    }
+  }'
+```
+
+### 单条导师刷新状态
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/admin/items/1/refresh
+```
+
+该接口当前返回单条导师的热更新状态提示；向量和图谱仍需要按上文执行全量重建。
+
 ## 常用管理命令
 
-导入 SCU 数据：
+导入已登记数据源：
 
 ```bash
 doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.import_dataset
+```
+
+一键重建导入、图谱和向量索引：
+
+```bash
+doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.rebuild_all
 ```
 
 重建图谱：
@@ -192,18 +325,43 @@ doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs
 uv run python -c "import sqlite3; con=sqlite3.connect('data/app.db'); print('items', con.execute('select count(*) from items').fetchone()[0]); print('graph_edges', con.execute('select count(*) from graph_edges').fetchone()[0]); con.close()"
 ```
 
-## 测试与验证
-
-推荐先跑稳定的单元测试：
+清理旧版导入遗留的无来源 `items`：
 
 ```bash
-doppler run --project yanclaw --config dev_personal -- uv run python -m pytest tests/test_llm.py tests/test_ranking.py -q
+doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.clean_legacy_items --dry-run
+doppler run --project yanclaw --config dev_personal -- uv run python -m app.jobs.clean_legacy_items
+```
+
+正式清理会先备份 `data/app.db` 到 `data/backups/`，再删除 `source_id IS NULL` 的旧记录并重建图谱。
+
+## 测试与验证
+
+推荐先跑隔离夹具测试，默认不依赖真实 `data/app.db` 或 `data/chroma`：
+
+```bash
+uv run python -m pytest -m "not realdata" -q
+```
+
+如果只想快速验证稳定的排序和 LLM 降级逻辑，可执行：
+
+```bash
+uv run python -m pytest tests/test_ranking.py tests/test_llm.py -q
+```
+
+也可以跑稳定的单元测试和隔离夹具契约测试组合：
+
+```bash
+uv run python -m pytest tests/test_llm.py tests/test_ranking.py tests/test_contract_fixtures.py tests/test_models.py -q
 ```
 
 当前已知测试注意事项：
 
-- `tests/test_models.py` 使用固定唯一值，并连接真实 `data/app.db`，重复运行或已导入数据后可能触发唯一约束冲突。后续应改为独立临时 SQLite fixture。
-- `tests/test_api.py` 部分用例依赖 FastAPI lifespan 和已准备好的数据库数据，直接运行时可能受本地状态影响。
+- `tests/conftest.py` 提供 `temp_engine`、`db_session`、`temp_chroma_path`、`test_settings` 和 `isolated_app_state`，默认使用临时 SQLite/Chroma 路径，不读写 `data/app.db` 或 `data/chroma`。
+- 隔离 fixture 测试用于验证 API/服务契约和数据模型，不要求本地已经导入真实 SCU 数据。
+- `tests/test_models.py` 已使用临时 SQLite fixture，可重复运行且不会触碰真实业务库。
+- `tests/test_api.py` 中除 `/health` 外的接口烟测标记为 `@pytest.mark.realdata`，它们依赖已准备好的 `data/app.db`/图谱/向量运行状态。
+- 默认跳过真实数据测试可执行：`uv run python -m pytest -m "not realdata" -q`。
+- 需要验证真实数据 API 时，先按上文导入数据并构建图谱/向量索引，再执行：`uv run python -m pytest -m realdata tests/test_api.py -q`。
 
 ## Docker 说明
 
@@ -222,9 +380,10 @@ Compose 当前主要启动 FastAPI 后端和 nginx，不包含 Streamlit 前端�
 
 推荐结果为 0：
 
-1. 确认 `scu.edu.cn.db` 在项目根目录。
-2. 确认 `data/app.db` 的 `items` 不为空。
-3. 重新执行数据导入、图谱构建和向量索引构建。
+1. 确认原始 `.db` 在 `raw_data/`。
+2. 确认 `configs/sources.yaml` 中对应数据源 `enabled: true`。
+3. 确认 `data/app.db` 的 `items` 不为空。
+4. 重新执行 `uv run python -m app.jobs.rebuild_all`。
 
 Streamlit 报 `StreamlitSecretNotFoundError`：
 

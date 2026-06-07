@@ -1,0 +1,16 @@
+sources:
+  - source_id: scu.edu.cn
+    name: 四川大学
+    type: sqlite
+    path: raw_data/scu.edu.cn.db
+    adapter: professor_sqlite_v1
+    entity_type: professor
+    enabled: true
+
+  - source_id: buaa.edu.cn
+    name: 北京航空航天大学
+    type: sqlite
+    path: raw_data/buaa.edu.cn.db
+    adapter: professor_sqlite_v1
+    entity_type: professor
+    enabled: true
