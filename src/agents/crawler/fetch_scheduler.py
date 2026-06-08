@@ -4,6 +4,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from agents.crawler import db as crawler_db
+from agents.crawler.fetch_failures import FetchFailureKind, classify_fetch_failure
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.models import CrawlLogStatus
 from agents.crawler.url_heuristics import _same_site, _sanitize_url
@@ -71,7 +72,7 @@ class FetchScheduler:
                 return cached
             if cached is not None and cached.block_reason:
                 agent.logger.info(
-                    "Ignoring blocked cached page in resume so it can be retried: %s reason=%s",
+                    "Ignoring failed cached page in resume so it can be retried: %s reason=%s",
                     url,
                     cached.block_reason,
                 )
@@ -138,7 +139,13 @@ class FetchScheduler:
             crawl_message = f"depth={depth} status_code={fetched.status_code}"
             if fetched.block_reason:
                 crawl_status = CrawlLogStatus.FAILED
-                crawl_message = f"{crawl_message} blocked={fetched.block_reason} links={len(fetched.links)}"
+                failure_kind = classify_fetch_failure(fetched.block_reason)
+                if failure_kind == FetchFailureKind.BLOCKED:
+                    crawl_message = f"{crawl_message} blocked={fetched.block_reason} links={len(fetched.links)}"
+                else:
+                    crawl_message = (
+                        f"{crawl_message} fetch_failure={fetched.block_reason} links={len(fetched.links)}"
+                    )
             await crawler_db.log_crawl(
                 session,
                 canonical or dedup_url,
@@ -154,19 +161,51 @@ class FetchScheduler:
                 )
 
         if fetched.block_reason:
-            blocked_host = (urlparse(fetched.url).hostname or "").lower()
-            if blocked_host:
-                agent._blocked_hosts.add(blocked_host)
-            agent.logger.warning(
-                "WAF/challenge page detected url=%s status=%s reason=%s links=%s",
-                fetched.url,
-                fetched.status_code,
-                fetched.block_reason,
-                len(fetched.links),
-            )
-            agent.execution_log.append(
-                f"fetch blocked url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
-            )
+            failure_kind = classify_fetch_failure(fetched.block_reason)
+            if failure_kind == FetchFailureKind.BLOCKED:
+                blocked_host = (urlparse(fetched.url).hostname or "").lower()
+                if blocked_host:
+                    agent._blocked_hosts.add(blocked_host)
+                agent.logger.warning(
+                    "WAF/challenge page detected url=%s status=%s reason=%s links=%s",
+                    fetched.url,
+                    fetched.status_code,
+                    fetched.block_reason,
+                    len(fetched.links),
+                )
+                agent.execution_log.append(
+                    f"fetch blocked url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
+                )
+            elif failure_kind == FetchFailureKind.RETRYABLE:
+                if (fetched.block_reason or "").strip().lower() == "timeout":
+                    agent.logger.warning(
+                        "Human fetch timed out url=%s status=%s links=%s",
+                        fetched.url,
+                        fetched.status_code,
+                        len(fetched.links),
+                    )
+                else:
+                    agent.logger.warning(
+                        "Fetch failed with retryable reason url=%s status=%s reason=%s links=%s",
+                        fetched.url,
+                        fetched.status_code,
+                        fetched.block_reason,
+                        len(fetched.links),
+                    )
+                agent.execution_log.append(
+                    f"fetch retryable_failure url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
+                )
+            else:
+                agent.logger.warning(
+                    "Fetch failed url=%s status=%s reason=%s links=%s",
+                    fetched.url,
+                    fetched.status_code,
+                    fetched.block_reason,
+                    len(fetched.links),
+                )
+                agent.execution_log.append(
+                    f"fetch failed url={fetched.url} depth={depth} status={fetched.status_code} reason={fetched.block_reason}"
+                )
         else:
             agent.execution_log.append(
                 f"fetch ok url={fetched.url} depth={depth} status={fetched.status_code} links={len(fetched.links)}"

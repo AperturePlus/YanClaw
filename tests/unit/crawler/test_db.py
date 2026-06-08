@@ -16,6 +16,11 @@ from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
     Academician,
     CrawlExtractionFailure,
+    CrawlGraphEdge,
+    CrawlGraphEdgeType,
+    CrawlGraphNode,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
     CrawlLogStatus,
     CrawlStatus,
     CrawlTask,
@@ -1710,4 +1715,141 @@ async def test_crawl_task_upsert_exact_match_does_not_rewrite_task_kind(tmp_path
     assert returned.id == list_task.id
     assert row.task_kind == CrawlTaskKind.LIST_PAGE.value
     assert row.status == CrawlTaskStatus.DONE.value
+    await db.close()
+
+
+async def test_crawl_graph_node_and_edge_upsert_dedupes_and_merges_metadata(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "crawl_graph.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        source = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty#top",
+            org_unit_name="CS",
+            priority_score=80,
+            metadata={"source": "list"},
+        )
+        same_source = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="Computer Science",
+            priority_score=85,
+            metadata={"seen_on": ["home"]},
+        )
+        detail = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/1001/ada.htm",
+            org_unit_name="CS",
+            priority_score=40,
+        )
+        edge = await crawler_db.upsert_graph_edge(
+            session,
+            from_node_id=source.id,
+            to_node_id=detail.id,
+            edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+            metadata={"page": 1},
+        )
+        same_edge = await crawler_db.upsert_graph_edge(
+            session,
+            from_node_id=same_source.id,
+            to_node_id=detail.id,
+            edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+            metadata={"page": 2},
+        )
+        nodes = (await session.execute(select(CrawlGraphNode))).scalars().all()
+        edges = (await session.execute(select(CrawlGraphEdge))).scalars().all()
+
+    assert same_source.id == source.id
+    assert edge.id == same_edge.id
+    assert len(nodes) == 2
+    assert len(edges) == 1
+    assert same_source.priority_score == 85
+    assert "Computer Science" in same_source.org_unit_name
+    assert '"seen_on":["home"]' in same_source.metadata_json
+    await db.close()
+
+
+async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "crawl_graph_ready.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        low = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/low.htm",
+            org_unit_name="CS",
+            priority_score=40,
+            depth=3,
+        )
+        high = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=80,
+            depth=1,
+        )
+        await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+            url="https://cs.example.edu.cn/faculty/archive",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.DONE,
+            priority_score=90,
+        )
+        retry = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.PAGINATION_URL,
+            url="https://cs.example.edu.cn/faculty/2.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.RETRY,
+            priority_score=70,
+        )
+        rows = await crawler_db.list_ready_graph_nodes(session, limit=10)
+        await crawler_db.mark_graph_node_status(
+            session,
+            low.id,
+            status=CrawlGraphNodeStatus.FAILED,
+            last_error="fetch_failed",
+            increment_attempt=True,
+        )
+        failed = await session.get(CrawlGraphNode, low.id)
+
+    assert [row.id for row in rows] == [high.id, retry.id, low.id]
+    assert failed.status == CrawlGraphNodeStatus.FAILED.value
+    assert failed.attempt_count == 1
+    assert failed.last_error == "fetch_failed"
+    await db.close()
+
+
+async def test_ensure_runtime_schema_creates_crawl_graph_tables_for_existing_db(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "crawl_graph_schema.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        await session.execute(text("DROP TABLE crawl_graph_edges"))
+        await session.execute(text("DROP TABLE crawl_graph_nodes"))
+
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        tables = (
+            await session.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name IN ('crawl_graph_nodes', 'crawl_graph_edges')"
+                )
+            )
+        ).scalars().all()
+        await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            url="https://www.example.edu.cn/orgs",
+        )
+
+    assert set(tables) == {"crawl_graph_nodes", "crawl_graph_edges"}
     await db.close()

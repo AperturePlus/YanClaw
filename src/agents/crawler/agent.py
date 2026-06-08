@@ -16,9 +16,13 @@ from agents.crawler import agent_detail, agent_parsing, form_pagination
 from agents.crawler.entrances import ManualOrgUnitEntrance
 from agents.crawler.extraction_pipeline import ExtractionPipeline
 from agents.crawler.faculty_discovery import FacultyDiscoveryService
+from agents.crawler.fetch_failures import is_retryable_fetch_failure
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.fetch_scheduler import FetchScheduler
 from agents.crawler.models import (
+    CrawlGraphEdgeType,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
     CrawlStatus,
     CrawlTaskKind,
     CrawlTaskStatus,
@@ -26,6 +30,7 @@ from agents.crawler.models import (
     OrgUnitStatus,
     UniversityMeta,
 )
+from agents.crawler.graph_frontier import GraphFetchCandidate, GraphFrontier
 from agents.crawler.org_unit_filter import (
     ORG_UNIT_FILTER_STATE,
     hard_filter_org_unit_payloads,
@@ -143,6 +148,9 @@ class _QueuedUrl:
     org_unit_id: int | None = None
     fetch_action: dict[str, Any] | None = None
     identity_url: str | None = None
+    graph_node_id: int | None = None
+    graph_node_type: str = ""
+    graph_priority_score: float = 0.0
 
     @property
     def queue_url(self) -> str:
@@ -167,6 +175,7 @@ class _ExtractionTaskItem:
     task_kind: str = CrawlTaskKind.LIST_PAGE.value
     recovered: bool = False
     name_homepage_candidates: dict[str, str] = field(default_factory=dict)
+    graph_node_id: int | None = None
 
 
 @dataclass
@@ -294,6 +303,7 @@ class CrawlerAgent:
         self.fetch_scheduler = FetchScheduler(self)
         self.faculty_discovery = FacultyDiscoveryService(self)
         self.detail_enricher = agent_detail.DetailEnricher(self)
+        self.graph_frontier = GraphFrontier(self)
         self.prompt_builder = CrawlerPromptBuilder(
             context_manager=self.context_manager,
             fetcher=self.fetcher,
@@ -701,9 +711,24 @@ class CrawlerAgent:
         )
 
         manual_org_units = await self._seed_manual_org_units()
+        if manual_org_units or self.org_unit_listing_urls:
+            await self.graph_frontier.seed_manual_entrances(
+                org_units=manual_org_units,
+                manual_org_units=self.manual_org_units,
+                org_unit_listing_urls=self.org_unit_listing_urls,
+            )
         org_units = manual_org_units or list(resume_seed_org_units)
         if not org_units and self.org_unit_listing_urls:
+            graph_candidates = await self.graph_frontier.next_fetch_candidates(
+                limit=max(1, len(self.org_unit_listing_urls)),
+                node_types=[CrawlGraphNodeType.ORG_LISTING_URL],
+            )
+            listing_url_keys = {_sanitize_url(url) for url in self.org_unit_listing_urls if _sanitize_url(url)}
             org_unit_pages = [
+                self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                for candidate in graph_candidates
+                if _sanitize_url(candidate.url) in listing_url_keys
+            ] or [
                 _QueuedUrl(url=url, depth=1, label="manual_org_listing")
                 for url in self.org_unit_listing_urls
             ]
@@ -739,7 +764,7 @@ class CrawlerAgent:
 
         self._target_org_unit_ids = {int(unit.id) for unit in org_units if unit.id is not None}
         if manual_org_units:
-            manual_faculty_links = self._manual_faculty_links_for_org_units(org_units)
+            manual_faculty_links = await self._manual_faculty_links_for_org_units(org_units)
             if manual_faculty_links:
                 self.logger.info(
                     "Manual faculty entrances university=%s links=%s",
@@ -795,7 +820,7 @@ class CrawlerAgent:
                 seeded.append(row)
         return seeded
 
-    def _manual_faculty_links_for_org_units(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
+    async def _manual_faculty_links_for_org_units(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
         if not self.manual_org_units or not org_units:
             return []
         units_by_name: dict[str, OrgUnit] = {}
@@ -828,7 +853,26 @@ class CrawlerAgent:
                     org_unit_id=unit.id,
                 )
             )
-        return _dedupe_queue(result)
+        result = _dedupe_queue(result)
+        if not result:
+            return []
+        graph_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=self.start_url,
+            links=result,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            edge_type=CrawlGraphEdgeType.SEEDED_FROM_MANIFEST,
+            source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            depth=1,
+            confidence=1.0,
+            metadata={"source": "manifest"},
+            source_status=CrawlGraphNodeStatus.DONE,
+        )
+        if not graph_candidates:
+            return result
+        return [
+            self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+            for candidate in graph_candidates
+        ]
 
     def _org_units_without_manual_faculty(self, org_units: list[OrgUnit]) -> list[OrgUnit]:
         with_faculty = {
@@ -1017,11 +1061,29 @@ class CrawlerAgent:
                 )
             links = [home.url]
 
-        return [
+        org_page_items = [
             _QueuedUrl(url=link, depth=1, label="org_unit_page")
             for link in links[:20]
             if self._within_depth(1)
         ]
+        graph_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=home.url,
+            links=org_page_items,
+            node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+            source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            depth=1,
+            confidence=1.0,
+            metadata={"source": "org_page_discovery"},
+            source_status=CrawlGraphNodeStatus.DONE,
+        )
+        if graph_candidates:
+            return [
+                self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                for candidate in graph_candidates
+            ]
+        return org_page_items
+
     async def _extract_org_units(self, org_unit_pages: list[_QueuedUrl]) -> list[OrgUnit]:
         self._log_state(CrawlerState.EXTRACT_ORG_UNITS)
         skills = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
@@ -1072,6 +1134,7 @@ class CrawlerAgent:
                 else:
                     followups = ranked_followups
                 added_followups: list[str] = []
+                followup_items: list[_QueuedUrl] = []
                 for link in followups:
                     if link in seen_pages:
                         continue
@@ -1081,9 +1144,21 @@ class CrawlerAgent:
                     if not self._within_depth(next_depth):
                         continue
                     seen_pages.add(link)
-                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    followup_item = _QueuedUrl(url=link, depth=next_depth, label=page.label)
+                    pending.append(followup_item)
+                    followup_items.append(followup_item)
                     added_followups.append(link)
                 if added_followups:
+                    await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=followup_items,
+                        node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        depth=page.depth + 1,
+                        confidence=0.8,
+                        metadata={"source": "org_unit_llm_followup"},
+                    )
                     self.logger.debug(
                         "Org-unit extraction followups from LLM hint page=%s added=%s sample=%s",
                         fetched.url,
@@ -1134,18 +1209,22 @@ class CrawlerAgent:
                 source="extract_org_units",
             )
 
+            stored_units: list[OrgUnit] = []
             async with self.db.session() as session:
                 for unit in filtered_units:
                     kind = str(unit.get("kind") or "").strip() or None
                     if _is_core_academic_kind(kind):
                         core_validated_total += 1
-                    await crawler_db.get_or_create_org_unit(
+                    row = await crawler_db.get_or_create_org_unit(
                         session,
                         name=str(unit.get("name") or ""),
                         url=str(unit.get("url") or ""),
                         kind=kind,
                         discovered_from_url=str(unit.get("discovered_from_url") or fetched.url),
                     )
+                    stored_units.append(row)
+            if stored_units:
+                await self.graph_frontier.record_org_units(stored_units, source_url=fetched.url)
 
             if hallucinated:
                 self.logger.info(
@@ -1164,6 +1243,7 @@ class CrawlerAgent:
                 if preferred_followups:
                     followups = preferred_followups
                 added_followups: list[str] = []
+                followup_items: list[_QueuedUrl] = []
                 for link in followups[:8]:
                     if link in seen_pages:
                         continue
@@ -1171,9 +1251,21 @@ class CrawlerAgent:
                     if not self._within_depth(next_depth):
                         continue
                     seen_pages.add(link)
-                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    followup_item = _QueuedUrl(url=link, depth=next_depth, label=page.label)
+                    pending.append(followup_item)
+                    followup_items.append(followup_item)
                     added_followups.append(link)
                 if added_followups:
+                    await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=followup_items,
+                        node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        depth=page.depth + 1,
+                        confidence=0.7,
+                        metadata={"source": "org_unit_zero_validated_followup"},
+                    )
                     self.logger.debug(
                         "Org-unit validation produced 0 accepted; queued followups page=%s added=%s sample=%s",
                         fetched.url,
@@ -1554,6 +1646,23 @@ class CrawlerAgent:
                     faculty_for_unit.append(_QueuedUrl(url=link, depth=depth, label=item.label, org_unit_id=item.org_unit_id))
 
             if faculty_for_unit:
+                graph_candidates = await self.graph_frontier.record_discovered_links(
+                    source_url=fetched.url,
+                    links=faculty_for_unit,
+                    node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                    edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                    source_node_type=CrawlGraphNodeType.ORG_UNIT,
+                    org_unit_name=org_unit.name,
+                    org_unit_id=org_unit.id,
+                    depth=item.depth + 1,
+                    confidence=1.0,
+                    metadata={"source": "streaming_faculty_discovery"},
+                )
+                if graph_candidates:
+                    faculty_for_unit = [
+                        self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                        for candidate in graph_candidates
+                    ]
                 self.logger.info(
                     "Streaming: extracting professors for %s (%d faculty pages)",
                     org_unit.name, len(faculty_for_unit),
@@ -1686,14 +1795,33 @@ class CrawlerAgent:
             for link in links[:max_links_per_org_unit]:
                 depth = item.depth + (0 if link == fetched.url else 1)
                 if self._within_depth(depth):
-                    faculty_links.append(
+                    faculty_for_unit = [
                         _QueuedUrl(
                             url=link,
                             depth=depth,
                             label=item.label,
                             org_unit_id=item.org_unit_id,
                         )
+                    ]
+                    graph_candidates = await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=faculty_for_unit,
+                        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_UNIT,
+                        org_unit_name=org_unit.name,
+                        org_unit_id=org_unit.id,
+                        depth=depth,
+                        confidence=1.0,
+                        metadata={"source": "batch_faculty_discovery"},
                     )
+                    if graph_candidates:
+                        faculty_links.extend(
+                            self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                            for candidate in graph_candidates
+                        )
+                    else:
+                        faculty_links.extend(faculty_for_unit)
 
         if not faculty_links:
             self.logger.info("No faculty links from org units, trying search engine fallback")
@@ -1853,13 +1981,13 @@ class CrawlerAgent:
             processed_urls.add(key)
             return True
 
-        def _schedule_related_pages(
+        async def _schedule_related_pages(
             current: _QueuedUrl,
             fetched: FetchResult,
             pages_to_process: list[_QueuedUrl],
         ) -> set[str]:
-            added_followups: list[str] = []
             skipped_duplicates = 0
+            followup_items: list[_QueuedUrl] = []
             followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
             for link in followups[:_FOLLOWUP_PAGE_LIMIT]:
                 next_depth = current.depth + 1
@@ -1874,10 +2002,9 @@ class CrawlerAgent:
                 if not _mark_scheduled(followup_item):
                     skipped_duplicates += 1
                     continue
-                pages_to_process.append(followup_item)
-                added_followups.append(link)
+                followup_items.append(followup_item)
 
-            added_pagination: list[str] = []
+            pagination_items: list[_QueuedUrl] = []
             pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
             for plink in pagination_links:
                 if not self._within_depth(current.depth):
@@ -1891,8 +2018,7 @@ class CrawlerAgent:
                 if not _mark_scheduled(page_item):
                     skipped_duplicates += 1
                     continue
-                pages_to_process.append(page_item)
-                added_pagination.append(plink)
+                pagination_items.append(page_item)
 
             for state in getattr(fetched, "pagination_states", ()) or ():
                 action = form_pagination.pagination_state_to_fetch_action(state)
@@ -1912,8 +2038,56 @@ class CrawlerAgent:
                 if not _mark_scheduled(page_item):
                     skipped_duplicates += 1
                     continue
-                pages_to_process.append(page_item)
-                added_pagination.append(identity_url)
+                pagination_items.append(page_item)
+
+            followup_candidates = []
+            pagination_candidates = []
+            if followup_items:
+                followup_candidates = await self.graph_frontier.record_discovered_links(
+                    source_url=fetched.url,
+                    links=followup_items,
+                    node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+                    edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                    source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                    org_unit_name=current.label,
+                    org_unit_id=current.org_unit_id,
+                    depth=current.depth + 1,
+                    confidence=0.8,
+                    metadata={"source": "faculty_followup"},
+                )
+            if pagination_items:
+                pagination_candidates = await self.graph_frontier.record_discovered_links(
+                    source_url=fetched.url,
+                    links=pagination_items,
+                    node_type=CrawlGraphNodeType.PAGINATION_URL,
+                    edge_type=CrawlGraphEdgeType.PAGINATION_OF,
+                    source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                    org_unit_name=current.label,
+                    org_unit_id=current.org_unit_id,
+                    depth=current.depth,
+                    confidence=0.9,
+                    metadata={"source": "pagination"},
+                )
+
+            appended_items: list[_QueuedUrl] = []
+            if pagination_candidates:
+                appended_items.extend(
+                    self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                    for candidate in pagination_candidates
+                )
+            else:
+                appended_items.extend(pagination_items)
+            if followup_candidates:
+                appended_items.extend(
+                    self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                    for candidate in followup_candidates
+                )
+            else:
+                appended_items.extend(followup_items)
+            pages_to_process.extend(appended_items)
+
+            added_followups = [item.queue_url for item in followup_items]
+            added_pagination = [item.queue_url for item in pagination_items]
 
             if added_followups:
                 self._pipeline_stats["followups_scheduled"] = int(
@@ -1948,17 +2122,49 @@ class CrawlerAgent:
                     current = pages_to_process.pop(0)
                     if not _mark_processing(current):
                         continue
+                    await self.graph_frontier.mark_node_status(
+                        current.graph_node_id,
+                        status=CrawlGraphNodeStatus.IN_PROGRESS,
+                    )
                     if self._is_noise_or_login_candidate(current.url):
                         self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="noise_or_login_candidate",
+                        )
                         continue
                     fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
                     if fetched is None:
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.RETRY,
+                            last_error="fetch_failed",
+                            increment_attempt=True,
+                        )
+                        continue
+                    if is_retryable_fetch_failure(fetched.block_reason):
+                        await self._mark_retryable_fetch_failure(
+                            current,
+                            fetched,
+                            detail_mode=False,
+                        )
                         continue
                     if self._is_noise_or_login_candidate(fetched.url):
                         self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="noise_or_login_page",
+                        )
                         continue
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="retired_page",
+                        )
                         continue
                     skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
                     if skip_llm:
@@ -1970,6 +2176,11 @@ class CrawlerAgent:
                             fetched.url,
                             skip_reason,
                         )
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error=f"skipped_by_gate:{skip_reason or 'unknown'}",
+                        )
                     else:
                         await self._extract_professors_from_page(
                             current,
@@ -1977,7 +2188,11 @@ class CrawlerAgent:
                             skills,
                             detail_mode=False,
                         )
-                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.DONE,
+                        )
+                    reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
                     await self._enrich_profiles_with_detail_backend(
                         current,
                         fetched,
@@ -2022,17 +2237,49 @@ class CrawlerAgent:
                     current = pages_to_process.pop(0)
                     if not _mark_processing(current):
                         continue
+                    await self.graph_frontier.mark_node_status(
+                        current.graph_node_id,
+                        status=CrawlGraphNodeStatus.IN_PROGRESS,
+                    )
                     if self._is_noise_or_login_candidate(current.url):
                         self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="noise_or_login_candidate",
+                        )
                         continue
                     fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
                     if fetched is None:
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.RETRY,
+                            last_error="fetch_failed",
+                            increment_attempt=True,
+                        )
+                        continue
+                    if is_retryable_fetch_failure(fetched.block_reason):
+                        await self._mark_retryable_fetch_failure(
+                            current,
+                            fetched,
+                            detail_mode=False,
+                        )
                         continue
                     if self._is_noise_or_login_candidate(fetched.url):
                         self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="noise_or_login_page",
+                        )
                         continue
                     if self._is_retired_page(fetched):
                         self.logger.info("Skip retired faculty page url=%s", fetched.url)
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error="retired_page",
+                        )
                         continue
                     skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
                     if skip_llm:
@@ -2044,6 +2291,11 @@ class CrawlerAgent:
                             fetched.url,
                             skip_reason,
                         )
+                        await self.graph_frontier.mark_node_status(
+                            current.graph_node_id,
+                            status=CrawlGraphNodeStatus.SKIPPED,
+                            last_error=f"skipped_by_gate:{skip_reason or 'unknown'}",
+                        )
                     else:
                         await self._enqueue_extraction_task(
                             current,
@@ -2052,7 +2304,7 @@ class CrawlerAgent:
                             detail_mode=False,
                             priority=0,
                         )
-                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
+                    reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
                     previous_detail_queue = self._active_detail_llm_queue
                     self._active_detail_llm_queue = llm_queue
                     try:
@@ -2146,6 +2398,15 @@ class CrawlerAgent:
         if self._is_home_path(final_path) and not self._is_home_path(requested_path):
             return True, "redirect_to_home"
 
+        if not detail_mode:
+            final_assessment = _assess_faculty_candidate(final)
+            if (
+                final_assessment.hard_reject
+                or final_assessment.page_type == FACULTY_PAGE_TYPE_NOISE
+                or _is_non_faculty_noise_url(final)
+            ):
+                return True, "redirect_to_noise"
+
         current_dir = self._derive_section_prefix(requested_path)
         if not current_dir:
             return False, ""
@@ -2168,6 +2429,33 @@ class CrawlerAgent:
         else:
             self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
 
+    async def _mark_retryable_fetch_failure(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        *,
+        detail_mode: bool,
+    ) -> None:
+        reason = (fetched.block_reason or "fetch_failed").strip() or "fetch_failed"
+        if detail_mode:
+            self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
+        else:
+            self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+        self.logger.warning(
+            "Skip professor extraction after retryable fetch failure url=%s reason=%s detail_mode=%s text_len=%s links=%s",
+            fetched.url,
+            reason,
+            detail_mode,
+            len((fetched.text or "").strip()),
+            len(fetched.links or []),
+        )
+        await self.graph_frontier.mark_node_status(
+            current.graph_node_id,
+            status=CrawlGraphNodeStatus.RETRY,
+            last_error=f"fetch_failure:{reason}",
+            increment_attempt=True,
+        )
+
     async def _enqueue_extraction_task(
         self,
         current: _QueuedUrl,
@@ -2178,6 +2466,13 @@ class CrawlerAgent:
         priority: int,
         requested_url: str | None = None,
     ) -> None:
+        if is_retryable_fetch_failure(fetched.block_reason):
+            await self._mark_retryable_fetch_failure(
+                current,
+                fetched,
+                detail_mode=detail_mode,
+            )
+            return
         source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return
@@ -2196,6 +2491,11 @@ class CrawlerAgent:
                 detail_mode,
                 redirect_reason,
             )
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error=f"redirect:{redirect_reason}",
+            )
             return
         if final_url != source_url:
             self.logger.debug(
@@ -2209,6 +2509,11 @@ class CrawlerAgent:
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
         allowed_tools = ["save_professors"]
         task_kind = CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value
+        task_priority = (
+            -int(current.graph_priority_score)
+            if float(current.graph_priority_score or 0.0) > 0.0
+            else int(priority or 0)
+        )
         name_homepage_candidates = self._extract_name_homepage_candidates(
             fetched,
             source_url=source_url,
@@ -2228,7 +2533,7 @@ class CrawlerAgent:
                 page_text_snapshot=snapshot,
                 allowed_tools=json.dumps(sorted(allowed_tools), ensure_ascii=False, separators=(",", ":")),
                 attempt=0,
-                priority=priority,
+                priority=task_priority,
                 status=CrawlTaskStatus.PENDING,
             )
             if row.status != CrawlTaskStatus.PENDING.value:
@@ -2244,6 +2549,12 @@ class CrawlerAgent:
                     source_url,
                     row.status,
                     row.id,
+                )
+                await self.graph_frontier.mark_node_status(
+                    current.graph_node_id,
+                    status=CrawlGraphNodeStatus.DONE,
+                    last_error=f"existing_crawl_task:{row.status}",
+                    metadata={"crawl_task_id": int(row.id)},
                 )
                 return
             task = _ExtractionTaskItem(
@@ -2262,7 +2573,13 @@ class CrawlerAgent:
                 detail_mode=detail_mode,
                 task_kind=str(getattr(row, "task_kind", None) or task_kind),
                 name_homepage_candidates=name_homepage_candidates,
+                graph_node_id=current.graph_node_id,
             )
+        await self.graph_frontier.mark_node_status(
+            current.graph_node_id,
+            status=CrawlGraphNodeStatus.IN_PROGRESS,
+            metadata={"crawl_task_id": int(task.task_id), "task_kind": task.task_kind},
+        )
         await llm_queue.put(task)
         self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
         if detail_mode:
@@ -2394,9 +2711,33 @@ class CrawlerAgent:
                 "status": row.status,
                 "last_error": row.last_error,
             }
+            graph_node_type = (
+                CrawlGraphNodeType.DETAIL_URL
+                if detail_mode
+                else CrawlGraphNodeType.FACULTY_LIST_URL
+            )
+            graph_candidate = await self.graph_frontier.ensure_url_node(
+                url=str(row_data["source_url"] or row_data["page_url"] or ""),
+                node_type=graph_node_type,
+                org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
+                status=CrawlGraphNodeStatus.RETRY
+                if row_data["status"] == CrawlTaskStatus.RETRY.value
+                else CrawlGraphNodeStatus.PENDING,
+                depth=1,
+                priority_score=float(row_data["priority"] or 0),
+                metadata={"crawl_task_id": int(row_data["id"]), "recovered": True},
+            )
             if self._recovered_task_needs_refetch(row_data, detail_mode=detail_mode):
                 refreshed = await self._refetch_recovered_detail_task(row_data)
                 if refreshed is None:
+                    if graph_candidate is not None:
+                        await self.graph_frontier.mark_node_status(
+                            graph_candidate.node_id,
+                            status=CrawlGraphNodeStatus.RETRY,
+                            last_error="recovered_refetch_failed",
+                            increment_attempt=True,
+                            metadata={"crawl_task_id": int(row_data["id"])},
+                        )
                     continue
                 row_data = refreshed
             if row.allowed_tools:
@@ -2430,6 +2771,7 @@ class CrawlerAgent:
                         source_url=str(row_data["source_url"] or row_data["page_url"] or ""),
                     )
                 ),
+                graph_node_id=graph_candidate.node_id if graph_candidate is not None else None,
             )
             if row_data["status"] == CrawlTaskStatus.RETRY.value:
                 self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
@@ -2582,6 +2924,11 @@ class CrawlerAgent:
                 attempt=task.attempt,
                 last_error=f"skipped_by_gate:{reason or 'unknown'}",
             )
+        await self.graph_frontier.mark_node_status(
+            task.graph_node_id,
+            status=CrawlGraphNodeStatus.SKIPPED,
+            last_error=f"skipped_by_gate:{reason or 'unknown'}",
+        )
         self._pipeline_stats["done"] += 1
         self._pipeline_stats["processed_tasks"] += 1
         self._increment_task_kind_stat(task, "skipped")
@@ -2615,6 +2962,11 @@ class CrawlerAgent:
             current_task = task
             retry_exhausted = False
             while True:
+                await self.graph_frontier.mark_node_status(
+                    current_task.graph_node_id,
+                    status=CrawlGraphNodeStatus.IN_PROGRESS,
+                    metadata={"crawl_task_id": current_task.task_id},
+                )
                 async with self.db.session() as session:
                     await crawler_db.set_crawl_task_status(
                         session,
@@ -2695,6 +3047,12 @@ class CrawlerAgent:
                         attempt=task.attempt,
                         resolver="dropped",
                     )
+                await self.graph_frontier.mark_node_status(
+                    task.graph_node_id,
+                    status=CrawlGraphNodeStatus.FAILED,
+                    last_error=f"save_error:{error}",
+                    metadata={"crawl_task_id": task.task_id},
+                )
                 self._pipeline_stats["failed"] += 1
                 self._increment_task_kind_stat(task, "failed")
                 self._pipeline_stats["save_errors"] += 1
@@ -2708,6 +3066,16 @@ class CrawlerAgent:
                     status=CrawlTaskStatus.DONE,
                     attempt=task.attempt,
                 )
+            await self.graph_frontier.mark_node_status(
+                task.graph_node_id,
+                status=CrawlGraphNodeStatus.DONE,
+                metadata={
+                    "crawl_task_id": task.task_id,
+                    "accepted": int(save_summary.get("accepted", 0) or 0),
+                    "created": int(save_summary.get("created", 0) or 0),
+                    "updated": int(save_summary.get("updated", 0) or 0),
+                },
+            )
             self._pipeline_stats["done"] += 1
             self._pipeline_stats["processed_tasks"] += 1
             self._increment_task_kind_stat(task, "processed")
@@ -2743,6 +3111,12 @@ class CrawlerAgent:
                     attempt=task.attempt,
                     resolver="retry",
                 )
+            await self.graph_frontier.mark_node_status(
+                task.graph_node_id,
+                status=CrawlGraphNodeStatus.RETRY,
+                last_error=_RICH_DETAIL_NO_STRUCTURED_DATA,
+                metadata={"crawl_task_id": task.task_id},
+            )
             self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
             self._pipeline_stats["no_structured_data_recoverable"] = int(
                 self._pipeline_stats.get("no_structured_data_recoverable", 0)
@@ -2773,6 +3147,12 @@ class CrawlerAgent:
                 attempt=task.attempt,
                 resolver="dropped",
             )
+        await self.graph_frontier.mark_node_status(
+            task.graph_node_id,
+            status=CrawlGraphNodeStatus.FAILED,
+            last_error="no_structured_data",
+            metadata={"crawl_task_id": task.task_id},
+        )
         self._pipeline_stats["failed"] += 1
         self._increment_task_kind_stat(task, "failed")
         self._pipeline_stats["no_structured_data_failures"] += 1
@@ -2815,6 +3195,7 @@ class CrawlerAgent:
                 task_kind=task.task_kind,
                 recovered=task.recovered,
                 name_homepage_candidates=task.name_homepage_candidates,
+                graph_node_id=task.graph_node_id,
             )
             async with self.db.session() as session:
                 await crawler_db.set_crawl_task_status(
@@ -2834,6 +3215,13 @@ class CrawlerAgent:
                     attempt=next_attempt,
                     resolver="retry",
                 )
+            await self.graph_frontier.mark_node_status(
+                task.graph_node_id,
+                status=CrawlGraphNodeStatus.RETRY,
+                last_error="invalid_json_retry",
+                increment_attempt=True,
+                metadata={"crawl_task_id": task.task_id},
+            )
             self._pipeline_stats["retries"] += 1
             return retry_task
 
@@ -2855,6 +3243,13 @@ class CrawlerAgent:
                 attempt=task.attempt,
                 resolver="retry",
             )
+        await self.graph_frontier.mark_node_status(
+            task.graph_node_id,
+            status=CrawlGraphNodeStatus.RETRY,
+            last_error="invalid_json_retry_exhausted",
+            increment_attempt=True,
+            metadata={"crawl_task_id": task.task_id},
+        )
         self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
         self._increment_task_kind_stat(task, "failed")
         self._pipeline_stats["invalid_json_failures"] += 1
@@ -3656,6 +4051,13 @@ class CrawlerAgent:
         detail_mode: bool,
         requested_url: str | None = None,
     ) -> int:
+        if is_retryable_fetch_failure(fetched.block_reason):
+            await self._mark_retryable_fetch_failure(
+                current,
+                fetched,
+                detail_mode=detail_mode,
+            )
+            return 0
         saved_before = self.saved_professors
         source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
@@ -3782,7 +4184,12 @@ class CrawlerAgent:
             reserved_urls=reserved_urls,
         )
 
-    async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
+    async def _process_detail_urls_with_human(
+        self,
+        urls: list[str | GraphFetchCandidate],
+        current: _QueuedUrl,
+        skills: str,
+    ) -> None:
         await self.detail_enricher.process_detail_urls_with_human(urls, current, skills)
 
     def _extract_detail_profile_links(

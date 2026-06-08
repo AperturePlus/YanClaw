@@ -40,6 +40,8 @@ async def ensure_runtime_schema(session: AsyncSession, *, repair_identity: bool 
     if session.bind is None or session.bind.dialect.name != "sqlite":
         return
 
+    await _ensure_crawl_graph_schema(session)
+
     await session.execute(
         text(
             """
@@ -161,6 +163,82 @@ async def ensure_runtime_schema(session: AsyncSession, *, repair_identity: bool 
                 "WHERE name_key IS NOT NULL AND trim(name_key) <> ''"
             )
         )
+
+
+async def _ensure_crawl_graph_schema(session: AsyncSession) -> None:
+    await session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_graph_nodes (
+                id INTEGER PRIMARY KEY,
+                node_key VARCHAR(512) NOT NULL,
+                type VARCHAR(64) NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                org_unit_name VARCHAR(255) NOT NULL DEFAULT '',
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                priority_score FLOAT NOT NULL DEFAULT 0.0,
+                confidence FLOAT NOT NULL DEFAULT 1.0,
+                depth INTEGER NOT NULL DEFAULT 0,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+    )
+    await session.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_graph_edges (
+                id INTEGER PRIMARY KEY,
+                from_node_id INTEGER NOT NULL,
+                to_node_id INTEGER NOT NULL,
+                edge_type VARCHAR(64) NOT NULL,
+                confidence FLOAT NOT NULL DEFAULT 1.0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME,
+                updated_at DATETIME,
+                FOREIGN KEY(from_node_id) REFERENCES crawl_graph_nodes(id),
+                FOREIGN KEY(to_node_id) REFERENCES crawl_graph_nodes(id)
+            )
+            """
+        )
+    )
+    await session.execute(
+        text("CREATE UNIQUE INDEX IF NOT EXISTS uq_crawl_graph_node_key ON crawl_graph_nodes(node_key)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_type ON crawl_graph_nodes(type)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_url ON crawl_graph_nodes(url)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_org_unit_name ON crawl_graph_nodes(org_unit_name)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_status ON crawl_graph_nodes(status)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_priority_score ON crawl_graph_nodes(priority_score)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_edges_from_node_id ON crawl_graph_edges(from_node_id)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_edges_to_node_id ON crawl_graph_edges(to_node_id)")
+    )
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_edges_edge_type ON crawl_graph_edges(edge_type)")
+    )
+    await session.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_crawl_graph_edge "
+            "ON crawl_graph_edges(from_node_id, to_node_id, edge_type)"
+        )
+    )
 
 
 async def _backfill_name_keys(session: AsyncSession) -> None:

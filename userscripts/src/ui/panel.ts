@@ -1,7 +1,6 @@
-import { failCurrent, overrideUrl, skipCurrent, submitCurrent, switchPendingDecisionToHuman } from '../actions';
+import { failCurrent, openCurrent, overrideUrl, skipCurrent, submitCurrent, switchPendingDecisionToHuman } from '../actions';
 import { setAutoMode, setMinimized, state, togglePaused } from '../state';
 import { urlMatches } from '../utils';
-import { performFetchAction } from '../formPagination';
 import {
   renderActions,
   renderDecision,
@@ -68,9 +67,7 @@ function bindEvents(): void {
     if (job) void navigator.clipboard.writeText(job.url);
   });
   bind('ycl-open', 'click', () => {
-    if (!job) return;
-    if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
-    window.location.href = job.url;
+    openCurrent();
   });
   bind('ycl-submit', 'click', submitCurrent);
   bind('ycl-skip', 'click', skipCurrent);

@@ -41,7 +41,7 @@ class CrawlerSettings(BaseSettings):
     recommend_top_professors: int = Field(default=20, ge=1)
     human_server_host: str = "127.0.0.1"
     human_server_port: int = 21520
-    human_job_timeout_seconds: float = 60.0
+    human_job_timeout_seconds: float = 180.0
     detail_enrich_enabled: bool = True
     detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
     pipeline_enabled: bool = True

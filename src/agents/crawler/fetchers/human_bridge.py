@@ -36,7 +36,7 @@ class HumanFetcherBridge:
         *,
         host: str = "127.0.0.1",
         port: int = 21520,
-        job_timeout_seconds: float = 300.0,
+        job_timeout_seconds: float = 180.0,
     ) -> None:
         self.host = host
         self.port = port

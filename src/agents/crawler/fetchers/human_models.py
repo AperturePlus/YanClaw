@@ -54,7 +54,7 @@ class FetchJob:
 
     url: str
     context: JobContext
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 180.0
     action: dict[str, Any] | None = None
     identity_url: str | None = None
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -68,6 +68,7 @@ class FetchJob:
     result_title: str | None = None
     result_pagination_states: tuple[dict[str, Any], ...] = ()
     error_message: str | None = None
+    completed_after_timeout: bool = False
     # Async coordination
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -170,7 +171,10 @@ class JobQueue:
         pagination_states: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
     ) -> FetchJob:
         job = self._require(job_id)
-        if job.status in {FetchJobStatus.COMPLETED, FetchJobStatus.FAILED, FetchJobStatus.SKIPPED}:
+        was_timeout = job.status == FetchJobStatus.FAILED and (job.error_message or "").strip().lower() == "timeout"
+        if job.status in {FetchJobStatus.COMPLETED, FetchJobStatus.SKIPPED}:
+            return job
+        if job.status == FetchJobStatus.FAILED and not was_timeout:
             return job
         job.status = FetchJobStatus.COMPLETED
         job.completed_at = datetime.now(timezone.utc)
@@ -178,6 +182,9 @@ class JobQueue:
         job.result_url = url or job.url
         job.result_title = title
         job.result_pagination_states = tuple(item for item in (pagination_states or ()) if isinstance(item, dict))
+        job.completed_after_timeout = was_timeout
+        if was_timeout:
+            job.error_message = None
         job.done_event.set()
         return job
 

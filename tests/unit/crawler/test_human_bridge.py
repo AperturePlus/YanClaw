@@ -123,7 +123,7 @@ async def test_fetch_timeout():
     bridge = HumanFetcherBridge(job_timeout_seconds=0.1)
     result = await bridge.fetch("https://example.edu.cn/")
     assert result.status_code == 0
-    assert "timeout" in (result.block_reason or "")
+    assert result.block_reason == "timeout"
 
 
 async def test_set_context_propagates():
@@ -168,9 +168,26 @@ async def test_queue_complete_cannot_override_failed_job():
     bridge = HumanFetcherBridge(job_timeout_seconds=5)
     job = FetchJob(url="https://example.edu.cn/", context=JobContext())
     await bridge.queue.submit(job)
-    bridge.queue.fail(job.id, "timeout")
+    bridge.queue.fail(job.id, "login required")
     bridge.queue.complete(job.id, html="<html><body>late</body></html>", url="https://example.edu.cn/late")
 
     stored = bridge.queue.get(job.id)
     assert stored is not None
     assert stored.status == FetchJobStatus.FAILED
+    assert stored.result_html is None
+
+
+async def test_queue_complete_accepts_late_timeout_result():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    job = FetchJob(url="https://example.edu.cn/", context=JobContext())
+    await bridge.queue.submit(job)
+    bridge.queue.fail(job.id, "timeout")
+    bridge.queue.complete(job.id, html="<html><body>late</body></html>", url="https://example.edu.cn/late")
+
+    stored = bridge.queue.get(job.id)
+    assert stored is not None
+    assert stored.status == FetchJobStatus.COMPLETED
+    assert stored.completed_after_timeout is True
+    assert stored.result_html == "<html><body>late</body></html>"
+    assert stored.result_url == "https://example.edu.cn/late"
+    assert stored.error_message is None

@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from typing import Any
 from urllib.parse import urlparse
 
 from sqlalchemy import func, or_, select
 
-from agents.crawler.models import CrawlTask, CrawlTaskKind, OrgUnit, Professor, ProfessorAffiliation
+from agents.crawler.graph_frontier import GraphFetchCandidate
+from agents.crawler.models import (
+    CrawlGraphEdgeType,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
+    CrawlTask,
+    CrawlTaskKind,
+    OrgUnit,
+    Professor,
+    ProfessorAffiliation,
+)
 from agents.crawler.sanitizer import contains_self_academician_hint, normalize_name
 from agents.crawler.url_heuristics import (
     _is_explicit_faculty_directory_url,
@@ -262,7 +273,7 @@ class DetailEnricher:
     ) -> None:
         await enrich_profiles_with_human(self.agent, current, fetched, skills, reserved_urls=reserved_urls)
 
-    async def process_detail_urls_with_human(self, urls: list[str], current: Any, skills: str) -> None:
+    async def process_detail_urls_with_human(self, urls: list[str | GraphFetchCandidate], current: Any, skills: str) -> None:
         await process_detail_urls_with_human(self.agent, urls, current, skills)
 
     def extract_detail_profile_links(
@@ -697,10 +708,37 @@ async def enrich_profiles_with_human(
         if getattr(sig, "url", None)
     }
 
-    pending: list[str] = []
+    detail_candidates = await self.graph_frontier.record_discovered_links(
+        source_url=fetched.url,
+        links=[
+            GraphFetchCandidate(
+                url=link,
+                depth=current.depth + 1,
+                label=current.label or "Unknown",
+                org_unit_id=getattr(current, "org_unit_id", None),
+            )
+            for link in candidates
+        ],
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+        source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name=current.label or "Unknown",
+        org_unit_id=getattr(current, "org_unit_id", None),
+        depth=current.depth + 1,
+        confidence=0.8,
+        metadata={"source": "detail_candidate"},
+    )
+    candidate_by_url = {
+        _sanitize_url(candidate.queue_url): candidate
+        for candidate in detail_candidates
+        if _sanitize_url(candidate.queue_url)
+    }
+
+    pending: list[GraphFetchCandidate] = []
     skipped_by_name = 0
     skipped_reserved = 0
     skipped_existing_task = 0
+    skipped_visited = 0
     for link in candidates:
         if len(pending) >= remaining:
             break
@@ -709,17 +747,54 @@ async def enrich_profiles_with_human(
             continue
         if normalized in existing_detail_task_urls:
             skipped_existing_task += 1
+            graph_candidate = candidate_by_url.get(normalized)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="existing_detail_task",
+                )
             continue
         if normalized in reserved:
             skipped_reserved += 1
+            graph_candidate = candidate_by_url.get(normalized)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="reserved_for_list_processing",
+                )
             continue
         if normalized in self._detail_visited_urls or normalized in self.visited_urls:
+            skipped_visited += 1
+            graph_candidate = candidate_by_url.get(normalized)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="already_visited",
+                )
             continue
         if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(normalized) or sig_by_url.get(link), enriched_names):
             skipped_by_name += 1
+            graph_candidate = candidate_by_url.get(normalized)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="already_enriched_name",
+                )
             continue
         self._detail_visited_urls.add(normalized)
-        pending.append(normalized)
+        pending.append(
+            candidate_by_url.get(normalized)
+            or GraphFetchCandidate(
+                url=normalized,
+                depth=current.depth + 1,
+                label=current.label or "Unknown",
+                org_unit_id=getattr(current, "org_unit_id", None),
+            )
+        )
 
     if skipped_by_name:
         self._pipeline_stats["detail_links_dropped_already_enriched"] = int(
@@ -781,12 +856,23 @@ async def enrich_profiles_with_human(
     self._enriched_names_by_org_unit.pop(org_unit_key, None)
 
 
-async def process_detail_urls_with_human(self: Any, urls: list[str], current: Any, skills: str) -> None:
+async def process_detail_urls_with_human(
+    self: Any,
+    urls: list[str | GraphFetchCandidate],
+    current: Any,
+    skills: str,
+) -> None:
     next_depth = current.depth + 1
     allow_profile_depth = not self._within_depth(next_depth)
     if allow_profile_depth and next_depth > getattr(self, "max_depth", 0) + 1:
         return
-    for url in urls:
+    for item in urls:
+        if isinstance(item, GraphFetchCandidate):
+            url = item.url
+            graph_candidate = item
+        else:
+            url = str(item or "")
+            graph_candidate = None
         if allow_profile_depth and not _is_same_site_primary_profile_url(
             url,
             start_url=getattr(self, "start_url", ""),
@@ -794,25 +880,62 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
             self._pipeline_stats["detail_profile_depth_gate_skipped"] = int(
                 self._pipeline_stats.get("detail_profile_depth_gate_skipped", 0)
             ) + 1
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="profile_depth_gate",
+                )
             continue
         if url in self.visited_urls:
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="already_visited",
+                )
             continue
+        detail_current = _with_detail_graph_context(current, graph_candidate)
+        if graph_candidate is not None:
+            await self.graph_frontier.mark_node_status(
+                graph_candidate.node_id,
+                status=CrawlGraphNodeStatus.IN_PROGRESS,
+            )
         fetched = await self._fetch_url(url, next_depth, allow_depth_excess=allow_profile_depth)
         if fetched is None:
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.RETRY,
+                    last_error="fetch_failed",
+                    increment_attempt=True,
+                )
             continue
         if self._is_retired_page(fetched):
             self.logger.info("Skip retired human detail page url=%s", fetched.url)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="retired_page",
+                )
             continue
         if self._looks_like_detail_directory_page(fetched):
             self._pipeline_stats["detail_directory_skipped"] = int(
                 self._pipeline_stats.get("detail_directory_skipped", 0)
             ) + 1
             self.logger.debug("Skip directory/list page from detail enrichment url=%s", fetched.url)
+            if graph_candidate is not None:
+                await self.graph_frontier.mark_node_status(
+                    graph_candidate.node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="detail_directory_page",
+                )
             continue
         llm_queue = getattr(self, "_active_detail_llm_queue", None)
         if llm_queue is not None and getattr(self, "pipeline_enabled", False):
             await self._enqueue_extraction_task(
-                current,
+                detail_current,
                 fetched,
                 llm_queue=llm_queue,
                 detail_mode=True,
@@ -821,12 +944,37 @@ async def process_detail_urls_with_human(self: Any, urls: list[str], current: An
             )
             continue
         await self._extract_professors_from_page(
-            current,
+            detail_current,
             fetched,
             skills,
             detail_mode=True,
             requested_url=url,
         )
+        if graph_candidate is not None:
+            await self.graph_frontier.mark_node_status(
+                graph_candidate.node_id,
+                status=CrawlGraphNodeStatus.DONE,
+            )
+
+
+def _with_detail_graph_context(current: Any, candidate: GraphFetchCandidate | None) -> Any:
+    if candidate is None:
+        return current
+    try:
+        return replace(
+            current,
+            graph_node_id=candidate.node_id,
+            graph_node_type=CrawlGraphNodeType.DETAIL_URL.value,
+            graph_priority_score=candidate.priority_score,
+        )
+    except Exception:
+        try:
+            setattr(current, "graph_node_id", candidate.node_id)
+            setattr(current, "graph_node_type", CrawlGraphNodeType.DETAIL_URL.value)
+            setattr(current, "graph_priority_score", candidate.priority_score)
+        except Exception:
+            return current
+        return current
 
 
 def _merge_ordered_urls(primary: list[str], secondary: list[str]) -> list[str]:

@@ -31,6 +31,11 @@ from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
     Academician,
     CrawlExtractionFailure,
+    CrawlGraphEdge,
+    CrawlGraphEdgeType,
+    CrawlGraphNode,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
     CrawlLogStatus,
     CrawlStatus,
     CrawlTask,
@@ -462,8 +467,21 @@ async def test_agent_manual_faculty_entrance_bypasses_discovery(tmp_path):
     async with db.session() as session:
         units = (await session.execute(select(OrgUnit))).scalars().all()
         professors = (await session.execute(select(Professor))).scalars().all()
+        graph_nodes = (await session.execute(select(CrawlGraphNode))).scalars().all()
+        graph_edges = (await session.execute(select(CrawlGraphEdge))).scalars().all()
         assert [unit.name for unit in units] == ["CS"]
         assert [professor.name for professor in professors] == ["Ada"]
+        faculty_nodes = [
+            node
+            for node in graph_nodes
+            if node.type == CrawlGraphNodeType.FACULTY_LIST_URL.value
+            and node.url == "https://www.example.edu.cn/cs/faculty"
+        ]
+        assert len(faculty_nodes) == 1
+        assert faculty_nodes[0].org_unit_name == "CS"
+        assert faculty_nodes[0].status == CrawlGraphNodeStatus.DONE.value
+        assert any(edge.edge_type == CrawlGraphEdgeType.SEEDED_FROM_MANIFEST.value for edge in graph_edges)
+        assert any(edge.edge_type == CrawlGraphEdgeType.BELONGS_TO_ORG_UNIT.value for edge in graph_edges)
     await db.close()
 
 
@@ -2626,6 +2644,48 @@ async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path
     await db.close()
 
 
+async def test_extract_professors_retries_timeout_page_without_llm_payload(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/szdw.html"
+
+    class CountingLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_calls = 0
+
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                self.extract_calls += 1
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    llm = CountingLLM()
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        llm,
+        pages={
+            list_url: FetchResult(
+                list_url,
+                "",
+                [],
+                0,
+                block_reason="timeout",
+            ),
+        },
+        fetcher_cls=FakeHumanFetcher,
+    )
+
+    await agent._extract_professors([_QueuedUrl(url=list_url, depth=1, label="CS")])
+
+    assert llm.extract_calls == 0
+    assert int(agent._pipeline_stats.get("list_skipped", 0)) == 1
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        retry_urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+    assert tasks == []
+    assert retry_urls == [list_url]
+    await db.close()
+
+
 async def test_list_page_anchor_links_fill_missing_homepage_before_save(tmp_path):
     list_url = "https://www.example.edu.cn/cs/faculty"
     detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
@@ -3148,6 +3208,60 @@ async def test_enqueue_extraction_task_skips_detail_redirect_to_home(tmp_path):
     assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_redirect_skipped", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_skipped", 0)) == 1
+    async with db.session() as session:
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+    assert rows == []
+    await db.close()
+
+
+async def test_enqueue_extraction_task_allows_list_redirect_to_faculty_roster(tmp_path):
+    source_url = "https://www.cs.sjtu.edu.cn/szdw.html"
+    final_url = "https://www.cs.sjtu.edu.cn/jiaoshiml.html"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    llm_queue: asyncio.Queue = asyncio.Queue()
+
+    await agent._enqueue_extraction_task(
+        _QueuedUrl(url=source_url, depth=2, label="计算机科学与工程学院"),
+        FetchResult(final_url, "教师名录\n张三 教授\n李四 副教授", [], 200),
+        llm_queue=llm_queue,
+        detail_mode=False,
+        priority=0,
+    )
+
+    assert llm_queue.qsize() == 1
+    assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 0
+    async with db.session() as session:
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].source_url == source_url
+    assert rows[0].status == CrawlTaskStatus.PENDING.value
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "final_url",
+    [
+        "https://www.example.edu.cn/cs/news/jiaoshiml.html",
+        "https://www.example.edu.cn/cs/login/jiaoshiml.html",
+    ],
+)
+async def test_enqueue_extraction_task_skips_list_redirect_to_noise_or_login(tmp_path, final_url):
+    source_url = "https://www.example.edu.cn/cs/szdw.html"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    llm_queue: asyncio.Queue = asyncio.Queue()
+
+    await agent._enqueue_extraction_task(
+        _QueuedUrl(url=source_url, depth=2, label="CS"),
+        FetchResult(final_url, "新闻 登录 师资", [], 200),
+        llm_queue=llm_queue,
+        detail_mode=False,
+        priority=0,
+    )
+
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_skipped", 0)) == 1
     async with db.session() as session:
         rows = (await session.execute(select(CrawlTask))).scalars().all()
     assert rows == []
@@ -4525,12 +4639,20 @@ async def test_dynamic_form_pagination_states_schedule_distinct_list_tasks(tmp_p
     async with db.session() as session:
         tasks = (await session.execute(select(CrawlTask))).scalars().all()
         professors = (await session.execute(select(Professor))).scalars().all()
+        graph_nodes = (await session.execute(select(CrawlGraphNode))).scalars().all()
     source_urls = {task.source_url for task in tasks}
     assert list_url in source_urls
     assert page2_identity in source_urls
     assert any(call.get("action", {}).get("form_name") == "fromWen" for call in fetcher.action_calls)
     assert {professor.name for professor in professors} == {"教师一", "教师二"}
     assert int(agent._pipeline_stats.get("pagination_scheduled", 0)) >= 1
+    pagination_nodes = [
+        node for node in graph_nodes if node.type == CrawlGraphNodeType.PAGINATION_URL.value
+    ]
+    assert len(pagination_nodes) == 1
+    assert pagination_nodes[0].url == page2_identity
+    assert pagination_nodes[0].status == CrawlGraphNodeStatus.DONE.value
+    assert any(task.priority < 0 for task in tasks)
     await db.close()
 
 
@@ -4639,7 +4761,7 @@ async def test_enrich_skips_detail_urls_when_anchor_matches_enriched_professor(t
     processed_urls: list[str] = []
 
     async def _capture(self, urls, current, skills):
-        processed_urls.extend(urls)
+        processed_urls.extend(getattr(item, "queue_url", item) for item in urls)
 
     import agents.crawler.agent_detail as _agent_detail
     original = _agent_detail.process_detail_urls_with_human
@@ -4718,6 +4840,68 @@ async def test_enrich_warns_when_pending_empty_with_candidates(tmp_path):
 
     assert int(agent._pipeline_stats.get("detail_pending_empty_with_candidates", 0)) == 1
     assert any("0 pending" in r.getMessage() for r in records)
+    await db.close()
+
+
+async def test_detail_graph_dedupes_url_and_keeps_multiple_source_edges(tmp_path):
+    detail_url = "https://soft.example.edu.cn/info/1001/ada.htm"
+    list_a = "https://soft.example.edu.cn/szdw/js.htm"
+    list_b = "https://soft.example.edu.cn/szdw/fjs.htm"
+    pages = {
+        detail_url: FetchResult(detail_url, "Ada 教授\n研究方向: systems", [], 200),
+    }
+    fetcher = FakeHumanFetcher(pages)
+    db = DatabaseManager(sqlite_url(tmp_path / "detail_graph.db"))
+    await db.init_db()
+    skills_dir = tmp_path / "skills"
+    manager = SkillManager(skills_dir, db, "crawler")
+    await manager.create_skill("save-professors", "## Goal\nsave\n", "save")
+    agent = CrawlerAgent(
+        university_name="TestU",
+        start_url="https://www.example.edu.cn/",
+        location="TestCity",
+        db=db,
+        llm_client=FakeLLMResearchDetail(),
+        skill_manager=manager,
+        context_manager=ContextManager(),
+        fetcher=fetcher,
+        max_depth=4,
+        min_org_units=1,
+    )
+
+    current_a = _QueuedUrl(url=list_a, depth=2, label="软件学院")
+    current_b = _QueuedUrl(url=list_b, depth=2, label="软件学院")
+    await agent._enrich_profiles_with_detail_backend(
+        current_a,
+        FetchResult(list_a, "教师", [detail_url], 200),
+        "",
+    )
+    await agent._enrich_profiles_with_detail_backend(
+        current_b,
+        FetchResult(list_b, "教师", [detail_url], 200),
+        "",
+    )
+
+    async with db.session() as session:
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(
+                    CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value,
+                    CrawlGraphNode.url == detail_url,
+                )
+            )
+        ).scalars().all()
+        detail_edges = (
+            await session.execute(
+                select(CrawlGraphEdge).where(
+                    CrawlGraphEdge.edge_type == CrawlGraphEdgeType.DETAIL_CANDIDATE_OF.value
+                )
+            )
+        ).scalars().all()
+
+    assert len(detail_nodes) == 1
+    assert len(detail_edges) == 2
+    assert fetcher.calls == [detail_url]
     await db.close()
 
 
@@ -5007,12 +5191,30 @@ async def test_buaa_automation_active_teacher_roster_enters_task_queue(tmp_path)
     assert result.status == CrawlStatus.COMPLETED.value
     async with db.session() as session:
         tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        graph_nodes = (await session.execute(select(CrawlGraphNode))).scalars().all()
+        graph_edges = (await session.execute(select(CrawlGraphEdge))).scalars().all()
     task_urls = {task.page_url for task in tasks}
 
     assert roster_url in task_urls
     assert followup_a in task_urls
     assert followup_b in task_urls
     assert elite_url not in task_urls
+    followup_urls = {
+        node.url
+        for node in graph_nodes
+        if node.type == CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value
+    }
+    assert {followup_a, followup_b} <= followup_urls
+    elite_nodes = [
+        node
+        for node in graph_nodes
+        if node.type == CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value
+        and node.url == elite_url
+    ]
+    assert len(elite_nodes) == 1
+    assert elite_nodes[0].status == CrawlGraphNodeStatus.RETRY.value
+    assert elite_nodes[0].last_error == "fetch_failed"
+    assert any(edge.edge_type == CrawlGraphEdgeType.DISCOVERED_ON_PAGE.value for edge in graph_edges)
     await db.close()
 
 

@@ -91,13 +91,22 @@ async def _handle_complete(request: web.Request) -> web.Response:
     except KeyError:
         return _json_response({"error": "not found"}, status=404)
 
-    logger.info("Job completed id=%s url=%s", job.id, job.result_url)
+    if job.completed_after_timeout:
+        response_status = "completed_after_timeout"
+        logger.info("Job completed after timeout id=%s url=%s", job.id, job.result_url)
+    elif job.status == FetchJobStatus.COMPLETED:
+        response_status = "completed"
+        logger.info("Job completed id=%s url=%s", job.id, job.result_url)
+    else:
+        response_status = f"ignored_{job.status.value}"
+        logger.info("Job completion ignored id=%s status=%s url=%s", job.id, job.status.value, job.url)
 
     # Eagerly return next job to reduce round-trips.
-    next_job = await queue.next(timeout=0.1)
-    result: dict[str, Any] = {"status": "completed"}
-    if next_job is not None:
-        result["next_job"] = next_job.to_dict()
+    result: dict[str, Any] = {"status": response_status}
+    if job.status == FetchJobStatus.COMPLETED:
+        next_job = await queue.next(timeout=0.1)
+        if next_job is not None:
+            result["next_job"] = next_job.to_dict()
     return _json_response(result)
 
 

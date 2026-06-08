@@ -503,6 +503,20 @@
     });
     return params.map(([key, value]) => `${key}=${value}`).join("&");
   }
+  function sameSite(a, b) {
+    try {
+      return siteRoot(new URL(a).hostname) === siteRoot(new URL(b).hostname);
+    } catch {
+      return false;
+    }
+  }
+  function siteRoot(host) {
+    const parts = host.split(".");
+    if (parts.length >= 3 && parts.at(-1) === "cn" && ["edu", "ac", "com"].includes(parts.at(-2))) {
+      return parts.slice(-3).join(".");
+    }
+    return parts.slice(-2).join(".");
+  }
   function truncUrl(url, max = 40) {
     try {
       return new URL(url).pathname.slice(0, max);
@@ -530,6 +544,8 @@
   const ERROR_RETRY_DELAY = 5e3;
   const MAX_ERROR_RETRIES = 3;
   const DEFAULT_DECISION_ACTION = "switch_failed_to_human";
+  const NAVIGATION_ATTEMPT_KEY = "ycl_navigation_attempt_v1";
+  const DOCUMENT_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let pollTimer = null;
   let autoCheckTimer = null;
   let submitting = false;
@@ -539,17 +555,26 @@
   let lastDecisionCheckAt = 0;
   let actionSubmittedForJobId = null;
   async function recoverState() {
+    const sync = await syncBackendStatus();
+    if (sync.assignedJobChanged && state.currentJob && state.autoMode && !urlMatches(window.location.href, state.currentJob.url) && !isSameSiteRedirectReady(state.currentJob)) {
+      navigateToJob(state.currentJob);
+    }
+  }
+  async function syncBackendStatus() {
     var _a, _b, _c;
     let changed = false;
+    let localJobCleared = false;
+    let assignedJobChanged = false;
+    let status = null;
     try {
-      const status = await fetchStatus();
+      status = await fetchStatus();
       if (!status) {
         if (state.connected) {
           state.connected = false;
           changed = true;
         }
         if (changed) notify();
-        return;
+        return { status: null, changed, localJobCleared, assignedJobChanged };
       }
       if (!state.connected) {
         state.connected = true;
@@ -562,11 +587,17 @@
       state.pendingDecision = status.pending_decision ?? null;
       if (status.current_job) {
         if ((((_c = state.currentJob) == null ? void 0 : _c.id) ?? null) !== status.current_job.id) {
+          if (state.currentJob) {
+            clearNavigationAttempt(state.currentJob.id);
+          }
           state.currentJob = status.current_job;
+          assignedJobChanged = true;
           changed = true;
         }
       } else if (state.currentJob !== null) {
+        clearNavigationAttempt(state.currentJob.id);
         state.currentJob = null;
+        localJobCleared = true;
         changed = true;
       }
     } catch {
@@ -578,6 +609,7 @@
     if (changed) {
       notify();
     }
+    return { status, changed, localJobCleared, assignedJobChanged };
   }
   function startPolling() {
     if (pollTimer !== null) return;
@@ -604,6 +636,65 @@
   }
   let matchedSince = null;
   let errorRetries = 0;
+  function resetAutoMatchState() {
+    matchedSince = null;
+    errorRetries = 0;
+  }
+  function readNavigationAttempt() {
+    try {
+      const raw = sessionStorage.getItem(NAVIGATION_ATTEMPT_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed.jobId || !parsed.fromUrl || !parsed.targetUrl) return null;
+      return {
+        jobId: parsed.jobId,
+        fromUrl: parsed.fromUrl,
+        targetUrl: parsed.targetUrl,
+        createdAt: Number(parsed.createdAt || 0),
+        documentId: String(parsed.documentId || "")
+      };
+    } catch {
+      return null;
+    }
+  }
+  function recordNavigationAttempt(job) {
+    try {
+      sessionStorage.setItem(
+        NAVIGATION_ATTEMPT_KEY,
+        JSON.stringify({
+          jobId: job.id,
+          fromUrl: window.location.href,
+          targetUrl: job.url,
+          createdAt: Date.now(),
+          documentId: DOCUMENT_ID
+        })
+      );
+    } catch {
+    }
+  }
+  function clearNavigationAttempt(jobId) {
+    try {
+      const attempt = readNavigationAttempt();
+      if (!jobId || !attempt || attempt.jobId === jobId) {
+        sessionStorage.removeItem(NAVIGATION_ATTEMPT_KEY);
+      }
+    } catch {
+    }
+  }
+  function navigateToJob(job) {
+    recordNavigationAttempt(job);
+    window.location.href = job.url;
+  }
+  function isSameSiteRedirectReady(job) {
+    if (job.action) return false;
+    if (urlMatches(window.location.href, job.url)) return false;
+    const attempt = readNavigationAttempt();
+    if (!attempt || attempt.jobId !== job.id || !urlMatches(attempt.targetUrl, job.url)) {
+      return false;
+    }
+    if (attempt.documentId === DOCUMENT_ID) return false;
+    return sameSite(window.location.href, job.url) && !isErrorPage();
+  }
   function autoCheck() {
     if (state.instanceRole !== "owner") return;
     const job = state.currentJob;
@@ -617,7 +708,7 @@
         errorRetries++;
         showToast(`错误页面，${ERROR_RETRY_DELAY / 1e3}s 后重试 (${errorRetries}/${MAX_ERROR_RETRIES})`);
         setTimeout(() => {
-          window.location.href = job.url;
+          navigateToJob(job);
         }, ERROR_RETRY_DELAY);
       } else {
         showToast("重试次数已用完，请手动处理");
@@ -625,7 +716,9 @@
       return;
     }
     errorRetries = 0;
-    if (urlMatches(window.location.href, job.url)) {
+    const exactMatch = urlMatches(window.location.href, job.url);
+    const redirectMatch = !exactMatch && isSameSiteRedirectReady(job);
+    if (exactMatch || redirectMatch) {
       if (job.action && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
         if (actionSubmittedForJobId !== job.id && performFetchAction(job.action)) {
           actionSubmittedForJobId = job.id;
@@ -637,6 +730,9 @@
         matchedSince = Date.now();
       } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
         matchedSince = null;
+        if (redirectMatch) {
+          showToast("检测到同站点重定向，提交当前页");
+        }
         void submitCurrent();
       }
     } else {
@@ -651,11 +747,26 @@
       await checkPendingDecision();
     }
     if (document.visibilityState === "hidden" && !state.currentJob) return;
-    if (state.paused || state.currentJob || polling) return;
+    if (state.paused || polling) return;
     const connectedBefore = state.connected;
     let jobAssigned = false;
     polling = true;
     try {
+      const hadLocalJob = state.currentJob !== null;
+      const sync = await syncBackendStatus();
+      if (sync.localJobCleared) {
+        resetAutoMatchState();
+        showToast("后端已释放当前任务，继续领取下一个任务");
+      }
+      if (sync.assignedJobChanged && state.currentJob) {
+        resetAutoMatchState();
+        if (state.autoMode && !urlMatches(window.location.href, state.currentJob.url) && !isSameSiteRedirectReady(state.currentJob)) {
+          navigateToJob(state.currentJob);
+        }
+        return;
+      }
+      if (document.visibilityState === "hidden" && !state.currentJob) return;
+      if (hadLocalJob && state.currentJob) return;
       const job = await fetchNextJob();
       state.connected = true;
       if (job) {
@@ -672,11 +783,12 @@
     }
   }
   function assignJob(job) {
-    errorRetries = 0;
+    resetAutoMatchState();
     actionSubmittedForJobId = null;
+    clearNavigationAttempt();
     setJob(job);
     if (state.autoMode) {
-      window.location.href = job.url;
+      navigateToJob(job);
     }
   }
   function triggerFastPollBurst() {
@@ -739,6 +851,13 @@
     if (!decision) return;
     await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
   }
+  function openCurrent() {
+    if (state.instanceRole !== "owner") return;
+    const job = state.currentJob;
+    if (!job) return;
+    if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
+    navigateToJob(job);
+  }
   async function submitCurrent() {
     if (state.instanceRole !== "owner") return;
     const job = state.currentJob;
@@ -761,6 +880,7 @@
       const html = await captureCurrentHtml();
       const paginationStates = collectFormPaginationStates(window.location.href);
       const res = await completeJob(job.id, html, window.location.href, document.title, paginationStates);
+      clearNavigationAttempt(job.id);
       clearJob();
       if (res == null ? void 0 : res.next_job) {
         setTimeout(() => assignJob(res.next_job), 100);
@@ -826,6 +946,7 @@
       await skipJob(job.id);
     } catch {
     }
+    clearNavigationAttempt(job.id);
     clearJob();
     triggerFastPollBurst();
   }
@@ -837,6 +958,7 @@
       await failJob(job.id, msg || "手动标记失败");
     } catch {
     }
+    clearNavigationAttempt(job.id);
     clearJob();
     triggerFastPollBurst();
   }
@@ -1072,9 +1194,7 @@
       if (job) void navigator.clipboard.writeText(job.url);
     });
     bind("ycl-open", "click", () => {
-      if (!job) return;
-      if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
-      window.location.href = job.url;
+      openCurrent();
     });
     bind("ycl-submit", "click", submitCurrent);
     bind("ycl-skip", "click", skipCurrent);
