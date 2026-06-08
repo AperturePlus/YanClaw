@@ -1,3 +1,5 @@
+原始采集资料：本文件不再作为 crawler 输入。请把确认后的正式高校名、正式学院名和 URL 维护到 assets/entrances.yaml。
+
 学院列表
 兰州大学：https://www.lzu.edu.cn/xxjgs/jxky.htm
 北京大学：https://www.pku.edu.cn/department.html
