@@ -187,7 +187,7 @@ LLM 通过两个 tool 与代码交互：
 | `INVALID_JSON_MAX_RETRY` | 1 | LLM 输出非法 JSON 的重试次数 |
 | `TASK_RECOVERY_ENABLED` | True | 启动时恢复 pending/retry crawl_tasks |
 | `HUMAN_SERVER_HOST` / `_PORT` / `_JOB_TIMEOUT_SECONDS` | 127.0.0.1 / 21520 / 60 | 人工模式参数 |
-| `WEBSITES_PATH` | `assets/websites.md` | 大学清单 |
+| `WEBSITES_PATH` | `assets/entrances.yaml` | 大学入口清单；默认解析规范 YAML，`YANCLAW_WEBSITES_PATH` 可指向旧 CSV manifest |
 | `UNIVERSITY_DB_DIR` | `data/universities` | DB 目录 |
 
 ## 10. Skills 体系
@@ -241,7 +241,7 @@ LLM 通过两个 tool 与代码交互：
 - 新 fetcher：放在 `src/agents/crawler/fetchers/`，至少要实现 `__aenter__` / `__aexit__` / `fetch(url) -> FetchResult` / `filter_same_domain` 静态方法；`set_status_provider` 可选；如果是交互式必须暴露 `set_context`（`_is_interactive` 据此判定）。
 - 新 tool：`tools.py` 加定义 + handler，并在 `_ask_llm` 的 `allowed_tools` 集合里放行；同时更新 `agents/crawler/skills/save-professors.md` 等告诉 LLM 怎么用。
 - 新数据字段：`models.py` 新列 → 在 `db/schema.py:ensure_runtime_schema` 里补"老库不存在则 ALTER TABLE"；同步改 `sanitizer.py` 与 `db/professors.py` 的 upsert。
-- 新大学：直接编辑 `assets/websites.md`，CSV-style，列名见 `db.university.load_university_targets_from_csv`。
+- 新大学：优先编辑 `assets/entrances.yaml`，写正式高校名、正式学院名和入口 URL；`assets/收集.txt` 只保留为人工原始采集资料，不再由 crawler 解析。`YANCLAW_WEBSITES_PATH` 仍可指向旧 CSV manifest。
 
 ## 15. 测试
 
