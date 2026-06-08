@@ -22,6 +22,7 @@ from agents.crawler.models import (
     StewardRun,
 )
 from agents.data_steward.agent import DataStewardAgent
+from agents.data_steward.db.selector import resolve_targets
 from agents.data_steward.db.exporter import PUBLIC_TABLES, default_export_root, export_clean_database
 from agents.data_steward.llm_service import DataStewardLLMService
 from runtime.database import DatabaseManager
@@ -67,6 +68,32 @@ def _sqlite_scalar(path: Path, sql: str) -> object:
         return conn.execute(sql).fetchone()[0]
     finally:
         conn.close()
+
+
+def _assert_steward_selector_resolves_default_manifest_target(tmp_path: Path) -> None:
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "buaa.edu.cn.db"
+    db_path.write_bytes(b"placeholder")
+    settings = CrawlerSettings(university_db_dir=db_dir)
+
+    result = resolve_targets(
+        settings=settings,
+        universities=["北京航空航天大学"],
+        universities_file=None,
+        db_roots=None,
+    )
+
+    assert result.targets == [db_path]
+    assert result.unmatched_universities == []
+
+
+def test_steward_selector_resolves_default_yaml_manifest_target(tmp_path):
+    _assert_steward_selector_resolves_default_manifest_target(tmp_path)
+
+
+def test_steward_selector_resolves_default_text_manifest_target(tmp_path):
+    _assert_steward_selector_resolves_default_manifest_target(tmp_path)
 
 
 async def _seed_completion_detail_task(

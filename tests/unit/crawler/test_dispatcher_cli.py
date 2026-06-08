@@ -32,6 +32,22 @@ def _sqlite_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path.as_posix()}"
 
 
+def _manual_manifest(*universities: tuple[str, str, str]) -> str:
+    lines = [
+        "record_type,name,url,location,org_unit_name,org_unit_url,faculty_url,org_unit_listing_url",
+    ]
+    for name, url, location in universities:
+        lines.append(f"university,{name},{url},{location},,,,")
+        lines.append(f"org_unit,{name},,,CS,{url.rstrip('/')}/cs,{url.rstrip('/')}/cs/faculty,")
+    return "\n".join(lines) + "\n"
+
+
+def _legacy_manifest(*universities: tuple[str, str, str]) -> str:
+    lines = ["name,url,location"]
+    lines.extend(f"{name},{url},{location}" for name, url, location in universities)
+    return "\n".join(lines) + "\n"
+
+
 class FakeAgent:
     active = 0
     max_active = 0
@@ -58,7 +74,10 @@ class FakeAgent:
 
 
 class NoopFetcher:
+    entered = 0
+
     async def __aenter__(self):
+        type(self).entered += 1
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -68,7 +87,10 @@ class NoopFetcher:
 async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\nB,https://b.example.edu.cn/,Y\n",
+        _manual_manifest(
+            ("A", "https://a.example.edu.cn/", "X"),
+            ("B", "https://b.example.edu.cn/", "Y"),
+        ),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -85,6 +107,38 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
 
     assert summary.success == 2
     assert FakeAgent.max_active == 1
+
+
+async def test_dispatcher_missing_manual_entrance_does_not_touch_db(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _legacy_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"old-a")
+
+    NoopFetcher.entered = 0
+    FakeAgent.active = 0
+    FakeAgent.max_active = 0
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(universities=["A"])
+
+    assert summary.success == 0
+    assert summary.failed == 1
+    assert summary.results[0].messages == ["manual_entrance_missing"]
+    assert FakeAgent.max_active == 0
+    assert NoopFetcher.entered == 0
+    assert db_path.read_bytes() == b"old-a"
+    assert not (Path(settings.university_db_dir) / "backup").exists()
 
 
 class SlowAgent:
@@ -174,7 +228,7 @@ def test_dispatcher_default_llm_client_uses_concurrency_settings(tmp_path):
 async def test_dispatcher_enforces_university_timeout(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -195,7 +249,15 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
 async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        "\n".join(
+            [
+                "record_type,name,url,location,org_unit_name,org_unit_url,faculty_url,org_unit_listing_url",
+                "university,A,https://a.example.edu.cn/,X,,,,",
+                "org_unit,A,,,计算机学院,https://a.example.edu.cn/cs,https://a.example.edu.cn/cs/faculty,",
+                "org_unit,A,,,软件学院,https://a.example.edu.cn/soft,https://a.example.edu.cn/soft/faculty,",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -226,7 +288,7 @@ async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
 async def test_dispatcher_passes_resume_mode_to_agent(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -560,7 +622,10 @@ async def test_crawl_async_passes_resume_to_dispatcher(tmp_path, monkeypatch):
 async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\nB,https://b.sample.edu.cn/,Y\n",
+        _manual_manifest(
+            ("A", "https://a.example.edu.cn/", "X"),
+            ("B", "https://b.sample.edu.cn/", "Y"),
+        ),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -596,7 +661,7 @@ async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
 async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -667,7 +732,7 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
 async def test_dispatcher_resume_cleans_excluded_org_units_before_skip(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -675,6 +740,7 @@ async def test_dispatcher_resume_cleans_excluded_org_units_before_skip(tmp_path)
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db = DatabaseManager(_sqlite_url(db_path))
@@ -732,7 +798,7 @@ async def test_dispatcher_resume_cleans_excluded_org_units_before_skip(tmp_path)
 async def test_dispatcher_resume_merges_sub_department_org_units_before_skip(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -740,6 +806,7 @@ async def test_dispatcher_resume_merges_sub_department_org_units_before_skip(tmp
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db = DatabaseManager(_sqlite_url(db_path))
@@ -798,7 +865,7 @@ async def test_dispatcher_resume_merges_sub_department_org_units_before_skip(tmp
 async def test_dispatcher_resume_mode_reruns_completed_db_with_retryable_fetch_failure(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -857,7 +924,7 @@ async def test_dispatcher_resume_mode_reruns_completed_db_with_retryable_fetch_f
 async def test_dispatcher_resume_mode_reruns_completed_db_with_recoverable_crawl_task(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -865,6 +932,7 @@ async def test_dispatcher_resume_mode_reruns_completed_db_with_recoverable_crawl
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db = DatabaseManager(_sqlite_url(db_path))
@@ -921,7 +989,7 @@ async def test_dispatcher_resume_mode_reruns_completed_db_with_recoverable_crawl
 async def test_dispatcher_resume_explicit_university_runs_completed_db_with_professors(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -929,6 +997,7 @@ async def test_dispatcher_resume_explicit_university_runs_completed_db_with_prof
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db = DatabaseManager(_sqlite_url(db_path))
@@ -969,7 +1038,7 @@ async def test_dispatcher_resume_explicit_university_runs_completed_db_with_prof
 async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypatch):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -977,6 +1046,7 @@ async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypa
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db_path.parent.mkdir(parents=True, exist_ok=True)

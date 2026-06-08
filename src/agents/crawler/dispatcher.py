@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from agents.crawler import db as crawler_db
 from agents.crawler.agent import AgentResult, CrawlerAgent
 from agents.crawler.config import CrawlerSettings
+from agents.crawler.entrances import ManualOrgUnitEntrance, load_university_entrance_targets
 from agents.crawler.fetchers import Fetcher, _site_root
 from agents.crawler.models import CrawlLogStatus, CrawlStatus, CrawlTaskStatus
 from agents.crawler.org_unit_filter import (
@@ -40,6 +41,12 @@ class _UniversityTarget:
     url: str
     location: str
     db_path: Path
+    org_unit_listing_urls: tuple[str, ...] = ()
+    manual_org_units: tuple[ManualOrgUnitEntrance, ...] = ()
+
+    @property
+    def has_manual_entrances(self) -> bool:
+        return bool(self.manual_org_units or self.org_unit_listing_urls)
 
 
 @dataclass(frozen=True)
@@ -118,56 +125,81 @@ class CrawlDispatcher:
         university_db_dir.mkdir(parents=True, exist_ok=True)
         self._resume_cleaned_db_paths.clear()
 
-        all_targets = crawler_db.load_university_targets_from_csv(self.settings.websites_path)
+        all_targets = load_university_entrance_targets(self.settings.websites_path)
         explicit_universities = bool(universities)
         selected = set(universities or [])
         targets: list[_UniversityTarget] = []
         for item in all_targets:
-            if selected and item["name"] not in selected:
+            if selected and item.name not in selected:
                 continue
-            db_path = _university_db_path(university_db_dir, item["url"])
+            db_path = _university_db_path(university_db_dir, item.url)
             targets.append(
                 _UniversityTarget(
-                    name=item["name"],
-                    url=item["url"],
-                    location=item.get("location", ""),
+                    name=item.name,
+                    url=item.url,
+                    location=item.location,
                     db_path=db_path,
+                    org_unit_listing_urls=item.org_unit_listing_urls,
+                    manual_org_units=item.manual_org_units,
                 )
+            )
+
+        runnable_targets = [target for target in targets if target.has_manual_entrances]
+        missing_entrance_results = [
+            self._manual_entrance_missing_result(target)
+            for target in targets
+            if not target.has_manual_entrances
+        ]
+        for result in missing_entrance_results:
+            self.logger.warning(
+                "Skip university=%s reason=manual_entrance_missing; no DB will be touched",
+                result.university_name,
             )
 
         if resume:
             self.logger.info("Run mode=resume; preserving existing per-university databases")
-            await self._inspect_progress(targets, force_existing=explicit_universities)
+            await self._inspect_progress(runnable_targets, force_existing=explicit_universities)
         else:
             self.logger.info("Run mode=fresh; backing up and rebuilding selected per-university databases")
-            self._prepare_fresh_run(targets)
+            self._prepare_fresh_run(runnable_targets)
 
         semaphore = asyncio.Semaphore(self.settings.max_concurrency)
-        results: list[AgentResult] = []
+        results: list[AgentResult] = list(missing_entrance_results)
         skipped = 0
 
-        async with self.fetcher_factory() as fetcher:
-            tasks = []
-            for university in targets:
-                if resume and not explicit_universities and await self._should_skip(university):
-                    skipped += 1
-                    continue
-                tasks.append(
-                    self._run_one(
-                        university,
-                        fetcher,
-                        semaphore,
-                        resume_mode=resume,
-                        resume_force_existing=resume and explicit_universities,
+        if runnable_targets:
+            async with self.fetcher_factory() as fetcher:
+                tasks = []
+                for university in runnable_targets:
+                    if resume and not explicit_universities and await self._should_skip(university):
+                        skipped += 1
+                        continue
+                    tasks.append(
+                        self._run_one(
+                            university,
+                            fetcher,
+                            semaphore,
+                            resume_mode=resume,
+                            resume_force_existing=resume and explicit_universities,
+                        )
                     )
-                )
-            if tasks:
-                results = list(await asyncio.gather(*tasks))
+                if tasks:
+                    results.extend(await asyncio.gather(*tasks))
 
         success = sum(1 for result in results if result.status == CrawlStatus.COMPLETED.value)
         failed = sum(1 for result in results if result.status == CrawlStatus.FAILED.value)
         self.logger.info("Summary success=%s failed=%s skipped=%s", success, failed, skipped)
         return DispatcherSummary(success=success, failed=failed, skipped=skipped, results=results)
+
+    @staticmethod
+    def _manual_entrance_missing_result(university: _UniversityTarget) -> AgentResult:
+        return AgentResult(
+            university_name=university.name,
+            status=CrawlStatus.FAILED.value,
+            visited_count=0,
+            saved_professors=0,
+            messages=["manual_entrance_missing"],
+        )
 
     def _prepare_fresh_run(self, targets: list[_UniversityTarget]) -> None:
         existing_paths = sorted({target.db_path for target in targets if target.db_path.exists()})
@@ -500,6 +532,8 @@ class CrawlDispatcher:
                         org_unit_exclude_enabled=self.settings.org_unit_exclude_enabled,
                         org_unit_exclude_keywords=list(self.settings.org_unit_exclude_keywords or []),
                         org_unit_llm_filter_enabled=self.settings.org_unit_llm_filter_enabled,
+                        org_unit_listing_urls=list(university.org_unit_listing_urls),
+                        manual_org_units=list(university.manual_org_units),
                     )
                     return await agent.run()
 

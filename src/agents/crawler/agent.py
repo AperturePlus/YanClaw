@@ -13,6 +13,7 @@ from urllib.parse import quote, urljoin, urlparse
 
 from agents.crawler import db as crawler_db
 from agents.crawler import agent_detail, agent_parsing, form_pagination
+from agents.crawler.entrances import ManualOrgUnitEntrance
 from agents.crawler.extraction_pipeline import ExtractionPipeline
 from agents.crawler.faculty_discovery import FacultyDiscoveryService
 from agents.crawler.fetchers import FetchResult, Fetcher
@@ -41,6 +42,7 @@ from agents.crawler.sanitizer import (
     contains_self_academician_hint,
     normalize_name,
     normalize_name_key,
+    normalize_org_unit_name,
 )
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
@@ -217,6 +219,8 @@ class CrawlerAgent:
         org_unit_exclude_enabled: bool = True,
         org_unit_exclude_keywords: list[str] | None = None,
         org_unit_llm_filter_enabled: bool = True,
+        org_unit_listing_urls: list[str] | None = None,
+        manual_org_units: list[ManualOrgUnitEntrance | dict[str, Any]] | None = None,
     ) -> None:
         self.university_name = university_name
         self.start_url = start_url
@@ -254,6 +258,19 @@ class CrawlerAgent:
             str(item).strip() for item in configured_exclude_keywords if str(item).strip()
         ]
         self.org_unit_llm_filter_enabled = bool(org_unit_llm_filter_enabled)
+        self.org_unit_listing_urls: list[str] = []
+        for item in org_unit_listing_urls or []:
+            url = _sanitize_url(str(item or ""))
+            if url:
+                self.org_unit_listing_urls.append(url)
+        self.manual_org_units: list[ManualOrgUnitEntrance] = []
+        for item in manual_org_units or []:
+            coerced = self._coerce_manual_org_unit(item)
+            if coerced is not None:
+                self.manual_org_units.append(coerced)
+        self._manual_org_unit_aliases_by_name = self._build_manual_org_unit_alias_index(
+            self.manual_org_units
+        )
         self.session_state = CrawlSessionState.create(pipeline_enabled=self.pipeline_enabled)
         self.visited_urls = self.session_state.visited_urls
         self._fetch_cache = self.session_state.fetch_cache
@@ -286,6 +303,48 @@ class CrawlerAgent:
             visited_urls=self.visited_urls,
         )
 
+    @staticmethod
+    def _coerce_manual_org_unit(item: ManualOrgUnitEntrance | dict[str, Any]) -> ManualOrgUnitEntrance | None:
+        if isinstance(item, ManualOrgUnitEntrance):
+            return item
+        if not isinstance(item, dict):
+            return None
+        name = str(item.get("name") or item.get("org_unit_name") or "").strip()
+        if not name:
+            return None
+        raw_aliases = item.get("aliases", [])
+        if isinstance(raw_aliases, str):
+            aliases = (raw_aliases.strip(),) if raw_aliases.strip() else ()
+        elif isinstance(raw_aliases, (list, tuple)):
+            aliases = tuple(str(alias).strip() for alias in raw_aliases if str(alias).strip())
+        else:
+            aliases = ()
+        return ManualOrgUnitEntrance(
+            name=name,
+            url=str(item.get("url") or item.get("org_unit_url") or "").strip(),
+            faculty_url=str(item.get("faculty_url") or item.get("faculty_entrance") or "").strip(),
+            kind=str(item.get("kind") or item.get("org_unit_kind") or "").strip(),
+            raw_name=str(item.get("raw_name") or item.get("alias") or "").strip(),
+            aliases=aliases,
+        )
+
+    @classmethod
+    def _build_manual_org_unit_alias_index(
+        cls,
+        items: list[ManualOrgUnitEntrance],
+    ) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {}
+        for item in items:
+            canonical_key = cls._normalize_org_unit_match_text(item.name)
+            if not canonical_key:
+                continue
+            aliases = result.setdefault(canonical_key, set())
+            for value in (item.name, item.raw_name, *item.aliases):
+                key = cls._normalize_org_unit_match_text(str(value or ""))
+                if key:
+                    aliases.add(key)
+        return result
+
     @property
     def _is_interactive(self) -> bool:
         """True when using a human-assisted fetcher (streaming per-org-unit is preferred)."""
@@ -316,6 +375,12 @@ class CrawlerAgent:
                 resume_seed_org_units = await self._prepare_resume_start()
 
             initial_professor_count = await self._professor_count()
+            if self.manual_org_units or self.org_unit_listing_urls:
+                early_result = await self._run_manual_entrance_flow(resume_seed_org_units)
+                if early_result is not None:
+                    return early_result
+                return await self._finalize_run(initial_professor_count)
+
             home = await self._fetch_url(self.start_url, 0)
             if home is None:
                 if self.resume_mode:
@@ -452,60 +517,61 @@ class CrawlerAgent:
                     await self._extract_professors(faculty_links)
 
 
-            recoverable_task_result = await self._fail_if_recoverable_tasks_remain(context="crawl_completion")
-            if recoverable_task_result is not None:
-                return recoverable_task_result
-
-            total_professor_count = await self._professor_count()
-            newly_saved_count = max(0, total_professor_count - initial_professor_count)
-            if total_professor_count <= 0:
-                if (
-                    self._all_target_org_units_marked_no_faculty()
-                ):
-                    message = "No professors saved: all targeted org units are marked no_faculty_page"
-                    retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
-                        context="target_no_faculty_completion",
-                    )
-                    if retryable_failure_result is not None:
-                        return retryable_failure_result
-                    await self._set_status(CrawlStatus.COMPLETED)
-                    self.logger.warning(
-                        "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
-                        self.university_name,
-                        sorted(self._target_org_unit_ids),
-                    )
-                    return self._result(CrawlStatus.COMPLETED, [message])
-                await self._set_status(CrawlStatus.FAILED)
-                self.logger.warning(
-                    "Crawler did not save any professors for %s; marking failed",
-                    self.university_name,
-                )
-                return self._result(CrawlStatus.FAILED, ["No professors saved"])
-            if newly_saved_count <= 0:
-                self.logger.warning(
-                    "Crawl finished with no new professors this run university=%s existing_total=%s tool_saved=%s",
-                    self.university_name,
-                    total_professor_count,
-                    self.saved_professors,
-                )
-
-            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
-                context="crawl_completion",
-            )
-            if retryable_failure_result is not None:
-                return retryable_failure_result
-            await self._set_status(CrawlStatus.COMPLETED)
-            self.logger.info(
-                "Completed crawl for %s professors_total=%s professors_new=%s",
-                self.university_name,
-                total_professor_count,
-                newly_saved_count,
-            )
-            return self._result(CrawlStatus.COMPLETED, [])
+            return await self._finalize_run(initial_professor_count)
         except Exception as error:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
+
+    async def _finalize_run(self, initial_professor_count: int) -> AgentResult:
+        recoverable_task_result = await self._fail_if_recoverable_tasks_remain(context="crawl_completion")
+        if recoverable_task_result is not None:
+            return recoverable_task_result
+
+        total_professor_count = await self._professor_count()
+        newly_saved_count = max(0, total_professor_count - initial_professor_count)
+        if total_professor_count <= 0:
+            if self._all_target_org_units_marked_no_faculty():
+                message = "No professors saved: all targeted org units are marked no_faculty_page"
+                retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                    context="target_no_faculty_completion",
+                )
+                if retryable_failure_result is not None:
+                    return retryable_failure_result
+                await self._set_status(CrawlStatus.COMPLETED)
+                self.logger.warning(
+                    "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
+                    self.university_name,
+                    sorted(self._target_org_unit_ids),
+                )
+                return self._result(CrawlStatus.COMPLETED, [message])
+            await self._set_status(CrawlStatus.FAILED)
+            self.logger.warning(
+                "Crawler did not save any professors for %s; marking failed",
+                self.university_name,
+            )
+            return self._result(CrawlStatus.FAILED, ["No professors saved"])
+        if newly_saved_count <= 0:
+            self.logger.warning(
+                "Crawl finished with no new professors this run university=%s existing_total=%s tool_saved=%s",
+                self.university_name,
+                total_professor_count,
+                self.saved_professors,
+            )
+
+        retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+            context="crawl_completion",
+        )
+        if retryable_failure_result is not None:
+            return retryable_failure_result
+        await self._set_status(CrawlStatus.COMPLETED)
+        self.logger.info(
+            "Completed crawl for %s professors_total=%s professors_new=%s",
+            self.university_name,
+            total_professor_count,
+            newly_saved_count,
+        )
+        return self._result(CrawlStatus.COMPLETED, [])
 
     async def _resume_without_start_page(self, initial_professor_count: int) -> AgentResult:
         async with self.db.session() as session:
@@ -624,6 +690,159 @@ class CrawlerAgent:
         )
         await self._set_status(CrawlStatus.FAILED)
         return self._result(CrawlStatus.FAILED, [message])
+
+    async def _run_manual_entrance_flow(self, resume_seed_org_units: list[OrgUnit]) -> AgentResult | None:
+        self.logger.info(
+            "Manual entrance flow university=%s manual_org_units=%s org_listing_urls=%s resume_seed_org_units=%s",
+            self.university_name,
+            len(self.manual_org_units),
+            len(self.org_unit_listing_urls),
+            len(resume_seed_org_units),
+        )
+
+        manual_org_units = await self._seed_manual_org_units()
+        org_units = manual_org_units or list(resume_seed_org_units)
+        if not org_units and self.org_unit_listing_urls:
+            org_unit_pages = [
+                _QueuedUrl(url=url, depth=1, label="manual_org_listing")
+                for url in self.org_unit_listing_urls
+            ]
+            org_units = await self._extract_org_units(org_unit_pages)
+
+        if not org_units:
+            await self._set_status(CrawlStatus.FAILED)
+            return self._result(CrawlStatus.FAILED, ["No org units from manual entrances"])
+
+        if self.target_org_units:
+            org_units, unmatched = self._filter_target_org_units(org_units)
+            if unmatched:
+                await self._set_status(CrawlStatus.FAILED)
+                self.logger.warning(
+                    "Target org units unmatched university=%s requested=%s unmatched=%s threshold=%.2f",
+                    self.university_name,
+                    self.target_org_units,
+                    unmatched,
+                    self.org_unit_match_threshold,
+                )
+                return self._result(
+                    CrawlStatus.FAILED,
+                    [f"Target org units unmatched: {', '.join(unmatched)}"],
+                )
+        elif not manual_org_units:
+            org_units = await self._filter_existing_org_units_for_discovery(
+                org_units,
+                source="manual_org_listing",
+            )
+            if not org_units:
+                await self._set_status(CrawlStatus.FAILED)
+                return self._result(CrawlStatus.FAILED, ["all org units excluded by scope filter"])
+
+        self._target_org_unit_ids = {int(unit.id) for unit in org_units if unit.id is not None}
+        if manual_org_units:
+            manual_faculty_links = self._manual_faculty_links_for_org_units(org_units)
+            if manual_faculty_links:
+                self.logger.info(
+                    "Manual faculty entrances university=%s links=%s",
+                    self.university_name,
+                    len(manual_faculty_links),
+                )
+                await self._extract_professors(manual_faculty_links)
+
+            remaining_org_units = self._org_units_without_manual_faculty(org_units)
+            if remaining_org_units:
+                self.logger.info(
+                    "Manual org units without faculty entrance university=%s org_units=%s mode=%s",
+                    self.university_name,
+                    len(remaining_org_units),
+                    "streaming" if self._is_interactive else "batch",
+                )
+                if self._is_interactive:
+                    await self._find_and_extract_streaming(remaining_org_units)
+                else:
+                    faculty_links = await self._find_faculty_pages(remaining_org_units)
+                    if faculty_links:
+                        await self._extract_professors(faculty_links)
+            return None
+
+        if self._is_interactive:
+            await self._find_and_extract_streaming(org_units)
+            return None
+
+        faculty_links = await self._find_faculty_pages(org_units)
+        if faculty_links:
+            await self._extract_professors(faculty_links)
+        return None
+
+    async def _seed_manual_org_units(self) -> list[OrgUnit]:
+        if not self.manual_org_units:
+            return []
+        seeded: list[OrgUnit] = []
+        async with self.db.session() as session:
+            for item in self.manual_org_units[: self.max_org_units_per_university]:
+                name = normalize_org_unit_name(item.name, default="")
+                if not name:
+                    continue
+                org_unit_url = _sanitize_url(item.url or item.faculty_url or "")
+                if not org_unit_url:
+                    continue
+                row = await crawler_db.get_or_create_org_unit(
+                    session,
+                    name=name,
+                    url=org_unit_url,
+                    kind=item.kind or "college",
+                    discovered_from_url=self.start_url,
+                )
+                seeded.append(row)
+        return seeded
+
+    def _manual_faculty_links_for_org_units(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
+        if not self.manual_org_units or not org_units:
+            return []
+        units_by_name: dict[str, OrgUnit] = {}
+        for unit in org_units:
+            canonical_key = self._normalize_org_unit_match_text(unit.name)
+            if not canonical_key:
+                continue
+            units_by_name[canonical_key] = unit
+            for alias in self._manual_org_unit_aliases_by_name.get(canonical_key, set()):
+                units_by_name.setdefault(alias, unit)
+        result: list[_QueuedUrl] = []
+        for item in self.manual_org_units:
+            faculty_url = _sanitize_url(item.faculty_url)
+            if not faculty_url:
+                continue
+            unit = None
+            for value in (item.name, item.raw_name, *item.aliases):
+                key = self._normalize_org_unit_match_text(str(value or ""))
+                if key:
+                    unit = units_by_name.get(key)
+                if unit is not None:
+                    break
+            if unit is None:
+                continue
+            result.append(
+                _QueuedUrl(
+                    url=faculty_url,
+                    depth=1,
+                    label=unit.name,
+                    org_unit_id=unit.id,
+                )
+            )
+        return _dedupe_queue(result)
+
+    def _org_units_without_manual_faculty(self, org_units: list[OrgUnit]) -> list[OrgUnit]:
+        with_faculty = {
+            self._normalize_org_unit_match_text(item.name)
+            for item in self.manual_org_units
+            if _sanitize_url(item.faculty_url)
+        }
+        if not with_faculty:
+            return org_units
+        return [
+            unit
+            for unit in org_units
+            if self._normalize_org_unit_match_text(unit.name) not in with_faculty
+        ]
 
     async def _prepare_resume_start(self) -> list[OrgUnit]:
         async with self.db.session() as session:
@@ -1001,6 +1220,13 @@ class CrawlerAgent:
             return min(0.89, max(0.75, 0.68 + coverage * 0.21))
         return float(difflib.SequenceMatcher(None, q, c).ratio())
 
+    def _org_unit_match_score_with_aliases(self, query: str, candidate: str) -> float:
+        score = self._org_unit_match_score(query, candidate)
+        candidate_key = self._normalize_org_unit_match_text(candidate)
+        for alias in self._manual_org_unit_aliases_by_name.get(candidate_key, set()):
+            score = max(score, self._org_unit_match_score(query, alias))
+        return score
+
     def _filter_target_org_units(
         self,
         org_units: list[OrgUnit],
@@ -1016,7 +1242,7 @@ class CrawlerAgent:
             best_unit: OrgUnit | None = None
             best_score = 0.0
             for unit in org_units:
-                score = self._org_unit_match_score(target, unit.name)
+                score = self._org_unit_match_score_with_aliases(target, unit.name)
                 if score > best_score:
                     best_unit = unit
                     best_score = score
@@ -1035,7 +1261,7 @@ class CrawlerAgent:
         if not self.target_org_units:
             return False
         return any(
-            self._org_unit_match_score(target, name) >= self.org_unit_match_threshold
+            self._org_unit_match_score_with_aliases(target, name) >= self.org_unit_match_threshold
             for target in self.target_org_units
         )
 
@@ -1988,6 +2214,7 @@ class CrawlerAgent:
             source_url=source_url,
             detail_mode=detail_mode,
         )
+
         async with self.db.session() as session:
             row = await crawler_db.upsert_crawl_task(
                 session,
@@ -2899,10 +3126,36 @@ class CrawlerAgent:
             and task_name
             and task_name != "Unknown"
             and incoming_name != task_name
+            and self._is_alias_for_org_unit(task_name, incoming_name)
+        ):
+            normalized["org_unit_name"] = task_name
+            normalized["org_unit_url"] = task.org_unit_url or normalized.get("org_unit_url")
+            if not normalized.get("source_url"):
+                normalized["source_url"] = task.source_url
+            self._pipeline_stats["alias_payloads_rewritten"] = int(
+                self._pipeline_stats.get("alias_payloads_rewritten", 0)
+            ) + 1
+            self.logger.info(
+                "Rewrite alias professor payload to canonical org_unit canonical=%s alias=%s source=%s",
+                task_name,
+                incoming_name,
+                normalized.get("source_url") or task.source_url,
+            )
+            self._fill_missing_homepages_from_name_links(normalized, task=task)
+            self._infer_academician_flags_from_detail_context(normalized, task=task)
+            return normalized
+
+        if (
+            incoming_name
+            and task_name
+            and task_name != "Unknown"
+            and incoming_name != task_name
             and looks_like_sub_department_section_name(incoming_name)
         ):
             normalized["org_unit_name"] = task_name
             normalized["org_unit_url"] = task.org_unit_url or normalized.get("org_unit_url")
+            if not normalized.get("source_url"):
+                normalized["source_url"] = task.source_url
             self._pipeline_stats["sub_department_payloads_rewritten"] = int(
                 self._pipeline_stats.get("sub_department_payloads_rewritten", 0)
             ) + 1
@@ -2924,6 +3177,13 @@ class CrawlerAgent:
         self._fill_missing_homepages_from_name_links(normalized, task=task)
         self._infer_academician_flags_from_detail_context(normalized, task=task)
         return normalized
+
+    def _is_alias_for_org_unit(self, canonical_name: str, value: str) -> bool:
+        canonical_key = self._normalize_org_unit_match_text(canonical_name)
+        value_key = self._normalize_org_unit_match_text(value)
+        if not canonical_key or not value_key:
+            return False
+        return value_key in self._manual_org_unit_aliases_by_name.get(canonical_key, set())
 
     def _fill_missing_homepages_from_name_links(
         self,

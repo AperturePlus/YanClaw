@@ -83,7 +83,13 @@ class _InMemoryFetcher:
 async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nTestU,https://www.example.edu.cn/,TestCity\n",
+        "\n".join(
+            [
+                "record_type,name,url,location,org_unit_listing_url",
+                "university,TestU,https://www.example.edu.cn/,TestCity,",
+                "org_listing,TestU,,,https://www.example.edu.cn/orgs",
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -134,7 +140,11 @@ async def test_dispatcher_agent_fetcher_llm_db_integration(tmp_path):
         assert meta.crawl_status == "completed"
         assert professors[0].name == "Ada"
         assert [u.name for u in units] == ["CS"]
-        assert len(logs) == 4
+        assert {log.url for log in logs} == {
+            "https://www.example.edu.cn/orgs",
+            "https://www.example.edu.cn/cs",
+            "https://www.example.edu.cn/cs/faculty",
+        }
 
     second = await dispatcher.run(resume=True)
     assert second.skipped == 1

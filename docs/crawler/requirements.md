@@ -41,7 +41,7 @@ Yanclaw 是一个面向高校导师信息采集、治理和推荐的本地智能
 
 - 采集中国高校公开网页上的导师和院士信息。
 - 以高校为单位保存本地 SQLite 数据库。
-- 支持从 `assets/websites.md` 中选择全部或部分高校运行。
+- 支持从默认 `assets/entrances.yaml` 中选择全部或部分高校运行。
 - 支持按学院/院系名称模糊筛选目标 org unit。
 - 默认使用人工辅助浏览器桥抓取页面。
 - 支持新跑批备份旧数据库，支持 resume 模式复用已有进度和任务。
@@ -68,7 +68,7 @@ Yanclaw 是一个面向高校导师信息采集、治理和推荐的本地智能
 验收标准：
 
 - 可执行 `uv run yanclaw crawl --universities "北京航空航天大学"`。
-- 未指定 `--universities` 时，系统按 `assets/websites.md` 中的目标列表处理。
+- 未指定 `--universities` 时，系统按 `assets/entrances.yaml` 中的目标列表处理。
 - CLI 输出本次运行的 success / failed / skipped 统计。
 - 若启动前 LLM 检查失败，默认阻止继续运行并提示配置问题。
 
@@ -302,11 +302,36 @@ Yanclaw 是一个面向高校导师信息采集、治理和推荐的本地智能
 
 ### 6.1 高校目标
 
-高校目标从 `assets/websites.md` 读取，当前解析逻辑接受 CSV-style header，核心字段为：
+高校目标默认从 `assets/entrances.yaml` 读取，`assets/收集.txt` 仅作为人工原始采集资料保留，不再由 crawler 解析。`YANCLAW_WEBSITES_PATH` 仍可指向旧 CSV-style manifest。运行时不再从高校首页自动发现学院入口；每所要爬取的高校必须人工提供至少一种入口：
 
-- name / university
-- url
-- location
+- `org_unit_listing_urls`：人工提供 1 个或多个学院/院系列表页，Agent 只从这些页抽取学院。
+- `org_units`：人工提供正式学院名称、可选学院主页、可选类型，以及 0 个或多个师资入口。
+- YAML 中必须写最终入库的正式高校名和正式学院名；系统不再运行时推断简称、短名或 raw alias。
+
+推荐 YAML 结构：
+
+```yaml
+version: 1
+universities:
+  - name: 北京航空航天大学
+    url: https://www.buaa.edu.cn/
+    location: 北京市
+    org_unit_listing_urls:
+      - https://www.buaa.edu.cn/jgsz/jxkyjg.htm
+
+  - name: 西安交通大学
+    url: https://www.xjtu.edu.cn/
+    location: 西安市
+    org_units:
+      - name: 机械工程学院
+        kind: college
+        faculty_urls:
+          - https://mec.xjtu.edu.cn/szdw/jsml.htm
+```
+
+如果某高校只有高校元信息而没有 `org_unit_listing_urls` / `org_units`，调度器返回 `manual_entrance_missing`，不会创建、备份或删除该高校 DB。
+
+`org_units` 优先级最高；同一高校存在人工学院清单时，`org_unit_listing_urls` 不会参与该高校的学院发现。
 
 ### 6.2 每高校独立 DB
 

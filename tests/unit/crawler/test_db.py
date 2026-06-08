@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
 from sqlalchemy import select, text
 
 from agents.crawler import db as crawler_db
 from agents.crawler.db.professors import normalize_professor_homepage
+from agents.crawler.entrances import (
+    EntranceManifestError,
+    load_university_entrance_targets,
+)
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.models import (
@@ -419,6 +424,178 @@ async def test_load_university_targets_accepts_markdown_autolink_urls(tmp_path):
     targets = crawler_db.load_university_targets_from_csv(csv_path)
     assert targets[0]["url"] == "https://www.example.edu.cn/"
     assert targets[0]["location"] == "City"
+
+
+def test_load_university_entrance_targets_accepts_manual_rows_with_chinese_headers(tmp_path):
+    manifest = tmp_path / "websites.md"
+    manifest.write_text(
+        "\n".join(
+            [
+                "# manual crawler entrances",
+                "record_type,序号,大学名称,官网地址,所在地,学院列表入口,学院名称,学院主页,师资入口,学院类型",
+                "university,1,TestU,<https://www.example.edu.cn/>,City,,,,,",
+                "org_listing,,TestU,,,https://www.example.edu.cn/orgs,,,,",
+                "org_unit,,TestU,,,,计算机学院,https://cs.example.edu.cn/,https://cs.example.edu.cn/faculty,college",
+                "org_unit,,TestU,,,,软件学院,https://soft.example.edu.cn/,,college",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    targets = load_university_entrance_targets(manifest)
+
+    assert len(targets) == 1
+    assert targets[0].name == "TestU"
+    assert targets[0].url == "https://www.example.edu.cn/"
+    assert targets[0].location == "City"
+    assert targets[0].org_unit_listing_urls == ()
+    assert [unit.name for unit in targets[0].manual_org_units] == ["计算机学院", "软件学院"]
+    assert targets[0].manual_org_units[0].faculty_url == "https://cs.example.edu.cn/faculty"
+
+    legacy = crawler_db.load_university_targets_from_csv(manifest)
+    assert legacy[0]["manual_org_units"][0]["name"] == "计算机学院"
+    assert legacy[0]["org_unit_listing_urls"] == []
+
+
+def test_load_university_entrance_targets_uses_listing_when_no_manual_org_units(tmp_path):
+    manifest = tmp_path / "websites.md"
+    manifest.write_text(
+        "\n".join(
+            [
+                "record_type,name,url,location,org_unit_listing_url,org_unit_name,org_unit_url,faculty_url",
+                "university,TestU,https://www.example.edu.cn/,City,,,,",
+                "org_listing,TestU,,,https://www.example.edu.cn/orgs,,,",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    targets = load_university_entrance_targets(manifest)
+
+    assert targets[0].manual_org_units == ()
+    assert targets[0].org_unit_listing_urls == ("https://www.example.edu.cn/orgs",)
+
+
+def test_load_university_entrance_targets_accepts_yaml_manifest(tmp_path):
+    manifest = tmp_path / "entrances.yaml"
+    manifest.write_text(
+        """
+version: 1
+universities:
+  - name: ListingU
+    url: https://www.listing.example.edu.cn/
+    location: CityA
+    org_unit_listing_urls:
+      - https://www.listing.example.edu.cn/orgs
+  - name: ManualU
+    url: https://www.manual.example.edu.cn/
+    location: CityB
+    org_unit_listing_urls:
+      - https://www.manual.example.edu.cn/ignored-when-org-units-exist
+    org_units:
+      - name: 机械工程学院
+        url: https://mec.manual.example.edu.cn/
+        kind: college
+        faculty_urls:
+          - https://mec.manual.example.edu.cn/szdw/jsml.htm
+          - https://mec.manual.example.edu.cn/szdw/qtjs.htm
+      - name: 软件学院
+        url: https://se.manual.example.edu.cn/
+""".strip(),
+        encoding="utf-8",
+    )
+
+    targets = load_university_entrance_targets(manifest)
+    by_name = {target.name: target for target in targets}
+
+    assert by_name["ListingU"].org_unit_listing_urls == ("https://www.listing.example.edu.cn/orgs",)
+    assert by_name["ListingU"].manual_org_units == ()
+    assert by_name["ManualU"].org_unit_listing_urls == ()
+    assert [unit.name for unit in by_name["ManualU"].manual_org_units] == [
+        "机械工程学院",
+        "机械工程学院",
+        "软件学院",
+    ]
+    assert [unit.faculty_url for unit in by_name["ManualU"].manual_org_units] == [
+        "https://mec.manual.example.edu.cn/szdw/jsml.htm",
+        "https://mec.manual.example.edu.cn/szdw/qtjs.htm",
+        "",
+    ]
+    assert all(unit.raw_name == "" and unit.aliases == () for unit in by_name["ManualU"].manual_org_units)
+
+    legacy = crawler_db.load_university_targets_from_csv(manifest)
+    assert legacy[1]["manual_org_units"][0]["name"] == "机械工程学院"
+
+
+def test_text_manifest_is_rejected(tmp_path):
+    manifest = tmp_path / "收集.txt"
+    manifest.write_text("学院列表\n北京航空航天大学：https://www.buaa.edu.cn/jgsz/jxkyjg.htm\n", encoding="utf-8")
+
+    with pytest.raises(EntranceManifestError, match="Text entrance manifest is no longer parsed"):
+        load_university_entrance_targets(manifest)
+
+
+def test_default_yaml_manifest_loads_key_manual_and_listing_targets():
+    targets = load_university_entrance_targets("assets/entrances.yaml")
+    by_name = {target.name: target for target in targets}
+
+    assert "北京航空航天大学" in by_name
+    assert by_name["北京航空航天大学"].org_unit_listing_urls == (
+        "https://www.buaa.edu.cn/jgsz/jxkyjg.htm",
+    )
+    assert "西安交通大学" in by_name
+    assert len(by_name["西安交通大学"].manual_org_units) >= 30
+    xjtu_names = {unit.name for unit in by_name["西安交通大学"].manual_org_units}
+    assert {
+        "机械工程学院",
+        "能源与动力工程学院",
+        "公共卫生学院",
+        "马克思主义学院",
+        "新闻与新媒体学院",
+    }.issubset(xjtu_names)
+    assert "中山大学" in by_name
+    sysu_names = {unit.name for unit in by_name["中山大学"].manual_org_units}
+    assert {"珠海-数学学院", "广州-数学学院", "深圳-药学院"}.issubset(sysu_names)
+    assert "厦门大学" in by_name
+    assert "数学学院" in {unit.name for unit in by_name["厦门大学"].manual_org_units}
+
+
+def test_load_university_entrance_targets_rejects_duplicate_org_unit_faculty_url(tmp_path):
+    manifest = tmp_path / "entrances.yaml"
+    manifest.write_text(
+        """
+version: 1
+universities:
+  - name: TestU
+    url: https://www.example.edu.cn/
+    org_units:
+      - name: 计算机学院
+        faculty_urls:
+          - https://cs.example.edu.cn/faculty
+          - https://cs.example.edu.cn/faculty
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EntranceManifestError, match="Duplicate URL"):
+        load_university_entrance_targets(manifest)
+
+
+def test_load_university_entrance_targets_rejects_org_unit_without_url(tmp_path):
+    manifest = tmp_path / "websites.md"
+    manifest.write_text(
+        "\n".join(
+            [
+                "record_type,name,url,location,org_unit_name,org_unit_url,faculty_url",
+                "university,TestU,https://www.example.edu.cn/,City,,,",
+                "org_unit,TestU,,,CS,,",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EntranceManifestError, match="requires org_unit_url or faculty_url"):
+        load_university_entrance_targets(manifest)
 
 
 async def test_upsert_academician_professors(tmp_path):

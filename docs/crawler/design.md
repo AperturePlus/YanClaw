@@ -19,7 +19,7 @@ runtime **不**提供 workflow、状态机或 BaseAgent 抽象类，避免成为
                          ▼
 ┌──────────────────────────────────────────────────────┐
 │              CrawlDispatcher                          │
-│  - 解析 assets/websites.md                            │
+│  - 解析 assets/entrances.yaml 或旧 CSV manifest        │
 │  - asyncio.Semaphore 控制并发                          │
 │  - 共享 Fetcher 实例                                   │
 │  - 断点续爬 + 汇总报告                                 │
@@ -365,17 +365,20 @@ DONE
 
 每个阶段的 Agent 行为：
 
-1. **FIND_COLLEGES**: 抓取大学首页 → LLM 分析 → 提取学院列表页链接
-2. **FIND_FACULTY_PAGES**: 对每个学院，抓取学院页面 → LLM 找到"师资队伍"链接
-3. **EXTRACT_PROFESSORS**: 抓取师资列表 → LLM 提取教师信息 + 个人主页链接 → 抓取详情 → tool calling 存库
-4. **REFLECT**: LLM 回顾执行日志，总结经验，决定是否更新/创建 skills
-5. **DONE**: 更新 `University.crawl_status = completed`
+1. **LOAD_MANUAL_ENTRANCES**: 从默认 `assets/entrances.yaml` 读取人工维护的学院列表入口或逐学院师资入口；`assets/收集.txt` 只作为原始资料保留，`YANCLAW_WEBSITES_PATH` 仍可指向旧 CSV manifest。默认不再从大学首页自动发现学院入口。
+2. **EXTRACT_ORG_UNITS**: 仅当高校配置了 `org_listing` 时，从这些人工指定页面抽取学院。
+3. **FIND_FACULTY_PAGES**: 对没有人工 `师资入口` 的学院，抓取学院页面并在学院范围内寻找师资页。
+4. **EXTRACT_PROFESSORS**: 抓取人工师资入口或发现到的师资列表 → LLM 提取教师信息 + 个人主页链接 → 抓取详情 → tool calling 存库。
+5. **REFLECT**: LLM 回顾执行日志，总结经验，决定是否更新/创建 skills。
+6. **DONE**: 更新 `University.crawl_status = completed`。
 
 ## 10. CrawlDispatcher 调度器
 
 CrawlDispatcher 是 crawler 子系统内部的调度器（非 Yanclaw 顶层编排）。
 
-- 从 `assets/websites.md` 解析大学列表
+- 从 `assets/entrances.yaml` 解析大学列表与人工入口，兼容旧 CSV manifest
+- YAML 中直接维护正式高校名和正式学院名；不在运行时推断短名或简称
+- 缺少人工入口的高校返回 `manual_entrance_missing`，不会触碰该高校 DB
 - `asyncio.Semaphore(max_concurrency)` 控制同时运行的 Agent 数量
 - **共享 Fetcher 实例**：per-domain 限速跨 Agent 生效，避免多个 Agent 同时请求同一域名
 - **断点续爬**：检查 `University.crawl_status`，跳过已 `completed` 的大学

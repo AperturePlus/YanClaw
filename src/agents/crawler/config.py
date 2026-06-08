@@ -33,7 +33,7 @@ class CrawlerSettings(BaseSettings):
     runtime_skills_dir: Path = Path("src/runtime/skills")
     crawler_skills_dir: Path = Path("src/agents/crawler/skills")
     data_steward_skills_dir: Path = Path("src/agents/data_steward/skills")
-    websites_path: Path = Path("assets/websites.md")
+    websites_path: Path = Path("assets/entrances.yaml")
     university_db_dir: Path = Path("data/universities")
     knowledge_graph_db_path: Path = Path("data/knowledge_graph.db")
     recommend_top_schools: int = Field(default=5, ge=1)

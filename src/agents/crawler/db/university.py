@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -843,18 +842,10 @@ async def count_academicians(session: AsyncSession) -> int:
     return int(count or 0)
 
 
-def load_university_targets_from_csv(path: str | Path) -> list[dict[str, str]]:
-    result: list[dict[str, str]] = []
-    with Path(path).open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            name = _row_value(row, "university", "name", fallback_index=1).strip()
-            url = _clean_url(_row_value(row, "url", fallback_index=2))
-            location = _clean_text(_row_value(row, "location", fallback_index=3))
-            if not name or not url:
-                continue
-            result.append({"name": name, "url": url, "location": location})
-    return result
+def load_university_targets_from_csv(path: str | Path) -> list[dict[str, object]]:
+    from agents.crawler.entrances import load_university_targets_from_csv as _load_targets
+
+    return _load_targets(path)
 
 
 async def _dedupe_org_units_by_name(session: AsyncSession) -> None:

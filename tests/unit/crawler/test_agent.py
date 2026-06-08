@@ -430,6 +430,177 @@ async def test_agent_state_machine_discovers_org_units_and_saves_professors(tmp_
     await db.close()
 
 
+async def test_agent_manual_faculty_entrance_bypasses_discovery(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages=pages,
+        manual_org_units=[
+            {
+                "name": "CS",
+                "url": "https://www.example.edu.cn/cs",
+                "faculty_url": "https://www.example.edu.cn/cs/faculty",
+                "kind": "college",
+            }
+        ],
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert fetcher.calls == ["https://www.example.edu.cn/cs/faculty"]
+    assert "state=DISCOVER_ORG_UNIT_PAGES" not in agent.execution_log
+    assert "state=FIND_FACULTY_PAGES" not in agent.execution_log
+    async with db.session() as session:
+        units = (await session.execute(select(OrgUnit))).scalars().all()
+        professors = (await session.execute(select(Professor))).scalars().all()
+        assert [unit.name for unit in units] == ["CS"]
+        assert [professor.name for professor in professors] == ["Ada"]
+    await db.close()
+
+
+async def test_agent_manual_faculty_entrance_uses_canonical_name(tmp_path):
+    class CanonicalFallbackLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_PROFESSORS":
+                result = await tool_handlers["save_professors"](
+                    org_unit_name="机械系",
+                    org_unit_url=payload["url"],
+                    source_url=payload["url"],
+                    professors=[{"name": "Ada", "title": "Professor"}],
+                )
+                return LLMResult(
+                    "",
+                    [
+                        ToolCallRecord(
+                            "save_professors",
+                            {"org_unit_name": "机械系", "professors": [{"name": "Ada"}]},
+                            result,
+                        )
+                    ],
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    pages = {
+        "https://www.example.edu.cn/mec/szdw/jsml.htm": FetchResult(
+            "https://www.example.edu.cn/mec/szdw/jsml.htm",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        CanonicalFallbackLLM(),
+        pages=pages,
+        manual_org_units=[
+            {
+                "name": "机械工程学院",
+                "faculty_url": "https://www.example.edu.cn/mec/szdw/jsml.htm",
+                "kind": "college",
+            }
+        ],
+        target_org_units=["机械工程学院"],
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert fetcher.calls == ["https://www.example.edu.cn/mec/szdw/jsml.htm"]
+    async with db.session() as session:
+        units = (await session.execute(select(OrgUnit))).scalars().all()
+        professors = (await session.execute(select(Professor))).scalars().all()
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        assert [unit.name for unit in units] == ["机械工程学院"]
+        assert [professor.org_unit_name for professor in professors] == ["机械工程学院"]
+        assert [task.org_unit_name for task in tasks] == ["机械工程学院"]
+    await db.close()
+
+
+async def test_agent_manual_org_unit_without_faculty_uses_org_level_discovery(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages=pages,
+        manual_org_units=[
+            {
+                "name": "CS",
+                "url": "https://www.example.edu.cn/cs",
+                "kind": "college",
+            }
+        ],
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert fetcher.calls == ["https://www.example.edu.cn/cs", "https://www.example.edu.cn/cs/faculty"]
+    assert "state=DISCOVER_ORG_UNIT_PAGES" not in agent.execution_log
+    assert "state=FIND_FACULTY_PAGES" in agent.execution_log
+    await db.close()
+
+
+async def test_agent_manual_org_listing_starts_from_configured_listing(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/manual-orgs": FetchResult(
+            "https://www.example.edu.cn/manual-orgs",
+            "org list",
+            ["https://www.example.edu.cn/cs"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs": FetchResult(
+            "https://www.example.edu.cn/cs",
+            "cs",
+            ["https://www.example.edu.cn/cs/faculty"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty",
+            "faculty",
+            [],
+            200,
+        ),
+    }
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages=pages,
+        org_unit_listing_urls=["https://www.example.edu.cn/manual-orgs"],
+    )
+
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://www.example.edu.cn/" not in fetcher.calls
+    assert fetcher.calls[0] == "https://www.example.edu.cn/manual-orgs"
+    assert "state=DISCOVER_ORG_UNIT_PAGES" not in agent.execution_log
+    assert "state=EXTRACT_ORG_UNITS" in agent.execution_log
+    await db.close()
+
+
 async def test_extract_professors_rewrites_sub_department_payload_to_parent_org_unit(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLMSubDepartmentProfessor())
 
