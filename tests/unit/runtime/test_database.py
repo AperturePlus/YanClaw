@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from sqlalchemy import text
 
 from runtime.database import DatabaseManager
@@ -37,3 +39,26 @@ async def test_sqlite_engine_enables_wal_and_tuned_pragmas(tmp_path):
     assert str(journal_mode).lower() == "wal"
     assert int(busy_timeout) == 15000
     assert int(synchronous) == 1  # 1 == NORMAL
+
+
+async def test_concurrent_writers_do_not_lock(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "concurrent.db"))
+    await db.init_db()
+    async with db.session() as session:
+        await session.execute(text("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"))
+
+    async def writer(worker: int) -> None:
+        for i in range(20):
+            async with db.session() as session:
+                await session.execute(
+                    text("INSERT INTO t (v) VALUES (:v)"),
+                    {"v": worker * 100 + i},
+                )
+
+    await asyncio.gather(*(writer(w) for w in range(8)))
+
+    async with db.session() as session:
+        total = (await session.execute(text("SELECT COUNT(*) FROM t"))).scalar()
+    await db.close()
+
+    assert int(total) == 160
