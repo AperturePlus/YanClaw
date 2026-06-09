@@ -263,6 +263,7 @@ class CrawlGraphNode(Base):
     type: Mapped[str] = mapped_column(String(64), index=True)
     url: Mapped[str] = mapped_column(Text, default="", index=True)
     org_unit_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    org_unit_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=CrawlGraphNodeStatus.PENDING.value, index=True)
     priority_score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)

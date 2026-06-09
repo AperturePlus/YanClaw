@@ -43,9 +43,12 @@ from agents.crawler.db.steward import (
     merge_into_academician_from_professor,
 )
 from agents.crawler.db.tasks import (
+    cleanup_non_edu_cn_crawl_tasks,
+    is_edu_cn_task_url,
     list_recoverable_crawl_tasks,
     log_extraction_failure,
     recover_stale_in_progress_crawl_tasks,
+    sanitize_crawl_task_url,
     set_crawl_task_status,
     summarize_crawl_task_status,
     upsert_crawl_task,
@@ -73,6 +76,7 @@ from agents.crawler.db.university import (
 
 __all__ = [
     "cleanup_excluded_org_units",
+    "cleanup_non_edu_cn_crawl_tasks",
     "cleanup_org_unit_scope_pollution",
     "count_academicians",
     "count_professors",
@@ -89,6 +93,7 @@ __all__ = [
     "get_graph_node_by_key",
     "get_university_status",
     "graph_node_key",
+    "is_edu_cn_task_url",
     "is_url_crawled",
     "list_ready_graph_nodes",
     "list_sub_department_section_candidates",
@@ -110,6 +115,7 @@ __all__ = [
     "ProfessorIdentityRepairCandidate",
     "ProfessorIdentityRepairSummary",
     "repair_professor_identity_data",
+    "sanitize_crawl_task_url",
     "UpsertEntityResult",
     "SubOrgUnitSectionCandidate",
     "set_crawl_task_status",

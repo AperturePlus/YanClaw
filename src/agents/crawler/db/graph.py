@@ -16,12 +16,23 @@ from agents.crawler.models import (
 )
 from agents.crawler.sanitizer import normalize_org_unit_name
 
+_GRAPH_NODE_METADATA_KEYS = {
+    "source_url",
+    "fetch_url",
+    "identity_url",
+    "fetch_action",
+    "candidate_score",
+    "discovery_source",
+    "skip_reason",
+}
+
 
 def graph_node_key(
     node_type: str | CrawlGraphNodeType,
     *,
     url: str | None = None,
     org_unit_name: str | None = None,
+    org_unit_id: int | None = None,
     node_key: str | None = None,
 ) -> str:
     if node_key:
@@ -30,10 +41,16 @@ def graph_node_key(
     normalized_url = _normalize_url(url) if url else ""
     normalized_name = normalize_org_unit_name(org_unit_name or "", default="")
     if type_value == CrawlGraphNodeType.ORG_UNIT.value:
+        if org_unit_id is not None:
+            return f"{type_value}:id:{int(org_unit_id)}"
         if not normalized_name:
             raise ValueError("org_unit_name is required for org_unit graph node")
         return f"{type_value}:name:{normalized_name}"
     if normalized_url:
+        if org_unit_id is not None:
+            return f"{type_value}:org:{int(org_unit_id)}:url:{normalized_url}"
+        if normalized_name:
+            return f"{type_value}:org:{normalized_name}:url:{normalized_url}"
         return f"{type_value}:url:{normalized_url}"
     if normalized_name:
         return f"{type_value}:name:{normalized_name}"
@@ -46,6 +63,7 @@ async def upsert_graph_node(
     node_type: str | CrawlGraphNodeType,
     url: str | None = None,
     org_unit_name: str | None = None,
+    org_unit_id: int | None = None,
     status: str | CrawlGraphNodeStatus = CrawlGraphNodeStatus.PENDING,
     priority_score: float = 0.0,
     confidence: float = 1.0,
@@ -60,13 +78,19 @@ async def upsert_graph_node(
     status_value = _enum_value(status)
     normalized_url = _normalize_url(url) if url else ""
     normalized_name = normalize_org_unit_name(org_unit_name or "", default="")
+    raw_metadata = _coerce_metadata(metadata=metadata, metadata_json=metadata_json)
+    metadata_org_unit_id = raw_metadata.pop("org_unit_id", None)
+    incoming_metadata = _filter_graph_node_metadata(raw_metadata)
+    normalized_org_unit_id = _optional_int(
+        org_unit_id if org_unit_id is not None else metadata_org_unit_id
+    )
     key = graph_node_key(
         type_value,
         url=normalized_url,
         org_unit_name=normalized_name,
+        org_unit_id=normalized_org_unit_id,
         node_key=node_key,
     )
-    incoming_metadata = _coerce_metadata(metadata=metadata, metadata_json=metadata_json)
 
     row = (
         await session.execute(select(CrawlGraphNode).where(CrawlGraphNode.node_key == key).limit(1))
@@ -77,6 +101,7 @@ async def upsert_graph_node(
             type=type_value,
             url=normalized_url,
             org_unit_name=normalized_name,
+            org_unit_id=normalized_org_unit_id,
             status=status_value,
             priority_score=float(priority_score or 0.0),
             confidence=float(confidence or 0.0),
@@ -96,7 +121,10 @@ async def upsert_graph_node(
         row.url = normalized_url
         changed = True
     if normalized_name and row.org_unit_name != normalized_name:
-        row.org_unit_name = _merge_org_unit_names(row.org_unit_name, normalized_name)
+        row.org_unit_name = normalized_name
+        changed = True
+    if normalized_org_unit_id is not None and row.org_unit_id != normalized_org_unit_id:
+        row.org_unit_id = normalized_org_unit_id
         changed = True
     if type_value and row.type != type_value:
         row.type = type_value
@@ -201,6 +229,7 @@ async def mark_graph_node_status(
         row.last_error = last_error
     if increment_attempt:
         row.attempt_count = int(row.attempt_count or 0) + 1
+        row.priority_score = float(row.priority_score or 0.0) - 5.0
     row.updated_at = _now_utc()
     await session.flush()
     return row
@@ -227,15 +256,16 @@ async def list_ready_graph_nodes(
         for name in (org_unit_names or [])
         if normalize_org_unit_name(name, default="")
     ]
-    metadata_id_filters = [
-        CrawlGraphNode.metadata_json.like(f'%"org_unit_id":{int(org_unit_id)}%')
+    normalized_ids = [
+        int(org_unit_id)
         for org_unit_id in (org_unit_ids or [])
         if org_unit_id is not None
     ]
     org_filters: list[Any] = []
     if normalized_names:
         org_filters.append(CrawlGraphNode.org_unit_name.in_(normalized_names))
-    org_filters.extend(metadata_id_filters)
+    if normalized_ids:
+        org_filters.append(CrawlGraphNode.org_unit_id.in_(normalized_ids))
     if org_filters:
         filters.append(or_(*org_filters))
 
@@ -275,7 +305,9 @@ async def record_graph_node_result(
     if priority_delta:
         row.priority_score = float(row.priority_score or 0.0) + float(priority_delta)
     if metadata:
-        row.metadata_json = _dump_metadata(_merge_metadata(_load_metadata(row.metadata_json), metadata))
+        filtered_metadata = _filter_graph_node_metadata(metadata)
+        if filtered_metadata:
+            row.metadata_json = _dump_metadata(_merge_metadata(_load_metadata(row.metadata_json), filtered_metadata))
     row.updated_at = _now_utc()
     await session.flush()
     return row
@@ -328,6 +360,15 @@ def _load_metadata(value: str | None) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _dump_metadata(value: dict[str, Any]) -> str:
     return json.dumps(value or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -349,6 +390,15 @@ def _merge_metadata(current: dict[str, Any], incoming: dict[str, Any]) -> dict[s
             continue
         result[key] = value
     return result
+
+
+def _filter_graph_node_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    result = dict(metadata or {})
+    source = result.pop("source", None)
+    result.pop("org_unit_id", None)
+    if source is not None and "discovery_source" not in result:
+        result["discovery_source"] = source
+    return {key: value for key, value in result.items() if key in _GRAPH_NODE_METADATA_KEYS}
 
 
 def _merge_org_unit_names(current: str | None, incoming: str) -> str:

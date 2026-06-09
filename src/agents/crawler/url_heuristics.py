@@ -6,243 +6,52 @@ from typing import Any
 from urllib.parse import parse_qsl, unquote, urlparse
 
 from agents.crawler.fetchers import Fetcher
+from agents.crawler.heuristic_constants import (
+    DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS,
+    FACULTY_KEYWORDS,
+    FACULTY_PAGE_TYPE_CATEGORY,
+    FACULTY_PAGE_TYPE_ELITE,
+    FACULTY_PAGE_TYPE_FULL,
+    FACULTY_PAGE_TYPE_NOISE,
+    FACULTY_PAGE_TYPE_UNKNOWN,
+    ORG_UNIT_PAGE_KEYWORDS,
+    _ACTIVE_TEXT_HINTS,
+    _CATEGORY_PATTERNS,
+    _COMMON_FACULTY_PATHS,
+    _EXPLICIT_FACULTY_DIR_HINTS,
+    _FACULTY_CATEGORY_TEXT_HINTS,
+    _FACULTY_ELITE_TEXT_HINTS,
+    _FACULTY_FULL_STRONG_TEXT_HINTS,
+    _FACULTY_FULL_TEXT_HINTS,
+    _FACULTY_LOGIN_HARD_REJECT_HINTS,
+    _FACULTY_NAV_CONTEXT_HINTS,
+    _FACULTY_NOISE_STEM_HINTS,
+    _FACULTY_NOISE_TEXT_HINTS,
+    _FACULTY_NOISE_TOKEN_HINTS,
+    _FACULTY_NOISE_URL_HINTS,
+    _FOCUS_AI_ASCII_TERMS,
+    _FOCUS_AI_HINTS,
+    _FOCUS_AI_HOST_LABELS,
+    _FOCUS_COMPUTER_ASCII_TERMS,
+    _FOCUS_COMPUTER_HINTS,
+    _FOCUS_COMPUTER_HOST_LABELS,
+    _FOCUS_ELECTRONICS_ASCII_TERMS,
+    _FOCUS_ELECTRONICS_HINTS,
+    _FOCUS_ELECTRONICS_HOST_LABELS,
+    _FOCUS_SOFTWARE_ASCII_TERMS,
+    _FOCUS_SOFTWARE_HINTS,
+    _FOCUS_SOFTWARE_HOST_LABELS,
+    _INTERMEDIATE_ORG_PATHS,
+    _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS,
+    _ORG_UNIT_LISTING_NOISE_HINTS,
+    _ORG_UNIT_LISTING_STRONG_HINTS,
+    _PAGINATION_RE,
+    _PROMOTIONAL_NOISE_TOKENS,
+    _RETIRED_TEXT_HINTS,
+    _RETIRED_URL_HINTS,
+    _URL_RE,
+)
 from agents.crawler.models import OrgUnit
-
-ORG_UNIT_PAGE_KEYWORDS = (
-    "college",
-    "school",
-    "department",
-    "academy",
-    "faculty",
-    "institute",
-    "yuan",
-    "xueyuan",
-    "yuanxi",
-    "/yxsz",
-    "/jgsz",
-    "/zzjg",
-    "/jxjg",
-    "/xysz",
-    "/xybm",
-    "/jxkydw",
-    "jxkydw",
-    "yjjg",
-    "/xygk",
-    "/xxgk",
-    # Full pinyin forms used by some universities (e.g. RUC zuzhijigou.html)
-    "zuzhijigou",
-    "jiaoxuejigou",
-    "jiaoxuedanwei",
-    "yuanxishezhi",
-    "xueyuanshezhi",
-    # Chinese keywords (multi-char only to avoid false positives)
-    "学院",
-    "院系",
-    "组织机构",
-    "机构设置",
-    "院系设置",
-    "学院设置",
-    "教学单位",
-    "科研机构",
-)
-
-FACULTY_KEYWORDS = (
-    "teacher",
-    "faculty",
-    "staff",
-    "people",
-    "team",
-    "tutor",
-    "supervisor",
-    "professor",
-    "mentor",
-    "directory",
-    "list",
-    "szjs",
-    "zzjs",
-    "szdw",
-    "szll",
-    "jsdw",
-    "qzjs",
-    "rcdw",
-    "jzg",
-    "jslb",
-    "jsml",
-    "jiaoshiliebiao",
-    "jiaoshiml",
-    "jiaoshimulu",
-    "faculty_list",
-    "teacher_list",
-    "facultylist",
-    "teacherlist",
-    "teaching_staff",
-    "师资",
-    "教师",
-    "导师",
-    "教工",
-    "人才",
-)
-
-_ORG_UNIT_EXCLUDE_KEYWORD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    (
-        "arts",
-        (
-            "艺术",
-            "美术",
-            "音乐",
-            "舞蹈",
-            "戏剧",
-            "戏曲",
-            "电影学院",
-            "影视学院",
-            "传媒艺术",
-            "艺术设计",
-            "fine arts",
-            "visual arts",
-            "performing arts",
-            "school of arts",
-            "college of arts",
-            "music",
-            "dance",
-            "drama",
-            "theater",
-            "theatre",
-            "film",
-            "cinema",
-        ),
-    ),
-    (
-        "sports",
-        (
-            "体育",
-            "运动训练",
-            "竞技体育",
-            "physical education",
-            "sports",
-            "sport science",
-            "kinesiology",
-            "athletics",
-        ),
-    ),
-    (
-        "joint_program",
-        (
-            "中外合作",
-            "中外合办",
-            "合作办学",
-            "国际联合",
-            "联合学院",
-            "联合培养",
-            "中法工程师",
-            "中德工程",
-            "中英国际",
-            "中美联合",
-            "匹兹堡",
-            "格拉斯哥",
-            "巴黎卓越",
-            "密西根",
-            "爱丁堡",
-            "莱斯特",
-            "pittsburgh",
-            "glasgow",
-            "paris elite",
-            "michigan",
-            "edinburgh",
-            "leicester",
-            "joint institute",
-            "joint college",
-            "international joint",
-            "cooperative education",
-            "sino-foreign",
-            "sino foreign",
-        ),
-    ),
-    (
-        "basic_teaching",
-        (
-            "基教中心",
-            "基础教学中心",
-            "基础教学部",
-            "基础课教学部",
-            "公共基础教学部",
-            "基础教育中心",
-            "公共课教学",
-        ),
-    ),
-    (
-        "teaching_experiment_center",
-        (
-            "教学实验中心",
-            "实验教学中心",
-            "实践教学中心",
-            "实验中心",
-            "教学中心",
-            "实训中心",
-            "工程训练中心",
-            "实验实训中心",
-            "teaching experiment center",
-            "experimental teaching center",
-            "practice teaching center",
-            "training center",
-        ),
-    ),
-    (
-        "continuing_education",
-        (
-            "继续教育学院",
-            "继续教育",
-            "成人教育学院",
-            "成人教育",
-            "成人高等教育",
-            "网络教育学院",
-            "网络教育",
-            "开放教育学院",
-            "开放教育",
-            "职业与继续教育学院",
-            "继续教育与培训",
-            "继续教育培训",
-            "continuing education",
-            "adult education",
-            "online education",
-        ),
-    ),
-    (
-        "undergraduate_teaching_unit",
-        (
-            "书院",
-            "本科生院",
-            "本科生学院",
-            "本科教育学院",
-            "本科教育",
-            "荣誉学院",
-            "荣誉书院",
-            "通识教育学院",
-            "通识教育",
-            "新生学院",
-            "北航学院",
-            "residential college",
-            "undergraduate college",
-            "honors college",
-            "honours college",
-            "general education",
-        ),
-    ),
-    (
-        "excellent_engineer_program",
-        (
-            "卓工",
-            "卓越工程师",
-            "卓越工程师学院",
-            "卓越工程师培养",
-            "excellent engineer",
-            "elite engineer",
-        ),
-    ),
-)
-
-DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS: tuple[str, ...] = tuple(
-    dict.fromkeys(keyword for _, keywords in _ORG_UNIT_EXCLUDE_KEYWORD_GROUPS for keyword in keywords)
-)
 
 
 @dataclass(frozen=True)
@@ -342,103 +151,6 @@ def _looks_like_faculty_page(url: str) -> bool:
     return bool(_keyword_filter([url], FACULTY_KEYWORDS))
 
 
-_FACULTY_NOISE_URL_HINTS = (
-    "/news/",
-    "/xwzx/",
-    "/notice/",
-    "/tzgg/",
-    "/gonggao/",
-    "/announcement/",
-    "/events/",
-    "/event/",
-    "/rczp/",
-    "/zhaopin/",
-    "/jobs/",
-    "/job/",
-    "/hr/",
-    "/renshi/",
-    "/rsrc/",
-    "/rsc/",
-    "/rszc/",
-    "/bszn/",
-    "/bslc/",
-    "/personnel/",
-    "/policy/",
-    "/zcwj/",
-    "/rule/",
-    "/rules/",
-    "/regulation/",
-    "规章制度",
-    "/dangjian/",
-    "/party/",
-    "/student/",
-    "/xsgz/",
-    "/zsjy/",
-    "/zlxz/",
-    "/download/",
-)
-
-_FACULTY_NOISE_TOKEN_HINTS = frozenset(
-    {
-        "news",
-        "xwzx",
-        "notice",
-        "tzgg",
-        "gonggao",
-        "announcement",
-        "events",
-        "event",
-        "rczp",
-        "zhaopin",
-        "jobs",
-        "job",
-        "hr",
-        "renshi",
-        "rsrc",
-        "rsc",
-        "rszc",
-        "bszn",
-        "bslc",
-        "zlxz",
-        "personnel",
-        "policy",
-        "zcwj",
-        "rule",
-        "rules",
-        "regulation",
-        "dangjian",
-        "party",
-        "student",
-        "xsgz",
-        "zsjy",
-        "download",
-        "downloads",
-    }
-)
-
-_FACULTY_NOISE_STEM_HINTS = frozenset(
-    {"rszc", "bszn", "bslc", "zlxz", "tzgg", "xwzx", "rczp", "zcwj", "renshi", "policy", "download"}
-)
-
-_EXPLICIT_FACULTY_DIR_HINTS = (
-    "/faculty/",
-    "/facultylist",
-    "/teacher/",
-    "/teachers/",
-    "/teacherlist",
-    "/staff/",
-    "/people/",
-    "/szdw/",
-    "/szdw.htm",
-    "/jsdw/",
-    "/szll",
-    "/qzjs",
-    "/mentor",
-    "/supervisor",
-    "/jzg",
-)
-
-
 def _iter_url_noise_tokens(url: str) -> list[str]:
     # Only tokenize the path: query strings frequently embed generic words such
     # as "news" inside parameter values (e.g. BUAA siteweaver detail pages use
@@ -459,11 +171,28 @@ def _matches_noise_stem(token: str) -> bool:
     return False
 
 
+def _is_promotional_noise_url(url: str) -> bool:
+    tokens = set(_iter_url_noise_tokens(url))
+    if not tokens.intersection(_PROMOTIONAL_NOISE_TOKENS):
+        return False
+    lowered = (url or "").lower()
+    if _is_explicit_faculty_directory_url(lowered) and _looks_like_faculty_page(lowered):
+        return False
+    return True
+
+
 def _is_non_faculty_noise_url(url: str) -> bool:
     lowered = url.lower()
-    if any(token in lowered for token in _FACULTY_NOISE_URL_HINTS):
+    if _is_promotional_noise_url(lowered):
+        return True
+    safe_url_hints = tuple(
+        token for token in _FACULTY_NOISE_URL_HINTS if token.strip("/") not in _PROMOTIONAL_NOISE_TOKENS
+    )
+    if any(token in lowered for token in safe_url_hints):
         return True
     for token in _iter_url_noise_tokens(lowered):
+        if token in _PROMOTIONAL_NOISE_TOKENS:
+            continue
         if token in _FACULTY_NOISE_TOKEN_HINTS or _matches_noise_stem(token):
             return True
     # Dated news/article URLs are usually irrelevant for faculty extraction.
@@ -476,46 +205,6 @@ def _is_non_faculty_noise_url(url: str) -> bool:
 def _is_explicit_faculty_directory_url(url: str) -> bool:
     lowered = (url or "").lower()
     return any(token in lowered for token in _EXPLICIT_FACULTY_DIR_HINTS)
-
-
-_ORG_UNIT_LISTING_STRONG_HINTS = (
-    "/yx.htm",
-    "/yxsz",
-    "/xysz",
-    "/jgsz",
-    "/zzjg",
-    "/xybm",
-    "/jxkydw",
-    "zuzhijigou",
-    "jiaoxuejigou",
-    "jiaoxuedanwei",
-    "yuanxishezhi",
-    "xueyuanshezhi",
-    "college",
-    "school",
-    "department",
-    "academy",
-    "xueyuan",
-    "yuanxi",
-)
-
-_ORG_UNIT_LISTING_NOISE_HINTS = (
-    "/xxgk/xxjj",
-    "/xxgk/ls",
-    "/xxgk/ld",
-    "/xxgk/xrld",
-    "/xygk/",
-    "/about",
-    "/overview",
-    "/intro",
-    "/history",
-    "/leader",
-    "/news",
-    "/notice",
-    "/jgbc",
-    "/ywdw",
-    "/jjjcjg",
-)
 
 
 def _looks_like_org_unit_listing_url(url: str) -> bool:
@@ -590,104 +279,6 @@ def _rank_faculty_page_candidates(links: list[str]) -> list[str]:
 def _is_academician_showcase_page(url: str) -> bool:
     lowered = url.lower()
     return any(token in lowered for token in ("lyys", "yuanshi", "academician", "yuan-shi"))
-
-
-FACULTY_PAGE_TYPE_FULL = "full_list"
-FACULTY_PAGE_TYPE_CATEGORY = "category_list"
-FACULTY_PAGE_TYPE_ELITE = "elite_list"
-FACULTY_PAGE_TYPE_NOISE = "noise_or_login"
-FACULTY_PAGE_TYPE_UNKNOWN = "unknown"
-
-_FACULTY_LOGIN_HARD_REJECT_HINTS = (
-    "tplloginaccount",
-    "/login",
-    "login.jsp",
-    "/account",
-    "signin",
-    "xw_list_new",
-)
-
-_FACULTY_FULL_TEXT_HINTS = (
-    "全体教师",
-    "教师名录",
-    "师资队伍",
-    "教师队伍",
-    "专任教师",
-    "在职教师",
-    "在岗教师",
-    "现任教师",
-    "faculty list",
-    "teacher list",
-    "all teachers",
-    "teaching staff",
-    "staff directory",
-)
-
-_FACULTY_FULL_STRONG_TEXT_HINTS = (
-    "全体教师",
-    "师资队伍",
-    "教师队伍",
-    "专任教师",
-    "在职教师",
-    "在岗教师",
-    "现任教师",
-    "faculty list",
-    "all teachers",
-    "teaching staff",
-    "staff directory",
-)
-
-_FACULTY_CATEGORY_TEXT_HINTS = (
-    "教授",
-    "副教授",
-    "讲师",
-    "研究员",
-    "博导",
-    "硕导",
-    "博士生导师",
-    "硕士生导师",
-    "professor",
-    "associate professor",
-    "assistant professor",
-    "lecturer",
-    "researcher",
-)
-
-_FACULTY_ELITE_TEXT_HINTS = (
-    "杰出人才",
-    "高层次人才",
-    "名师",
-    "杰青",
-    "优青",
-    "academician",
-    "distinguished",
-    "talent",
-    "fellow",
-)
-
-_FACULTY_NOISE_TEXT_HINTS = (
-    "新闻",
-    "通知",
-    "公告",
-    "党建",
-    "人事",
-    "招聘",
-    "规章制度",
-    "规章",
-    "办事指南",
-    "办事流程",
-    "资料下载",
-    "申请表",
-    "办理程序",
-    "news",
-    "notice",
-    "announcement",
-    "events",
-    "policy",
-    "recruit",
-)
-
-_FACULTY_NAV_CONTEXT_HINTS = ("nav", "menu", "tab", "tree", "list")
 
 
 @dataclass(frozen=True)
@@ -914,51 +505,6 @@ def _select_balanced_faculty_candidates(
     return deduped
 
 
-_RETIRED_URL_HINTS = (
-    "ltx",
-    "ltxjs",
-    "ltxgz",
-    "ltgz",
-    "retired",
-    "emeritus",
-    "rongxiu",
-    "tuixiu",
-    "rxjzg",
-    "rxjs",
-    "laojiaoshi",
-)
-
-_RETIRED_TEXT_HINTS = (
-    "离退休",
-    "退休",
-    "荣休",
-    "退休教师",
-    "离休",
-    "退休人员",
-    "retired",
-    "emeritus",
-)
-
-
-_ACTIVE_TEXT_HINTS = (
-    "\u5728\u804c",
-    "\u4e13\u4efb\u6559\u5e08",
-    "\u73b0\u804c",
-    "\u5e08\u8d44\u961f\u4f0d",
-    "\u5e08\u8d44\u529b\u91cf",
-    "\u6559\u5e08\u540d\u5f55",
-    "\u5bfc\u5e08\u961f\u4f0d",
-    "\u7855\u5bfc",
-    "\u535a\u5bfc",
-    "teacher",
-    "faculty",
-    "professor",
-    "staff",
-    "mentor",
-    "supervisor",
-)
-
-
 def _looks_like_retired_url(url: str) -> bool:
     lowered = url.lower()
     return any(token in lowered for token in _RETIRED_URL_HINTS) or any(token in url for token in _RETIRED_TEXT_HINTS)
@@ -1090,56 +636,6 @@ def _is_core_academic_kind(kind: str | None) -> bool:
     if any(token in value for token in research_tokens):
         return False
     return any(token in value for token in core_tokens)
-
-
-_FOCUS_COMPUTER_HINTS = (
-    "computer",
-    "computing",
-    "computer science",
-    "\u8ba1\u7b97\u673a",  # 计算机
-    "\u8ba1\u7b97\u673a\u79d1\u5b66",  # 计算机科学
-)
-_FOCUS_COMPUTER_HOST_LABELS = {"cs", "cse", "computer", "computing"}
-_FOCUS_COMPUTER_ASCII_TERMS = {"cs", "cse"}
-
-_FOCUS_SOFTWARE_HINTS = (
-    "software",
-    "software engineering",
-    "\u8f6f\u4ef6",  # 软件
-    "\u8f6f\u4ef6\u5de5\u7a0b",  # 软件工程
-)
-_FOCUS_SOFTWARE_HOST_LABELS = {"software", "se", "sse"}
-_FOCUS_SOFTWARE_ASCII_TERMS = {"software"}
-
-_FOCUS_AI_HINTS = (
-    "artificial intelligence",
-    "machine intelligence",
-    "\u4eba\u5de5\u667a\u80fd",  # 人工智能
-    "\u667a\u80fd\u79d1\u5b66",  # 智能科学
-)
-_FOCUS_AI_HOST_LABELS = {"ai", "iai", "aai"}
-_FOCUS_AI_ASCII_TERMS = {"ai"}
-
-_FOCUS_ELECTRONICS_HINTS = (
-    "electronics",
-    "electronic",
-    "electrical",
-    "microelectronics",
-    "information engineering",
-    "information science",
-    "\u7535\u5b50\u4fe1\u606f",  # 电子信息
-    "\u7535\u6c14\u5de5\u7a0b",  # 电气工程
-    "\u5fae\u7535\u5b50",  # 微电子
-)
-_FOCUS_ELECTRONICS_HOST_LABELS = {
-    "ee",
-    "ece",
-    "eie",
-    "electronic",
-    "electronics",
-    "microelectronics",
-}
-_FOCUS_ELECTRONICS_ASCII_TERMS = {"ee", "ece", "eie"}
 
 
 def _ascii_terms(value: str) -> set[str]:
@@ -1286,41 +782,6 @@ def _is_college_subdomain(url: str, start_url: str) -> bool:
     return _site_root(host) == _site_root(base_host)
 
 
-_COMMON_FACULTY_PATHS = (
-    "/szdw/szll.htm",
-    "/szdw.htm",
-    "/szdw/",
-    "/szll.htm",
-    "/szll/",
-    "/rcpy/szdw.htm",
-    "/sz/szdw.htm",
-    "/teacher/",
-    "/teachers/",
-    "/faculty/",
-    "/people/",
-    "/szrc.htm",
-    "/szdw/jsdw.htm",
-    "/szdw/qzjs.htm",
-    "/szdw/index.htm",
-    "/yjdw/szdw.htm",
-    "/jszy/",
-    "/rydw/",
-)
-
-_INTERMEDIATE_ORG_PATHS = (
-    "/zuzhijigou.html",
-    "/jgsz.htm",
-    "/jgsz/",
-    "/jgsz/jxkyjg.htm",
-    "/yxsz.htm",
-    "/yxsz/",
-    "/zzjg.htm",
-    "/zzjg/",
-    "/jxjg.htm",
-    "/jxjg/",
-    "/xysz.htm",
-    "/xysz/",
-)
 def _same_site(url: str, base_url: str) -> bool:
     return bool(Fetcher.filter_same_domain([url], base_url))
 
@@ -1342,22 +803,6 @@ def _url_found_on_page(url: str, page_links: set[str], page_text_lower: str) -> 
     if host and host in page_text_lower:
         return True
     return False
-
-
-_CATEGORY_PATTERNS = (
-    "教学科研",
-    "科研机构",
-    "研究机构",
-    "教学单位",
-    "直属单位",
-    "附属单位",
-    "独立学院",
-    "党群部门",
-    "行政部门",
-    "管理机构",
-    "教辅机构",
-    "群团组织",
-)
 
 
 def _is_category_name(name: str) -> bool:
@@ -1384,16 +829,6 @@ def _truncate_middle(text: str, max_chars: int) -> str:
     return head + "\n\n...[truncated]...\n\n" + tail
 
 
-_PAGINATION_RE = re.compile(
-    r"[?&](page|p|pagenum|pn|start|offset)=\d+"
-    r"|/list_\d+\.htm"
-    r"|/index_\d+\.htm"
-    r"|/page/\d+"
-    r"|-\d+\.htm$",
-    re.IGNORECASE,
-)
-
-
 def _is_pagination_link(url: str) -> bool:
     return bool(_PAGINATION_RE.search(url))
 
@@ -1408,9 +843,6 @@ def _is_query_profile_detail_url(url: str) -> bool:
         params[key.lower()] = value.strip()
     action = params.get("action", "").lower()
     return action == "detailteam" and bool(params.get("uuinid"))
-
-
-_URL_RE = re.compile(r"https?://[^\s\)\]\"'>]+")
 
 
 def _extract_urls_from_text(text: str) -> list[str]:

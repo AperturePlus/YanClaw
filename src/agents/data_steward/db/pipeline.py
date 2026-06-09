@@ -110,6 +110,18 @@ async def process_one_database(
         steward_llm = steward_llm_factory(db) if steward_llm_factory is not None else None
         async with db.session() as session:
             await repository.ensure_schema(session, repair_identity=False)
+            task_cleanup_summary = await crawler_db.cleanup_non_edu_cn_crawl_tasks(session)
+            task_cleanup_changed = (
+                int(task_cleanup_summary.get("crawl_tasks_deleted", 0) or 0)
+                + int(task_cleanup_summary.get("crawl_extraction_failures_deleted", 0) or 0)
+                + int(task_cleanup_summary.get("crawl_task_org_unit_urls_cleared", 0) or 0)
+            )
+            if task_cleanup_changed:
+                logger.info(
+                    "Data Steward cleaned non-edu-cn crawl tasks db=%s summary=%s",
+                    target_db.name,
+                    task_cleanup_summary,
+                )
             run_id = await repository.create_run(
                 session,
                 mode=mode,
@@ -1735,6 +1747,11 @@ async def record_missing_field_audits(
     audits_written = 0
     missing_field_audits = 0
     recrawl_tasks_upserted = 0
+    recrawl_enqueued = False
+    if apply and _should_enqueue_recrawl(missing_fields=missing_fields, reason=reason):
+        recrawl_enqueued = await enqueue_recrawl_task(session, professor, reason=reason)
+        if recrawl_enqueued:
+            recrawl_tasks_upserted += 1
     for field_name in missing_fields:
         recrawl_field = _should_enqueue_recrawl_for_field(
             field_name=field_name,
@@ -1752,14 +1769,11 @@ async def record_missing_field_audits(
             reason=reason,
             confidence=confidence,
             evidence=evidence,
-            action="recrawl_enqueued" if (apply and recrawl_field) else "report_only",
+            action="recrawl_enqueued" if (recrawl_enqueued and recrawl_field) else "report_only",
         )
         audits_written += 1
         missing_field_audits += 1
 
-    if apply and _should_enqueue_recrawl(missing_fields=missing_fields, reason=reason):
-        if await enqueue_recrawl_task(session, professor, reason=reason):
-            recrawl_tasks_upserted += 1
     return audits_written, missing_field_audits, recrawl_tasks_upserted
 
 

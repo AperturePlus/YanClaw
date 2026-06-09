@@ -62,6 +62,7 @@ class CrawlSessionState:
                 "followups_scheduled": 0,
                 "pagination_scheduled": 0,
                 "duplicate_tasks_skipped": 0,
+                "edu_cn_task_url_rejected": 0,
                 "duplicate_followups_skipped": 0,
                 "detail_links_dropped_noise": 0,
                 "detail_links_dropped_directory": 0,

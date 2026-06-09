@@ -1317,6 +1317,72 @@ async def test_steward_apply_enqueues_homepage_missing_research_recrawl(tmp_path
     await db.close()
 
 
+async def test_steward_apply_rejects_non_edu_cn_homepage_recrawl_task(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        "name,url,location\nTestU,https://www.example.edu.cn/,X\n",
+        encoding="utf-8",
+    )
+    db_dir = tmp_path / "universities"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    db_path = db_dir / "example.edu.cn.db"
+    homepage = "https://profiles.example.com/ada"
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session, repair_identity=False)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="TestU",
+            start_url="https://www.example.edu.cn/",
+            location="X",
+        )
+        professor = await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://www.example.edu.cn/cs",
+                "title": "Professor",
+                "source_url": "https://www.example.edu.cn/cs/faculty",
+                "bio": "profile exists",
+            },
+        )
+        professor.homepage = homepage
+    await db.close()
+
+    settings = CrawlerSettings(
+        websites_path=websites,
+        university_db_dir=db_dir,
+    )
+    summary = await DataStewardAgent(settings=settings).run(
+        universities=["TestU"],
+        universities_file=None,
+        db_roots=None,
+        apply=True,
+        llm_enabled=False,
+        max_context_tokens=128000,
+        include_backup_audit=False,
+    )
+
+    assert summary.total_recrawl_tasks_upserted == 0
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+        audits = (await session.execute(select(DataQualityAudit))).scalars().all()
+        assert tasks == []
+        assert any(
+            audit.field_name == "research_areas"
+            and audit.reason == "homepage_profile_incomplete"
+            and audit.action == "report_only"
+            for audit in audits
+        )
+    await db.close()
+
+
 async def test_steward_apply_enqueues_homepage_missing_bio_but_not_no_homepage(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(

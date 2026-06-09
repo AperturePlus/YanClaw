@@ -192,7 +192,7 @@ async def upsert_recrawl_task(
     university_meta = (await session.execute(select(UniversityMeta))).scalar_one_or_none()
     university_name = str(university_meta.name) if university_meta else ""
     page_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    await crawler_db.upsert_crawl_task(
+    task = await crawler_db.upsert_crawl_task(
         session,
         university=university_name,
         org_unit_name=professor.org_unit_name or "Unknown",
@@ -208,4 +208,4 @@ async def upsert_recrawl_task(
         priority=priority,
         last_error=last_error,
     )
-    return True
+    return task is not None

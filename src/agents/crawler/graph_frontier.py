@@ -13,7 +13,17 @@ from agents.crawler.models import (
     CrawlGraphNodeType,
     OrgUnit,
 )
-from agents.crawler.url_heuristics import _sanitize_url
+from agents.crawler.url_heuristics import _assess_faculty_candidate, _sanitize_url
+
+_FRONTIER_METADATA_KEYS = {
+    "source_url",
+    "fetch_url",
+    "identity_url",
+    "fetch_action",
+    "candidate_score",
+    "discovery_source",
+    "skip_reason",
+}
 
 
 @dataclass(frozen=True)
@@ -28,6 +38,8 @@ class GraphFetchCandidate:
     node_type: str = ""
     priority_score: float = 0.0
     confidence: float = 1.0
+    attempt_count: int = 0
+    status: str = ""
 
     @property
     def queue_url(self) -> str:
@@ -35,12 +47,12 @@ class GraphFetchCandidate:
 
 
 _BASE_PRIORITY: dict[str, float] = {
-    CrawlGraphNodeType.ORG_UNIT.value: 95.0,
+    CrawlGraphNodeType.ORG_UNIT.value: 100.0,
     CrawlGraphNodeType.ORG_LISTING_URL.value: 90.0,
-    CrawlGraphNodeType.FACULTY_LIST_URL.value: 80.0,
-    CrawlGraphNodeType.PAGINATION_URL.value: 70.0,
-    CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value: 60.0,
-    CrawlGraphNodeType.DETAIL_URL.value: 40.0,
+    CrawlGraphNodeType.FACULTY_LIST_URL.value: 85.0,
+    CrawlGraphNodeType.PAGINATION_URL.value: 80.0,
+    CrawlGraphNodeType.DETAIL_URL.value: 75.0,
+    CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value: 65.0,
 }
 
 
@@ -69,7 +81,7 @@ class GraphFrontier:
                 priority_score=120.0,
                 confidence=1.0,
                 depth=0,
-                metadata={"seed": "manifest", "university": self.agent.university_name},
+                metadata={"discovery_source": "manifest"},
             )
             for unit in org_units:
                 org_node = await crawler_db.upsert_graph_node(
@@ -77,15 +89,12 @@ class GraphFrontier:
                     node_type=CrawlGraphNodeType.ORG_UNIT,
                     url=getattr(unit, "url", "") or "",
                     org_unit_name=getattr(unit, "name", "") or "",
+                    org_unit_id=int(unit.id) if getattr(unit, "id", None) is not None else None,
                     status=CrawlGraphNodeStatus.PENDING,
                     priority_score=self.priority_for(CrawlGraphNodeType.ORG_UNIT, source="manifest"),
                     confidence=1.0,
                     depth=1,
-                    metadata={
-                        "org_unit_id": int(unit.id) if getattr(unit, "id", None) is not None else None,
-                        "kind": getattr(unit, "kind", "") or "",
-                        "source": "manifest",
-                    },
+                    metadata={"discovery_source": "manifest"},
                 )
                 await crawler_db.upsert_graph_edge(
                     session,
@@ -104,14 +113,17 @@ class GraphFrontier:
                         node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
                         url=faculty_url,
                         org_unit_name=getattr(unit, "name", "") or "",
+                        org_unit_id=int(unit.id) if getattr(unit, "id", None) is not None else None,
                         status=CrawlGraphNodeStatus.PENDING,
-                        priority_score=self.priority_for(CrawlGraphNodeType.FACULTY_LIST_URL, source="manifest"),
+                        priority_score=self.priority_for(
+                            CrawlGraphNodeType.FACULTY_LIST_URL,
+                            source="manifest",
+                            url=faculty_url,
+                            depth=1,
+                        ),
                         confidence=1.0,
                         depth=1,
-                        metadata={
-                            "org_unit_id": int(unit.id) if getattr(unit, "id", None) is not None else None,
-                            "source": "manifest",
-                        },
+                        metadata={"discovery_source": "manifest"},
                     )
                     await crawler_db.upsert_graph_edge(
                         session,
@@ -136,10 +148,15 @@ class GraphFrontier:
                     node_type=CrawlGraphNodeType.ORG_LISTING_URL,
                     url=clean_url,
                     status=CrawlGraphNodeStatus.PENDING,
-                    priority_score=self.priority_for(CrawlGraphNodeType.ORG_LISTING_URL, source="manifest"),
+                    priority_score=self.priority_for(
+                        CrawlGraphNodeType.ORG_LISTING_URL,
+                        source="manifest",
+                        url=clean_url,
+                        depth=1,
+                    ),
                     confidence=1.0,
                     depth=1,
-                    metadata={"source": "manifest"},
+                    metadata={"discovery_source": "manifest"},
                 )
                 await crawler_db.upsert_graph_edge(
                     session,
@@ -168,7 +185,7 @@ class GraphFrontier:
                     priority_score=self.priority_for(CrawlGraphNodeType.ORG_LISTING_URL),
                     confidence=1.0,
                     depth=1,
-                    metadata={"source": "org_unit_extraction"},
+                    metadata={"discovery_source": "org_unit_extraction"},
                 )
             for unit in org_units:
                 org_node = await crawler_db.upsert_graph_node(
@@ -176,13 +193,13 @@ class GraphFrontier:
                     node_type=CrawlGraphNodeType.ORG_UNIT,
                     url=getattr(unit, "url", "") or "",
                     org_unit_name=getattr(unit, "name", "") or "",
+                    org_unit_id=int(unit.id) if getattr(unit, "id", None) is not None else None,
                     status=CrawlGraphNodeStatus.PENDING,
                     priority_score=self.priority_for(CrawlGraphNodeType.ORG_UNIT),
                     confidence=1.0,
                     depth=1,
                     metadata={
-                        "org_unit_id": int(unit.id) if getattr(unit, "id", None) is not None else None,
-                        "kind": getattr(unit, "kind", "") or "",
+                        "discovery_source": "org_unit_extraction",
                         "source_url": clean_source,
                     },
                 )
@@ -209,6 +226,8 @@ class GraphFrontier:
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
         source_status: str | CrawlGraphNodeStatus = CrawlGraphNodeStatus.DONE,
+        node_status: str | CrawlGraphNodeStatus = CrawlGraphNodeStatus.PENDING,
+        last_error: str | None = None,
     ) -> list[GraphFetchCandidate]:
         node_type_value = _enum_value(node_type)
         edge_type_value = _enum_value(edge_type)
@@ -223,11 +242,16 @@ class GraphFrontier:
                 node_type=source_node_type,
                 url=source_url_clean,
                 org_unit_name=org_unit_name,
+                org_unit_id=org_unit_id,
                 status=source_status,
-                priority_score=self.priority_for(source_node_type),
+                priority_score=self.priority_for(
+                    source_node_type,
+                    url=source_url_clean,
+                    depth=max(0, int(depth or 0) - 1),
+                ),
                 confidence=1.0,
                 depth=max(0, int(depth or 0) - 1),
-                metadata={"source": "discovery_parent"},
+                metadata={"discovery_source": "discovery_parent"},
             )
             org_node = None
             if org_unit_name or org_unit_id is not None:
@@ -235,11 +259,12 @@ class GraphFrontier:
                     session,
                     node_type=CrawlGraphNodeType.ORG_UNIT,
                     org_unit_name=org_unit_name or f"id:{org_unit_id}",
+                    org_unit_id=org_unit_id,
                     status=CrawlGraphNodeStatus.PENDING,
                     priority_score=self.priority_for(CrawlGraphNodeType.ORG_UNIT),
                     confidence=1.0,
                     depth=1,
-                    metadata={"org_unit_id": org_unit_id},
+                    metadata={},
                 )
 
             seen_keys: set[str] = set()
@@ -254,14 +279,16 @@ class GraphFrontier:
                 fetch_url = _sanitize_url(candidate.url)
                 if not node_url or not fetch_url:
                     continue
-                node_metadata = dict(metadata or {})
+                node_metadata = self._frontier_metadata(metadata or {})
                 node_metadata.update(
                     {
                         "fetch_url": fetch_url,
                         "source_url": source_url_clean,
-                        "org_unit_id": candidate.org_unit_id,
                     }
                 )
+                candidate_score = self._candidate_score(node_type_value, fetch_url)
+                if candidate_score:
+                    node_metadata["candidate_score"] = candidate_score
                 if candidate.fetch_action is not None:
                     node_metadata["fetch_action"] = candidate.fetch_action
                 if candidate.identity_url:
@@ -272,11 +299,18 @@ class GraphFrontier:
                     node_type=node_type_value,
                     url=node_url,
                     org_unit_name=candidate.label or org_unit_name,
-                    status=CrawlGraphNodeStatus.PENDING,
+                    org_unit_id=candidate.org_unit_id,
+                    status=node_status,
                     priority_score=candidate.priority_score
-                    or self.priority_for(node_type_value, source=str(node_metadata.get("source") or "")),
+                    or self.priority_for(
+                        node_type_value,
+                        source=str(node_metadata.get("discovery_source") or ""),
+                        url=fetch_url,
+                        depth=candidate.depth,
+                    ),
                     confidence=candidate.confidence or confidence,
                     depth=candidate.depth,
+                    last_error=last_error,
                     metadata=node_metadata,
                 )
                 key = str(node.node_key)
@@ -297,11 +331,12 @@ class GraphFrontier:
                         session,
                         node_type=CrawlGraphNodeType.ORG_UNIT,
                         org_unit_name=candidate.label or f"id:{candidate.org_unit_id}",
+                        org_unit_id=candidate.org_unit_id,
                         status=CrawlGraphNodeStatus.PENDING,
                         priority_score=self.priority_for(CrawlGraphNodeType.ORG_UNIT),
                         confidence=1.0,
                         depth=1,
-                        metadata={"org_unit_id": candidate.org_unit_id},
+                        metadata={},
                     )
                 if candidate_org_node is not None:
                     await crawler_db.upsert_graph_edge(
@@ -350,17 +385,17 @@ class GraphFrontier:
         if not clean_url:
             return None
         node_metadata = dict(metadata or {})
-        if org_unit_id is not None:
-            node_metadata["org_unit_id"] = int(org_unit_id)
+        node_metadata = self._frontier_metadata(node_metadata)
         async with self.agent.db.session() as session:
             node = await crawler_db.upsert_graph_node(
                 session,
                 node_type=node_type,
                 url=clean_url,
                 org_unit_name=org_unit_name,
+                org_unit_id=org_unit_id,
                 status=status,
                 priority_score=(
-                    self.priority_for(node_type)
+                    self.priority_for(node_type, url=clean_url, depth=depth)
                     if priority_score is None
                     else float(priority_score)
                 ),
@@ -377,6 +412,7 @@ class GraphFrontier:
         node_type: str | CrawlGraphNodeType,
         status: str | CrawlGraphNodeStatus,
         org_unit_name: str = "",
+        org_unit_id: int | None = None,
         last_error: str | None = None,
         metadata: dict[str, Any] | None = None,
         increment_attempt: bool = False,
@@ -389,6 +425,7 @@ class GraphFrontier:
                 node_type,
                 url=clean_url,
                 org_unit_name=org_unit_name,
+                org_unit_id=org_unit_id,
             )
             node = await crawler_db.get_graph_node_by_key(session, node_key)
             if node is None:
@@ -397,8 +434,9 @@ class GraphFrontier:
                     node_type=node_type,
                     url=clean_url,
                     org_unit_name=org_unit_name,
+                    org_unit_id=org_unit_id,
                     status=status,
-                    priority_score=self.priority_for(node_type),
+                    priority_score=self.priority_for(node_type, url=clean_url),
                     metadata=metadata,
                 )
             else:
@@ -472,17 +510,48 @@ class GraphFrontier:
             key=lambda item: (
                 -float(item.priority_score or 0.0),
                 -float(item.confidence or 0.0),
+                int(item.attempt_count or 0),
                 int(item.depth or 0),
                 item.node_id or 0,
                 item.queue_url,
             ),
         )
 
-    def priority_for(self, node_type: str | CrawlGraphNodeType, *, source: str = "") -> float:
+    def sort_queue_items(self, items: Iterable[Any]) -> list[Any]:
+        def _type_rank(item: Any) -> int:
+            node_type = str(getattr(item, "graph_node_type", "") or "")
+            if node_type == CrawlGraphNodeType.FACULTY_LIST_URL.value:
+                return 0
+            if node_type == CrawlGraphNodeType.PAGINATION_URL.value:
+                return 1
+            if node_type == CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value:
+                return 2
+            return 3
+
+        return sorted(
+            list(items),
+            key=lambda item: (
+                _type_rank(item),
+                -float(getattr(item, "graph_priority_score", 0.0) or 0.0),
+                int(getattr(item, "depth", 0) or 0),
+                str(getattr(item, "queue_url", "") or getattr(item, "url", "") or ""),
+            ),
+        )
+
+    def priority_for(
+        self,
+        node_type: str | CrawlGraphNodeType,
+        *,
+        source: str = "",
+        url: str = "",
+        depth: int = 0,
+    ) -> float:
         type_value = _enum_value(node_type)
         priority = _BASE_PRIORITY.get(type_value, 0.0)
         if source == "manifest":
             priority += 30.0
+        priority += self._candidate_score(type_value, url)
+        priority -= max(0, int(depth or 0)) * 2.0
         return priority
 
     def _coerce_candidate(
@@ -521,18 +590,45 @@ class GraphFrontier:
         identity_url = str(metadata.get("identity_url") or "").strip() or None
         if not identity_url and fetch_url and node.url and fetch_url != node.url:
             identity_url = node.url
+        org_unit_id = _optional_int(getattr(node, "org_unit_id", None))
+        if org_unit_id is None:
+            org_unit_id = _optional_int(metadata.get("org_unit_id"))
         return GraphFetchCandidate(
             url=fetch_url or node.url,
             depth=int(node.depth or 0),
             label=node.org_unit_name or "",
-            org_unit_id=_optional_int(metadata.get("org_unit_id")),
+            org_unit_id=org_unit_id,
             fetch_action=metadata.get("fetch_action") if isinstance(metadata.get("fetch_action"), dict) else None,
             identity_url=identity_url,
             node_id=int(node.id),
             node_type=str(node.type or ""),
             priority_score=float(node.priority_score or 0.0),
             confidence=float(node.confidence or 0.0),
+            attempt_count=int(getattr(node, "attempt_count", 0) or 0),
+            status=str(getattr(node, "status", "") or ""),
         )
+
+    @staticmethod
+    def _frontier_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        result = dict(metadata or {})
+        source = result.pop("source", None)
+        result.pop("org_unit_id", None)
+        if source is not None and "discovery_source" not in result:
+            result["discovery_source"] = source
+        return {key: value for key, value in result.items() if key in _FRONTIER_METADATA_KEYS}
+
+    @staticmethod
+    def _candidate_score(node_type: str, url: str) -> float:
+        if node_type not in {
+            CrawlGraphNodeType.FACULTY_LIST_URL.value,
+            CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value,
+        }:
+            return 0.0
+        try:
+            score = float(_assess_faculty_candidate(url).score)
+        except Exception:
+            return 0.0
+        return max(-20.0, min(20.0, score))
 
 
 def _load_metadata(value: str | None) -> dict[str, Any]:

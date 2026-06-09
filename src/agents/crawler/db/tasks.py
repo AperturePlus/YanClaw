@@ -1,13 +1,65 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.models import CrawlExtractionFailure, CrawlTask, CrawlTaskKind, CrawlTaskStatus
 from agents.crawler.sanitizer import normalize_org_unit_name
 from agents.crawler.db.utils import _normalize_url, _now_utc, _serialize_optional
+
+
+def is_edu_cn_task_url(url: str) -> bool:
+    normalized = _normalize_url(url)
+    if not normalized:
+        return False
+    host = (urlparse(normalized).hostname or "").lower().rstrip(".")
+    return host == "edu.cn" or host.endswith(".edu.cn")
+
+
+def sanitize_crawl_task_url(url: str) -> str:
+    normalized = _normalize_url(url)
+    if not normalized or not is_edu_cn_task_url(normalized):
+        return ""
+    return normalized
+
+
+async def cleanup_non_edu_cn_crawl_tasks(session: AsyncSession) -> dict[str, int]:
+    rows = (await session.execute(select(CrawlTask))).scalars().all()
+    delete_ids: list[int] = []
+    org_unit_urls_cleared = 0
+
+    for row in rows:
+        source_url = sanitize_crawl_task_url(row.source_url)
+        page_url = sanitize_crawl_task_url(row.page_url)
+        if not source_url or not page_url:
+            if row.id is not None:
+                delete_ids.append(int(row.id))
+            continue
+        org_unit_url = sanitize_crawl_task_url(row.org_unit_url or "")
+        if row.org_unit_url and not org_unit_url:
+            row.org_unit_url = None
+            row.updated_at = _now_utc()
+            org_unit_urls_cleared += 1
+
+    failures_deleted = 0
+    deleted = 0
+    if delete_ids:
+        failure_result = await session.execute(
+            delete(CrawlExtractionFailure).where(CrawlExtractionFailure.task_id.in_(delete_ids))
+        )
+        failures_deleted = int(failure_result.rowcount or 0)
+        result = await session.execute(delete(CrawlTask).where(CrawlTask.id.in_(delete_ids)))
+        deleted = int(result.rowcount or 0)
+    await session.flush()
+    return {
+        "crawl_tasks_scanned": len(rows),
+        "crawl_tasks_deleted": deleted,
+        "crawl_extraction_failures_deleted": failures_deleted,
+        "crawl_task_org_unit_urls_cleared": org_unit_urls_cleared,
+    }
 
 
 async def upsert_crawl_task(
@@ -26,12 +78,25 @@ async def upsert_crawl_task(
     priority: int = 0,
     status: str | CrawlTaskStatus = CrawlTaskStatus.PENDING,
     last_error: str | None = None,
-) -> CrawlTask:
+) -> CrawlTask | None:
     org_unit_name = normalize_org_unit_name(org_unit_name, default="Unknown")
-    source_url = _normalize_url(source_url) or _normalize_url(page_url)
-    page_url = _normalize_url(page_url) or source_url
-    if not source_url:
-        raise ValueError("source_url or page_url is required for crawl task")
+    raw_source_url = _normalize_url(source_url)
+    raw_page_url = _normalize_url(page_url)
+    if raw_source_url:
+        source_url = sanitize_crawl_task_url(raw_source_url)
+        if not source_url:
+            return None
+    else:
+        source_url = sanitize_crawl_task_url(raw_page_url)
+    if raw_page_url:
+        page_url = sanitize_crawl_task_url(raw_page_url)
+        if not page_url:
+            return None
+    else:
+        page_url = source_url
+    if not source_url or not page_url:
+        return None
+    org_unit_url = sanitize_crawl_task_url(org_unit_url or "") or None
     status_value = status.value if isinstance(status, CrawlTaskStatus) else str(status)
     task_kind_value = task_kind.value if isinstance(task_kind, CrawlTaskKind) else str(task_kind)
     if task_kind_value not in {item.value for item in CrawlTaskKind}:
@@ -57,6 +122,7 @@ async def upsert_crawl_task(
             page_hash=page_hash,
             page_text_snapshot=page_text_snapshot,
             allowed_tools=allowed_tools,
+            org_unit_url=org_unit_url,
             task_kind_value=task_kind_value,
             attempt=attempt,
             priority=priority,
@@ -105,6 +171,7 @@ async def upsert_crawl_task(
                     page_hash=page_hash,
                     page_text_snapshot=page_text_snapshot,
                     allowed_tools=allowed_tools,
+                    org_unit_url=org_unit_url,
                     task_kind_value=task_kind_value,
                     attempt=attempt,
                     priority=priority,
@@ -122,6 +189,7 @@ async def upsert_crawl_task(
             page_hash=page_hash,
             page_text_snapshot=page_text_snapshot,
             allowed_tools=allowed_tools,
+            org_unit_url=org_unit_url,
             task_kind_value=task_kind_value,
             attempt=attempt,
             priority=priority,
@@ -135,7 +203,7 @@ async def upsert_crawl_task(
     row = CrawlTask(
         university=(university or "").strip(),
         org_unit_name=org_unit_name,
-        org_unit_url=_normalize_url(org_unit_url) if org_unit_url else None,
+        org_unit_url=org_unit_url,
         source_url=source_url,
         page_url=page_url,
         page_hash=page_hash,
@@ -162,6 +230,7 @@ async def _update_existing_crawl_task(
     page_hash: str,
     page_text_snapshot: str,
     allowed_tools: str | None,
+    org_unit_url: str | None,
     task_kind_value: str,
     attempt: int,
     priority: int,
@@ -184,6 +253,13 @@ async def _update_existing_crawl_task(
         changed = True
     if allowed_tools and existing.allowed_tools != allowed_tools:
         existing.allowed_tools = allowed_tools
+        changed = True
+    existing_org_unit_url = sanitize_crawl_task_url(existing.org_unit_url or "") or None
+    if existing.org_unit_url and not existing_org_unit_url:
+        existing.org_unit_url = org_unit_url
+        changed = True
+    elif org_unit_url and not existing.org_unit_url:
+        existing.org_unit_url = org_unit_url
         changed = True
     if allow_task_kind_update and task_kind_value and getattr(existing, "task_kind", None) != task_kind_value:
         existing.task_kind = task_kind_value
@@ -318,9 +394,12 @@ async def summarize_crawl_task_status(session: AsyncSession) -> dict[str, int]:
 
 
 __all__ = [
+    "cleanup_non_edu_cn_crawl_tasks",
+    "is_edu_cn_task_url",
     "list_recoverable_crawl_tasks",
     "log_extraction_failure",
     "recover_stale_in_progress_crawl_tasks",
+    "sanitize_crawl_task_url",
     "set_crawl_task_status",
     "summarize_crawl_task_status",
     "upsert_crawl_task",

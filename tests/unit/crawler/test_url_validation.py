@@ -262,6 +262,63 @@ def test_assess_faculty_candidate_classifies_rules_and_regulations_as_noise():
     assert item.score <= 0
 
 
+def test_assess_faculty_candidate_classifies_banner_as_noise_even_with_professor_text():
+    item = _assess_faculty_candidate(
+        "https://icisee.sjtu.edu.cn/banner/2727.html",
+        anchor_text="热烈祝贺张文军教授当选中国工程院院士",
+        heading_text="师资队伍",
+        parent_tags_or_classes=("div.g-nav2", "a.nava"),
+    )
+
+    assert _is_non_faculty_noise_url(item.url)
+    assert item.page_type == FACULTY_PAGE_TYPE_NOISE
+    assert item.score < 0
+
+
+def test_structural_selection_excludes_banner_category_noise_but_keeps_real_rosters():
+    roster = "https://icisee.sjtu.edu.cn/jiaoshiml.html"
+    roster_alt = "https://icisee.sjtu.edu.cn/szdw.html"
+    banner = "https://icisee.sjtu.edu.cn/banner/2947.html"
+    assessed = _assess_structural_faculty_candidates(
+        [roster, roster_alt, banner],
+        link_signals=(
+            LinkSignal(
+                url=roster,
+                anchor_text="教师名录",
+                heading_text="师资队伍",
+                parent_tags_or_classes=("div.g-nav",),
+                link_order=1,
+            ),
+            LinkSignal(
+                url=roster_alt,
+                anchor_text="师资队伍",
+                heading_text="教师名录",
+                parent_tags_or_classes=("div.g-nav",),
+                link_order=2,
+            ),
+            LinkSignal(
+                url=banner,
+                anchor_text="热烈祝贺张文军教授当选中国工程院院士",
+                heading_text="师资队伍",
+                parent_tags_or_classes=("div.g-nav2",),
+                link_order=3,
+            ),
+        ),
+    )
+
+    selected_urls = [item.url for item in _select_balanced_faculty_candidates(assessed, limit=4)]
+
+    assert roster in selected_urls
+    assert roster_alt in selected_urls
+    assert banner not in selected_urls
+
+
+def test_promotional_token_inside_explicit_faculty_path_is_not_noise():
+    url = "https://www.example.edu.cn/faculty/banner-lab/teacher_list.htm"
+
+    assert not _is_non_faculty_noise_url(url)
+
+
 def test_assess_faculty_candidate_classifies_full_category_and_elite():
     full = _assess_faculty_candidate(
         "https://scse.buaa.edu.cn/szdw/jsdw.htm",

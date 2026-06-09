@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agents.crawler.url_heuristics import (
+from agents.crawler.heuristic_constants import (
     FACULTY_KEYWORDS,
     ORG_UNIT_PAGE_KEYWORDS,
+)
+from agents.crawler.url_heuristics import (
     _keyword_filter,
     _truncate_middle,
 )

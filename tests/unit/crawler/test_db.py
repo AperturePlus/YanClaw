@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -1433,6 +1434,158 @@ async def test_org_unit_homepage_is_not_overwritten_by_deep_faculty_page(tmp_pat
     await db.close()
 
 
+async def test_crawl_task_sanitizer_only_accepts_edu_cn_task_urls(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "task_edu_cn_sanitizer.db"))
+    await db.init_db()
+
+    assert crawler_db.is_edu_cn_task_url("https://edu.cn/faculty")
+    assert crawler_db.is_edu_cn_task_url("https://cs.scu.edu.cn/szdw.htm")
+    assert not crawler_db.is_edu_cn_task_url("https://www.example.com/faculty")
+    assert not crawler_db.is_edu_cn_task_url("https://scu.edu.cn.evil.com/faculty")
+    assert not crawler_db.is_edu_cn_task_url("/relative/faculty")
+
+    async with db.session() as session:
+        root_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://external.example.com/cs",
+            source_url="https://edu.cn/faculty",
+            page_url="https://edu.cn/faculty",
+            page_hash="root",
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+        )
+        subdomain_task = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="https://cs.scu.edu.cn/szdw.htm",
+            page_url="https://cs.scu.edu.cn/szdw.htm",
+            page_hash="subdomain",
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+        )
+        rejected_com = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="https://www.example.com/faculty",
+            page_url="https://www.example.com/faculty",
+            page_hash="com",
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+        )
+        rejected_evil = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="https://scu.edu.cn.evil.com/faculty",
+            page_url="https://scu.edu.cn.evil.com/faculty",
+            page_hash="evil",
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+        )
+        rejected_no_host = await crawler_db.upsert_crawl_task(
+            session,
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="/relative/faculty",
+            page_url="/relative/faculty",
+            page_hash="relative",
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+        )
+        rows = (await session.execute(select(CrawlTask).order_by(CrawlTask.id))).scalars().all()
+
+    assert root_task is not None
+    assert root_task.org_unit_url is None
+    assert subdomain_task is not None
+    assert subdomain_task.org_unit_url == "https://cs.scu.edu.cn"
+    assert rejected_com is None
+    assert rejected_evil is None
+    assert rejected_no_host is None
+    assert [row.source_url for row in rows] == ["https://edu.cn/faculty", "https://cs.scu.edu.cn/szdw.htm"]
+    await db.close()
+
+
+async def test_cleanup_non_edu_cn_crawl_tasks_removes_invalid_tasks_and_org_unit_urls(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "task_edu_cn_cleanup.db"))
+    await db.init_db()
+
+    async with db.session() as session:
+        valid = CrawlTask(
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://external.example.com/cs",
+            source_url="https://cs.scu.edu.cn/szdw.htm",
+            page_url="https://cs.scu.edu.cn/szdw.htm",
+            page_hash="valid",
+            task_kind=CrawlTaskKind.LIST_PAGE.value,
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING.value,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        invalid_source = CrawlTask(
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="https://www.example.com/faculty",
+            page_url="https://cs.scu.edu.cn/szdw.htm",
+            page_hash="invalid-source",
+            task_kind=CrawlTaskKind.LIST_PAGE.value,
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.PENDING.value,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        invalid_page = CrawlTask(
+            university="TestU",
+            org_unit_name="CS",
+            org_unit_url="https://cs.scu.edu.cn/",
+            source_url="https://cs.scu.edu.cn/detail.htm",
+            page_url="https://scu.edu.cn.evil.com/detail.htm",
+            page_hash="invalid-page",
+            task_kind=CrawlTaskKind.DETAIL_PAGE.value,
+            page_text_snapshot="faculty",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY.value,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+        session.add_all([valid, invalid_source, invalid_page])
+        await session.flush()
+        await crawler_db.log_extraction_failure(
+            session,
+            task_id=int(invalid_source.id),
+            failure_type="invalid_json",
+            org_unit_name="CS",
+            source_url=invalid_source.source_url,
+        )
+
+    async with db.session() as session:
+        summary = await crawler_db.cleanup_non_edu_cn_crawl_tasks(session)
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+
+    assert summary["crawl_tasks_scanned"] == 3
+    assert summary["crawl_tasks_deleted"] == 2
+    assert summary["crawl_extraction_failures_deleted"] == 1
+    assert summary["crawl_task_org_unit_urls_cleared"] == 1
+    assert len(rows) == 1
+    assert rows[0].source_url == "https://cs.scu.edu.cn/szdw.htm"
+    assert rows[0].org_unit_url is None
+    assert failures == []
+    await db.close()
+
+
 async def test_upsert_crawl_task_does_not_reset_active_or_terminal_statuses(tmp_path):
     db = DatabaseManager(sqlite_url(tmp_path / "task_status_reset.db"))
     await db.init_db()
@@ -1728,6 +1881,7 @@ async def test_crawl_graph_node_and_edge_upsert_dedupes_and_merges_metadata(tmp_
             node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
             url="https://cs.example.edu.cn/faculty#top",
             org_unit_name="CS",
+            org_unit_id=1,
             priority_score=80,
             metadata={"source": "list"},
         )
@@ -1736,14 +1890,24 @@ async def test_crawl_graph_node_and_edge_upsert_dedupes_and_merges_metadata(tmp_
             node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
             url="https://cs.example.edu.cn/faculty",
             org_unit_name="Computer Science",
+            org_unit_id=1,
             priority_score=85,
             metadata={"seen_on": ["home"]},
+        )
+        other_org_source = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="AI",
+            org_unit_id=2,
+            priority_score=80,
         )
         detail = await crawler_db.upsert_graph_node(
             session,
             node_type=CrawlGraphNodeType.DETAIL_URL,
             url="https://cs.example.edu.cn/info/1001/ada.htm",
             org_unit_name="CS",
+            org_unit_id=1,
             priority_score=40,
         )
         edge = await crawler_db.upsert_graph_edge(
@@ -1765,11 +1929,14 @@ async def test_crawl_graph_node_and_edge_upsert_dedupes_and_merges_metadata(tmp_
 
     assert same_source.id == source.id
     assert edge.id == same_edge.id
-    assert len(nodes) == 2
+    assert other_org_source.id != source.id
+    assert len(nodes) == 3
     assert len(edges) == 1
     assert same_source.priority_score == 85
-    assert "Computer Science" in same_source.org_unit_name
-    assert '"seen_on":["home"]' in same_source.metadata_json
+    assert same_source.org_unit_name == "Computer Science"
+    assert same_source.org_unit_id == 1
+    metadata = json.loads(same_source.metadata_json)
+    assert metadata == {"discovery_source": "list"}
     await db.close()
 
 
@@ -1783,6 +1950,7 @@ async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
             node_type=CrawlGraphNodeType.DETAIL_URL,
             url="https://cs.example.edu.cn/info/low.htm",
             org_unit_name="CS",
+            org_unit_id=1,
             priority_score=40,
             depth=3,
         )
@@ -1791,6 +1959,7 @@ async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
             node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
             url="https://cs.example.edu.cn/faculty",
             org_unit_name="CS",
+            org_unit_id=1,
             priority_score=80,
             depth=1,
         )
@@ -1799,6 +1968,7 @@ async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
             node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
             url="https://cs.example.edu.cn/faculty/archive",
             org_unit_name="CS",
+            org_unit_id=1,
             status=CrawlGraphNodeStatus.DONE,
             priority_score=90,
         )
@@ -1807,10 +1977,20 @@ async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
             node_type=CrawlGraphNodeType.PAGINATION_URL,
             url="https://cs.example.edu.cn/faculty/2.htm",
             org_unit_name="CS",
+            org_unit_id=1,
             status=CrawlGraphNodeStatus.RETRY,
             priority_score=70,
         )
+        other_org = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://ai.example.edu.cn/faculty",
+            org_unit_name="AI",
+            org_unit_id=2,
+            priority_score=100,
+        )
         rows = await crawler_db.list_ready_graph_nodes(session, limit=10)
+        org_rows = await crawler_db.list_ready_graph_nodes(session, limit=10, org_unit_ids=[1])
         await crawler_db.mark_graph_node_status(
             session,
             low.id,
@@ -1820,9 +2000,11 @@ async def test_crawl_graph_ready_nodes_sort_by_priority_and_status(tmp_path):
         )
         failed = await session.get(CrawlGraphNode, low.id)
 
-    assert [row.id for row in rows] == [high.id, retry.id, low.id]
+    assert [row.id for row in rows] == [other_org.id, high.id, retry.id, low.id]
+    assert [row.id for row in org_rows] == [high.id, retry.id, low.id]
     assert failed.status == CrawlGraphNodeStatus.FAILED.value
     assert failed.attempt_count == 1
+    assert failed.priority_score == 35
     assert failed.last_error == "fetch_failed"
     await db.close()
 

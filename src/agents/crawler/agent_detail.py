@@ -708,93 +708,97 @@ async def enrich_profiles_with_human(
         if getattr(sig, "url", None)
     }
 
-    detail_candidates = await self.graph_frontier.record_discovered_links(
-        source_url=fetched.url,
-        links=[
-            GraphFetchCandidate(
-                url=link,
-                depth=current.depth + 1,
-                label=current.label or "Unknown",
-                org_unit_id=getattr(current, "org_unit_id", None),
-            )
-            for link in candidates
-        ],
-        node_type=CrawlGraphNodeType.DETAIL_URL,
-        edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
-        source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
-        org_unit_name=current.label or "Unknown",
-        org_unit_id=getattr(current, "org_unit_id", None),
-        depth=current.depth + 1,
-        confidence=0.8,
-        metadata={"source": "detail_candidate"},
-    )
-    candidate_by_url = {
-        _sanitize_url(candidate.queue_url): candidate
-        for candidate in detail_candidates
-        if _sanitize_url(candidate.queue_url)
-    }
-
     pending: list[GraphFetchCandidate] = []
+    skipped: list[tuple[str, str]] = []
     skipped_by_name = 0
     skipped_reserved = 0
     skipped_existing_task = 0
     skipped_visited = 0
-    for link in candidates:
-        if len(pending) >= remaining:
-            break
+    for index, link in enumerate(candidates):
         normalized = _sanitize_url(link)
         if not normalized:
             continue
         if normalized in existing_detail_task_urls:
             skipped_existing_task += 1
-            graph_candidate = candidate_by_url.get(normalized)
-            if graph_candidate is not None:
-                await self.graph_frontier.mark_node_status(
-                    graph_candidate.node_id,
-                    status=CrawlGraphNodeStatus.SKIPPED,
-                    last_error="existing_detail_task",
-                )
+            skipped.append((normalized, "existing_detail_task"))
             continue
         if normalized in reserved:
             skipped_reserved += 1
-            graph_candidate = candidate_by_url.get(normalized)
-            if graph_candidate is not None:
-                await self.graph_frontier.mark_node_status(
-                    graph_candidate.node_id,
-                    status=CrawlGraphNodeStatus.SKIPPED,
-                    last_error="reserved_for_list_processing",
-                )
+            skipped.append((normalized, "reserved_for_list_processing"))
             continue
         if normalized in self._detail_visited_urls or normalized in self.visited_urls:
             skipped_visited += 1
-            graph_candidate = candidate_by_url.get(normalized)
-            if graph_candidate is not None:
-                await self.graph_frontier.mark_node_status(
-                    graph_candidate.node_id,
-                    status=CrawlGraphNodeStatus.SKIPPED,
-                    last_error="already_visited",
-                )
+            skipped.append((normalized, "already_visited"))
             continue
         if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(normalized) or sig_by_url.get(link), enriched_names):
             skipped_by_name += 1
-            graph_candidate = candidate_by_url.get(normalized)
-            if graph_candidate is not None:
-                await self.graph_frontier.mark_node_status(
-                    graph_candidate.node_id,
-                    status=CrawlGraphNodeStatus.SKIPPED,
-                    last_error="already_enriched_name",
-                )
+            skipped.append((normalized, "already_enriched_name"))
+            continue
+        if len(pending) >= remaining:
+            skipped.append((normalized, "detail_cap_deferred"))
             continue
         self._detail_visited_urls.add(normalized)
         pending.append(
-            candidate_by_url.get(normalized)
-            or GraphFetchCandidate(
+            GraphFetchCandidate(
                 url=normalized,
                 depth=current.depth + 1,
                 label=current.label or "Unknown",
                 org_unit_id=getattr(current, "org_unit_id", None),
+                priority_score=self.graph_frontier.priority_for(
+                    CrawlGraphNodeType.DETAIL_URL,
+                    url=normalized,
+                    depth=current.depth + 1,
+                )
+                - index * 0.01,
             )
         )
+
+    if skipped:
+        skipped_candidates_by_reason: dict[str, list[GraphFetchCandidate]] = {}
+        for url, reason in skipped:
+            skipped_candidates_by_reason.setdefault(reason, []).append(
+                GraphFetchCandidate(
+                    url=url,
+                    depth=current.depth + 1,
+                    label=current.label or "Unknown",
+                    org_unit_id=getattr(current, "org_unit_id", None),
+                )
+            )
+        for reason, skipped_candidates in skipped_candidates_by_reason.items():
+            await self.graph_frontier.record_discovered_links(
+                source_url=fetched.url,
+                links=skipped_candidates,
+                node_type=CrawlGraphNodeType.DETAIL_URL,
+                edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+                source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                org_unit_name=current.label or "Unknown",
+                org_unit_id=getattr(current, "org_unit_id", None),
+                depth=current.depth + 1,
+                confidence=0.8,
+                metadata={"source": "detail_candidate", "skip_reason": reason},
+                node_status=CrawlGraphNodeStatus.SKIPPED,
+                last_error=reason,
+            )
+
+    if pending:
+        detail_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=fetched.url,
+            links=pending,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+            source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            org_unit_name=current.label or "Unknown",
+            org_unit_id=getattr(current, "org_unit_id", None),
+            depth=current.depth + 1,
+            confidence=0.8,
+            metadata={"source": "detail_candidate"},
+        )
+        candidate_by_url = {
+            _sanitize_url(candidate.queue_url): candidate
+            for candidate in detail_candidates
+            if _sanitize_url(candidate.queue_url)
+        }
+        pending = [candidate_by_url.get(_sanitize_url(item.queue_url)) or item for item in pending]
 
     if skipped_by_name:
         self._pipeline_stats["detail_links_dropped_already_enriched"] = int(

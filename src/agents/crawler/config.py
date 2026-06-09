@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from agents.crawler.url_heuristics import DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS
+from agents.crawler.heuristic_constants import DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS
 
 
 class CrawlerSettings(BaseSettings):

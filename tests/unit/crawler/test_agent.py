@@ -3268,6 +3268,80 @@ async def test_enqueue_extraction_task_skips_list_redirect_to_noise_or_login(tmp
     await db.close()
 
 
+@pytest.mark.parametrize(
+    ("final_url", "reason"),
+    [
+        ("https://mp.weixin.qq.com/s/abcdef", "redirect_to_wechat"),
+        ("https://jaccount.sjtu.edu.cn/jaccount/jalogin?sid=1", "redirect_to_jaccount"),
+    ],
+)
+async def test_enqueue_extraction_task_skips_wechat_and_jaccount_redirects(tmp_path, final_url, reason):
+    source_url = "https://icisee.sjtu.edu.cn/banner/2727.html"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    llm_queue: asyncio.Queue = asyncio.Queue()
+
+    result = await agent._enqueue_extraction_task(
+        _QueuedUrl(url=source_url, depth=2, label="集成电路学院"),
+        FetchResult(final_url, "微信 登录", [], 200),
+        llm_queue=llm_queue,
+        detail_mode=False,
+        priority=0,
+    )
+
+    assert result == "skipped"
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_redirect_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_skipped", 0)) == 1
+    async with db.session() as session:
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+    assert rows == []
+    assert agent._should_skip_redirected_extraction(source_url, final_url, detail_mode=False) == (True, reason)
+    await db.close()
+
+
+async def test_retryable_fetch_failure_on_banner_is_terminal_skip(tmp_path):
+    source_url = "https://icisee.sjtu.edu.cn/banner/2727.html"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    graph_candidate = await agent.graph_frontier.ensure_url_node(
+        url=source_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="集成电路学院",
+        status=CrawlGraphNodeStatus.PENDING,
+        depth=2,
+    )
+    assert graph_candidate is not None
+    current = _QueuedUrl(
+        url=source_url,
+        depth=2,
+        label="集成电路学院",
+        graph_node_id=graph_candidate.node_id,
+    )
+    llm_queue: asyncio.Queue = asyncio.Queue()
+
+    result = await agent._enqueue_extraction_task(
+        current,
+        FetchResult(source_url, "", [], 0, block_reason="timeout"),
+        llm_queue=llm_queue,
+        detail_mode=False,
+        priority=0,
+    )
+
+    assert result == "skipped"
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("terminal_noise_fetch_failures_skipped", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_skipped", 0)) == 1
+    async with db.session() as session:
+        node = await session.get(CrawlGraphNode, graph_candidate.node_id)
+        rows = (await session.execute(select(CrawlTask))).scalars().all()
+    assert node is not None
+    assert node.status == CrawlGraphNodeStatus.SKIPPED.value
+    assert node.last_error == "fetch_failure_terminal_noise:timeout"
+    assert int(node.attempt_count or 0) == 0
+    assert rows == []
+    await db.close()
+
+
 async def test_pipeline_save_payloads_counts_only_created_records_and_logs_roster_overlap(tmp_path):
     agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
     numerals = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
@@ -3671,6 +3745,106 @@ async def test_agent_rejects_login_and_news_candidates_and_drops_elite_subset(tm
     assert "https://scse.example.edu.cn/szdw/teacher_list.htm" in fetcher.calls
     assert "https://scse.example.edu.cn/szdw/professor.htm" in fetcher.calls
     assert "https://scse.example.edu.cn/szdw/distinguished.htm" not in fetcher.calls
+    await db.close()
+
+
+async def test_agent_rejects_banner_candidates_when_selecting_faculty_pages(tmp_path):
+    pages = {
+        "https://www.example.edu.cn/": FetchResult(
+            "https://www.example.edu.cn/",
+            "home",
+            ["https://www.example.edu.cn/orgs"],
+            200,
+        ),
+        "https://www.example.edu.cn/orgs": FetchResult(
+            "https://www.example.edu.cn/orgs",
+            "org list",
+            ["https://icisee.example.edu.cn/"],
+            200,
+        ),
+        "https://icisee.example.edu.cn/": FetchResult(
+            "https://icisee.example.edu.cn/",
+            "集成电路学院 师资队伍 教师名录",
+            [
+                "https://icisee.example.edu.cn/jiaoshiml.html",
+                "https://icisee.example.edu.cn/szdw.html",
+                "https://icisee.example.edu.cn/banner/2727.html",
+                "https://icisee.example.edu.cn/banner/2947.html",
+            ],
+            200,
+            link_signals=(
+                LinkSignal(
+                    url="https://icisee.example.edu.cn/jiaoshiml.html",
+                    anchor_text="教师名录",
+                    heading_text="师资队伍",
+                    parent_tags_or_classes=("div.g-nav",),
+                    link_order=1,
+                ),
+                LinkSignal(
+                    url="https://icisee.example.edu.cn/szdw.html",
+                    anchor_text="师资队伍",
+                    heading_text="教师名录",
+                    parent_tags_or_classes=("div.g-nav",),
+                    link_order=2,
+                ),
+                LinkSignal(
+                    url="https://icisee.example.edu.cn/banner/2727.html",
+                    anchor_text="Science发文！教授团队取得突破",
+                    heading_text="热烈祝贺张文军教授当选中国工程院院士",
+                    parent_tags_or_classes=("div.g-nav2",),
+                    link_order=3,
+                ),
+                LinkSignal(
+                    url="https://icisee.example.edu.cn/banner/2947.html",
+                    anchor_text="热烈祝贺张文军教授当选中国工程院院士",
+                    heading_text="师资队伍",
+                    parent_tags_or_classes=("div.g-nav2",),
+                    link_order=4,
+                ),
+            ),
+        ),
+        "https://icisee.example.edu.cn": FetchResult(
+            "https://icisee.example.edu.cn/",
+            "集成电路学院 师资队伍 教师名录",
+            [
+                "https://icisee.example.edu.cn/jiaoshiml.html",
+                "https://icisee.example.edu.cn/szdw.html",
+                "https://icisee.example.edu.cn/banner/2727.html",
+                "https://icisee.example.edu.cn/banner/2947.html",
+            ],
+            200,
+        ),
+        "https://icisee.example.edu.cn/jiaoshiml.html": FetchResult(
+            "https://icisee.example.edu.cn/jiaoshiml.html",
+            "faculty list",
+            [],
+            200,
+        ),
+        "https://icisee.example.edu.cn/szdw.html": FetchResult(
+            "https://icisee.example.edu.cn/szdw.html",
+            "faculty roster",
+            [],
+            200,
+        ),
+    }
+
+    class IciseeOrgLLM(FakeLLM):
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            payload = json.loads(messages[-1]["content"])
+            if payload.get("state") == "EXTRACT_ORG_UNITS":
+                return LLMResult(
+                    '{"org_units": [{"name": "集成电路学院", "url": "https://icisee.example.edu.cn/", "kind": "college"}]}'
+                )
+            return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+    agent, fetcher, db = await _agent(tmp_path, IciseeOrgLLM(), pages=pages)
+    result = await agent.run()
+
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert "https://icisee.example.edu.cn/jiaoshiml.html" in fetcher.calls
+    assert "https://icisee.example.edu.cn/szdw.html" in fetcher.calls
+    assert "https://icisee.example.edu.cn/banner/2727.html" not in fetcher.calls
+    assert "https://icisee.example.edu.cn/banner/2947.html" not in fetcher.calls
     await db.close()
 
 
@@ -5500,5 +5674,152 @@ async def test_run_extraction_task_skips_event_kickoff_without_llm_call(tmp_path
     assert llm.calls == 0
     assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) == 1
     assert int(agent._pipeline_stats.get("llm_calls_total", 0)) == 0
+    await db.close()
+
+
+async def test_detail_cap_deferred_graph_nodes_are_skipped_not_pending(tmp_path):
+    list_url = "https://www.example.edu.cn/cs/faculty"
+    detail_a = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    detail_b = "https://www.example.edu.cn/cs/info/1001/grace.htm"
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={list_url: FetchResult(list_url, "faculty list", [detail_a, detail_b], 200)},
+        fetcher_cls=FakeHumanFetcher,
+        detail_profile_hard_cap_per_org_unit=1,
+    )
+    fetched = FetchResult(
+        list_url,
+        "faculty list",
+        [detail_a, detail_b],
+        200,
+        link_signals=(
+            LinkSignal(url=detail_a, anchor_text="Ada", link_order=1),
+            LinkSignal(url=detail_b, anchor_text="Grace", link_order=2),
+        ),
+    )
+    current = _QueuedUrl(url=list_url, depth=1, label="CS")
+    processed: list[str] = []
+    original = agent._process_detail_urls_with_human
+
+    async def _capture(urls, current_arg, skills):
+        processed.extend(getattr(item, "queue_url", str(item)) for item in urls)
+
+    agent._process_detail_urls_with_human = _capture
+    try:
+        await agent._enrich_profiles_with_detail_backend(current, fetched, "")
+    finally:
+        agent._process_detail_urls_with_human = original
+
+    async with db.session() as session:
+        nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(
+                    CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value,
+                    CrawlGraphNode.url.in_([detail_a, detail_b]),
+                )
+            )
+        ).scalars().all()
+
+    node_by_url = {node.url: node for node in nodes}
+    assert processed == [detail_a]
+    assert node_by_url[detail_a].status == CrawlGraphNodeStatus.PENDING.value
+    assert node_by_url[detail_b].status == CrawlGraphNodeStatus.SKIPPED.value
+    assert node_by_url[detail_b].last_error == "detail_cap_deferred"
+    assert not any(
+        node.url == detail_b and node.status == CrawlGraphNodeStatus.PENDING.value
+        for node in nodes
+    )
+    await db.close()
+
+
+async def test_graph_frontier_retry_node_is_reprocessed_on_resume(tmp_path):
+    faculty_url = "https://www.example.edu.cn/cs/faculty"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={},
+        fetcher_cls=FakeHumanFetcher,
+    )
+    candidate = await agent.graph_frontier.ensure_url_node(
+        url=faculty_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="CS",
+        status=CrawlGraphNodeStatus.PENDING,
+        depth=1,
+    )
+    assert candidate is not None
+
+    await agent._extract_professors([])
+    async with db.session() as session:
+        failed_node = await session.get(CrawlGraphNode, candidate.node_id)
+        ready_after_failure = await crawler_db.list_ready_graph_nodes(
+            session,
+            node_types=[CrawlGraphNodeType.FACULTY_LIST_URL],
+        )
+
+    assert failed_node.status == CrawlGraphNodeStatus.RETRY.value
+    assert failed_node.attempt_count == 1
+    assert failed_node in ready_after_failure
+
+    fetcher.pages[faculty_url] = FetchResult(faculty_url, "faculty Ada", [], 200)
+    agent.visited_urls.clear()
+    await agent._extract_professors([])
+
+    async with db.session() as session:
+        done_node = await session.get(CrawlGraphNode, candidate.node_id)
+        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
+
+    assert fetcher.calls == [faculty_url, faculty_url]
+    assert done_node.status == CrawlGraphNodeStatus.DONE.value
+    assert professor.org_unit_name == "CS"
+    await db.close()
+
+
+async def test_graph_frontier_queue_orders_pagination_before_generic_followup(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    current = _QueuedUrl(
+        url="https://www.example.edu.cn/cs/faculty",
+        depth=1,
+        graph_node_type=CrawlGraphNodeType.FACULTY_LIST_URL.value,
+        graph_priority_score=85,
+    )
+    pagination = _QueuedUrl(
+        url="https://www.example.edu.cn/cs/faculty/2.htm",
+        depth=1,
+        graph_node_type=CrawlGraphNodeType.PAGINATION_URL.value,
+        graph_priority_score=80,
+    )
+    followup = _QueuedUrl(
+        url="https://www.example.edu.cn/cs/szdw/jsdw.htm",
+        depth=2,
+        graph_node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL.value,
+        graph_priority_score=100,
+    )
+
+    ordered = agent.graph_frontier.sort_queue_items([followup, pagination, current])
+
+    assert [item.url for item in ordered] == [current.url, pagination.url, followup.url]
+    await db.close()
+
+
+async def test_graph_frontier_faculty_heuristic_score_orders_candidates(tmp_path):
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM())
+    source_url = "https://www.example.edu.cn/cs/"
+    low_url = "https://www.example.edu.cn/cs/about/contact.htm"
+    high_url = "https://www.example.edu.cn/cs/szdw/jsdw.htm"
+
+    candidates = await agent.graph_frontier.record_discovered_links(
+        source_url=source_url,
+        links=[low_url, high_url],
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+        source_node_type=CrawlGraphNodeType.ORG_UNIT,
+        org_unit_name="CS",
+        depth=1,
+    )
+
+    assert [candidate.url for candidate in candidates] == [high_url, low_url]
+    assert candidates[0].priority_score > candidates[1].priority_score
     await db.close()
 

@@ -244,6 +244,27 @@ class CrawlDispatcher:
             index += 1
         return candidate
 
+    async def _cleanup_non_edu_cn_crawl_tasks_for_session(
+        self,
+        session: Any,
+        *,
+        university: _UniversityTarget,
+    ) -> dict[str, int]:
+        summary = await crawler_db.cleanup_non_edu_cn_crawl_tasks(session)
+        changed = (
+            int(summary.get("crawl_tasks_deleted", 0) or 0)
+            + int(summary.get("crawl_extraction_failures_deleted", 0) or 0)
+            + int(summary.get("crawl_task_org_unit_urls_cleared", 0) or 0)
+        )
+        if changed:
+            self.logger.info(
+                "Cleaned non-edu-cn crawl tasks university=%s db=%s summary=%s",
+                university.name,
+                university.db_path,
+                summary,
+            )
+        return summary
+
     async def _inspect_progress(self, targets: list[_UniversityTarget], *, force_existing: bool = False) -> None:
         for university in targets:
             cleanup_summary = await self._cleanup_excluded_org_units_for_resume(university)
@@ -337,6 +358,7 @@ class CrawlDispatcher:
                     start_url=university.url,
                     location=university.location,
                 )
+                await self._cleanup_non_edu_cn_crawl_tasks_for_session(session, university=university)
                 org_units = await crawler_db.list_org_units(session)
                 if not org_units:
                     return {}
@@ -444,6 +466,7 @@ class CrawlDispatcher:
                     start_url=university.url,
                     location=university.location,
                 )
+                await self._cleanup_non_edu_cn_crawl_tasks_for_session(session, university=university)
                 status = await crawler_db.get_university_status(session)
                 professor_count = await crawler_db.count_professors(session)
                 retryable_fetch_failure_count = await crawler_db.count_retryable_fetch_failure_urls(session)
@@ -500,6 +523,7 @@ class CrawlDispatcher:
                             start_url=university.url,
                             location=university.location,
                         )
+                        await self._cleanup_non_edu_cn_crawl_tasks_for_session(session, university=university)
 
                     skill_manager = SkillManager(
                         Path(self.settings.crawler_skills_dir),

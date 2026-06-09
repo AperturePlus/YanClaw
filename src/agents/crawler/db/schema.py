@@ -175,6 +175,7 @@ async def _ensure_crawl_graph_schema(session: AsyncSession) -> None:
                 type VARCHAR(64) NOT NULL,
                 url TEXT NOT NULL DEFAULT '',
                 org_unit_name VARCHAR(255) NOT NULL DEFAULT '',
+                org_unit_id INTEGER,
                 status VARCHAR(32) NOT NULL DEFAULT 'pending',
                 priority_score FLOAT NOT NULL DEFAULT 0.0,
                 confidence FLOAT NOT NULL DEFAULT 1.0,
@@ -217,6 +218,11 @@ async def _ensure_crawl_graph_schema(session: AsyncSession) -> None:
     )
     await session.execute(
         text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_org_unit_name ON crawl_graph_nodes(org_unit_name)")
+    )
+    if not await _sqlite_has_column(session, "crawl_graph_nodes", "org_unit_id"):
+        await session.execute(text("ALTER TABLE crawl_graph_nodes ADD COLUMN org_unit_id INTEGER"))
+    await session.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_org_unit_id ON crawl_graph_nodes(org_unit_id)")
     )
     await session.execute(
         text("CREATE INDEX IF NOT EXISTS ix_crawl_graph_nodes_status ON crawl_graph_nodes(status)")
