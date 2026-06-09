@@ -85,6 +85,7 @@ def _configure_sqlite_engine(engine: AsyncEngine) -> None:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA busy_timeout=15000")
             cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
 

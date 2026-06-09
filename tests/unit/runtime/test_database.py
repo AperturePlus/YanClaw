@@ -34,11 +34,13 @@ async def test_sqlite_engine_enables_wal_and_tuned_pragmas(tmp_path):
         journal_mode = (await session.execute(text("PRAGMA journal_mode"))).scalar()
         busy_timeout = (await session.execute(text("PRAGMA busy_timeout"))).scalar()
         synchronous = (await session.execute(text("PRAGMA synchronous"))).scalar()
+        foreign_keys = (await session.execute(text("PRAGMA foreign_keys"))).scalar()
     await db.close()
 
     assert str(journal_mode).lower() == "wal"
     assert int(busy_timeout) == 15000
     assert int(synchronous) == 1  # 1 == NORMAL
+    assert int(foreign_keys) == 1  # 1 == ON
 
 
 async def test_concurrent_writers_do_not_lock(tmp_path):
