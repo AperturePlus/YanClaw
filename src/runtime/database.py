@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -33,6 +34,7 @@ class DatabaseManager:
         self.database_url = database_url
         _ensure_sqlite_parent_dir(database_url)
         self.engine: AsyncEngine = create_async_engine(database_url, echo=echo)
+        _configure_sqlite_engine(self.engine)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -65,6 +67,26 @@ class DatabaseManager:
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+
+def _configure_sqlite_engine(engine: AsyncEngine) -> None:
+    """Apply concurrency/durability PRAGMAs to every new SQLite connection.
+
+    journal_mode=WAL is persisted in the database header; busy_timeout and
+    synchronous are per-connection and must be re-applied on each connect.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
 
 
 def _ensure_sqlite_parent_dir(database_url: str) -> None:
