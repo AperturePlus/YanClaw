@@ -130,8 +130,9 @@ async def upsert_graph_node(
     if type_value and row.type != type_value:
         row.type = type_value
         changed = True
-    if _status_rank(status_value) >= _status_rank(row.status) and row.status != status_value:
-        row.status = status_value
+    resolved_status = _resolve_status_on_upsert(row.status, status_value)
+    if resolved_status != row.status:
+        row.status = resolved_status
         changed = True
     if float(priority_score or 0.0) > float(row.priority_score or 0.0):
         row.priority_score = float(priority_score or 0.0)
@@ -426,10 +427,33 @@ def _status_rank(status: str) -> int:
         CrawlGraphNodeStatus.RETRY.value: 1,
         CrawlGraphNodeStatus.IN_PROGRESS.value: 2,
         CrawlGraphNodeStatus.SKIPPED.value: 3,
-        CrawlGraphNodeStatus.DONE.value: 4,
         CrawlGraphNodeStatus.FAILED.value: 4,
+        CrawlGraphNodeStatus.DONE.value: 5,
     }
     return ranks.get(str(status or ""), 0)
+
+
+def _resolve_status_on_upsert(current: str, incoming: str) -> str:
+    """Decide a graph node's status when it is re-upserted (re-discovered).
+
+    DONE is terminal-sticky. A non-DONE terminal node (FAILED/SKIPPED) that is
+    re-discovered as PENDING/RETRY is re-opened to RETRY so it becomes
+    claimable again (B2). Otherwise status may only move "up" the rank.
+    """
+    current = str(current or "")
+    incoming = str(incoming or "")
+    if not incoming or incoming == current:
+        return current
+    done = CrawlGraphNodeStatus.DONE.value
+    if current == done:
+        return done
+    reopen_from = {CrawlGraphNodeStatus.FAILED.value, CrawlGraphNodeStatus.SKIPPED.value}
+    reopen_with = {CrawlGraphNodeStatus.PENDING.value, CrawlGraphNodeStatus.RETRY.value}
+    if current in reopen_from and incoming in reopen_with:
+        return CrawlGraphNodeStatus.RETRY.value
+    if _status_rank(incoming) >= _status_rank(current):
+        return incoming
+    return current
 
 
 __all__ = [

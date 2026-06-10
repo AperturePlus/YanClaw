@@ -2071,3 +2071,45 @@ async def test_graph_node_tracks_base_priority_raise_only(tmp_path):
         )
         assert lowered.base_priority == 95.0
     await db.close()
+
+
+async def test_graph_node_rediscovery_reopens_failed_but_keeps_done_sticky(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "graph_reopen.db"))
+    await db.init_db()
+    async with db.session() as session:
+        failed = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/x.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.FAILED,
+        )
+        assert failed.status == CrawlGraphNodeStatus.FAILED.value
+
+        reopened = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/x.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.PENDING,
+        )
+        assert reopened.id == failed.id
+        assert reopened.status == CrawlGraphNodeStatus.RETRY.value
+
+        done = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/y.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.DONE,
+        )
+        still_done = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/y.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.PENDING,
+        )
+        assert still_done.id == done.id
+        assert still_done.status == CrawlGraphNodeStatus.DONE.value
+    await db.close()
