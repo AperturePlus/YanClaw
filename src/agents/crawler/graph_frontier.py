@@ -368,6 +368,28 @@ class GraphFrontier:
             )
         return [self._candidate_from_node(row) for row in rows]
 
+    async def claim_next(
+        self,
+        *,
+        node_types: Iterable[str | CrawlGraphNodeType] | None = None,
+        org_unit_names: Iterable[str] | None = None,
+        org_unit_ids: Iterable[int] | None = None,
+    ) -> GraphFetchCandidate | None:
+        async with self.agent.db.session() as session:
+            row = await crawler_db.claim_next_graph_node(
+                session,
+                node_types=node_types,
+                org_unit_names=org_unit_names,
+                org_unit_ids=org_unit_ids,
+            )
+            if row is None:
+                return None
+            return self._candidate_from_node(row)
+
+    async def recover_stale_in_progress(self) -> int:
+        async with self.agent.db.session() as session:
+            return await crawler_db.recover_stale_in_progress_graph_nodes(session)
+
     async def ensure_url_node(
         self,
         *,

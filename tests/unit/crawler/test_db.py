@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select, text
@@ -14,6 +15,7 @@ from agents.crawler.entrances import (
 )
 from agents.crawler.fetchers import FetchResult
 from agents.crawler.fetchers.link_signals import LinkSignal
+from agents.crawler.graph_frontier import GraphFrontier
 from agents.crawler.models import (
     Academician,
     CrawlExtractionFailure,
@@ -2219,4 +2221,35 @@ async def test_claim_next_graph_node_filters_by_node_type(tmp_path):
             )
             is None
         )
+    await db.close()
+
+
+async def test_graph_frontier_claim_next_and_recover_stale(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "frontier_claim.db"))
+    await db.init_db()
+    frontier = GraphFrontier(SimpleNamespace(db=db, start_url="https://www.example.edu.cn/"))
+
+    async with db.session() as session:
+        await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=85,
+            status=CrawlGraphNodeStatus.PENDING,
+        )
+
+    claimed = await frontier.claim_next(node_types=[CrawlGraphNodeType.FACULTY_LIST_URL])
+    assert claimed is not None
+    assert claimed.url == "https://cs.example.edu.cn/faculty"
+    assert claimed.status == CrawlGraphNodeStatus.IN_PROGRESS.value
+    # Already IN_PROGRESS → nothing else claimable.
+    assert await frontier.claim_next(node_types=[CrawlGraphNodeType.FACULTY_LIST_URL]) is None
+
+    # A stale IN_PROGRESS node is reset to RETRY and becomes claimable again.
+    recovered = await frontier.recover_stale_in_progress()
+    assert recovered == 1
+    reclaimed = await frontier.claim_next(node_types=[CrawlGraphNodeType.FACULTY_LIST_URL])
+    assert reclaimed is not None
+    assert reclaimed.url == "https://cs.example.edu.cn/faculty"
     await db.close()
