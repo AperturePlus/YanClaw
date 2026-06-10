@@ -19,8 +19,10 @@ CRAWLER_SYSTEM_PROMPT = "You are a cautious university faculty crawler. Stay on 
 PROFESSOR_DETAIL_INSTRUCTION_TEMPLATE = (
     "Extract professor records from this detail page and call save_professors when records are found. "
     "Use org_unit_name={org_unit_name}. Set source_url to the current page URL. "
-    "Prioritize fields: email, phone, research_areas, bio. "
-    "Only save records that include at least one of email/phone/research_areas/bio. "
+    "Prioritize fields: title, email, phone, research_areas, bio, homepage, external_link. "
+    "Only save records with a visible name and at least one concrete evidence field such as "
+    "title/email/phone/research_areas/bio/homepage/external_link/publications/enrollment_pref. "
+    "If only a name is visible, do not save a placeholder. "
     "If this is an individual profile with a visible name, academic title, and extractable facts, "
     "call save_professors; do not return explanatory prose only. "
     "Official same-domain profile pages under sections such as 名师风采/院士 should be saved when "
@@ -36,12 +38,10 @@ PROFESSOR_DETAIL_INSTRUCTION_TEMPLATE = (
 )
 
 PROFESSOR_LIST_INSTRUCTION_TEMPLATE = (
-    "Extract public professor records and call save_professors when records are found. "
-    "Use org_unit_name={org_unit_name}. Set source_url to the current page URL. "
-    "For official roster/list pages, save visible names and academic titles even when "
-    "email/phone/research_areas are absent; detail pages may enrich them later. "
-    "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
-    "Do not include retired/emeritus records. "
+    "This is a faculty roster/list traversal task for org_unit_name={org_unit_name}. "
+    "Do not call save_professors for roster/list pages, even when visible names or titles appear. "
+    "Professor facts are saved only from personal detail pages or strong single-person detail pages. "
+    "Use the page only to support navigation to detail pages, related faculty pages, and pagination. "
     "Skip noise pages dominated by notices/news/policies/recruitment/personnel content."
 )
 

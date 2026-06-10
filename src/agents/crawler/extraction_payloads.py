@@ -4,7 +4,9 @@ import re
 from typing import Any
 
 from agents.crawler import agent_detail
+from agents.crawler.db.professors import normalize_professor_homepage
 from agents.crawler.extraction_models import ExtractionTaskItem as _ExtractionTaskItem
+from agents.crawler.models import CrawlTaskKind
 from agents.crawler.org_unit_filter import (
     is_teaching_experiment_center_name,
     looks_like_sub_department_section_name,
@@ -14,6 +16,7 @@ from agents.crawler.sanitizer import (
     contains_self_academician_hint,
     normalize_name,
     normalize_name_key,
+    sanitize_professor_payload,
 )
 
 
@@ -136,6 +139,10 @@ class ExtractionPayloadService:
         *,
         task: _ExtractionTaskItem,
     ) -> dict[str, Any] | None:
+        if not self._is_detail_extraction_task(task):
+            self._record_list_payload_suppressed(payload, task=task)
+            return None
+
         incoming_name = str(payload.get("org_unit_name") or "").strip()
         task_name = str(task.org_unit_name or "").strip()
         effective_name = incoming_name or task_name or "Unknown"
@@ -174,7 +181,7 @@ class ExtractionPayloadService:
             )
             self._fill_missing_homepages_from_name_links(normalized, task=task)
             self._infer_academician_flags_from_detail_context(normalized, task=task)
-            return normalized
+            return self._finalize_professor_payload_for_task(normalized, task=task)
 
         if (
             incoming_name
@@ -198,7 +205,7 @@ class ExtractionPayloadService:
             )
             self._fill_missing_homepages_from_name_links(normalized, task=task)
             self._infer_academician_flags_from_detail_context(normalized, task=task)
-            return normalized
+            return self._finalize_professor_payload_for_task(normalized, task=task)
 
         normalized["org_unit_name"] = effective_name
         if not normalized.get("org_unit_url"):
@@ -207,7 +214,196 @@ class ExtractionPayloadService:
             normalized["source_url"] = task.source_url
         self._fill_missing_homepages_from_name_links(normalized, task=task)
         self._infer_academician_flags_from_detail_context(normalized, task=task)
-        return normalized
+        return self._finalize_professor_payload_for_task(normalized, task=task)
+
+    @staticmethod
+    def _is_detail_extraction_task(task: _ExtractionTaskItem) -> bool:
+        return bool(getattr(task, "detail_mode", False)) or (
+            str(getattr(task, "task_kind", "") or "") == CrawlTaskKind.DETAIL_PAGE.value
+        )
+
+    def _record_list_payload_suppressed(self, payload: dict[str, Any], *, task: _ExtractionTaskItem) -> None:
+        professors = payload.get("professors")
+        record_count = len(professors) if isinstance(professors, list) else 0
+        self._pipeline_stats["list_payloads_suppressed"] = int(
+            self._pipeline_stats.get("list_payloads_suppressed", 0)
+        ) + 1
+        self._pipeline_stats["list_records_suppressed"] = int(
+            self._pipeline_stats.get("list_records_suppressed", 0)
+        ) + record_count
+        self.logger.info(
+            "Drop list-page professor payload task_id=%s org_unit=%s source=%s records=%s",
+            getattr(task, "task_id", 0),
+            getattr(task, "org_unit_name", "Unknown"),
+            payload.get("source_url") or getattr(task, "source_url", ""),
+            record_count,
+        )
+
+    def _finalize_professor_payload_for_task(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: _ExtractionTaskItem,
+    ) -> dict[str, Any] | None:
+        filtered = self._filter_detail_professors_for_evidence(payload, task=task)
+        if filtered is None:
+            return None
+        payload["professors"] = filtered
+        return payload
+
+    def _filter_detail_professors_for_evidence(
+        self,
+        payload: dict[str, Any],
+        *,
+        task: _ExtractionTaskItem,
+    ) -> list[dict[str, Any]] | None:
+        professors = payload.get("professors")
+        if not isinstance(professors, list):
+            self._pipeline_stats["detail_payloads_missing_professors"] = int(
+                self._pipeline_stats.get("detail_payloads_missing_professors", 0)
+            ) + 1
+            return None
+
+        org_unit_name = str(payload.get("org_unit_name") or task.org_unit_name or "Unknown")
+        accepted: list[tuple[int, int, dict[str, Any]]] = []
+        dropped_low_evidence = 0
+        dropped_invalid = 0
+        for index, professor in enumerate(professors):
+            if not isinstance(professor, dict):
+                dropped_invalid += 1
+                continue
+            try:
+                cleaned, is_academician = sanitize_professor_payload(
+                    professor,
+                    org_unit_name=org_unit_name,
+                )
+            except Exception as exc:
+                dropped_invalid += 1
+                self.logger.debug(
+                    "Drop invalid detail professor payload task_id=%s source=%s index=%s error=%s",
+                    getattr(task, "task_id", 0),
+                    getattr(task, "source_url", ""),
+                    index,
+                    exc,
+                )
+                continue
+
+            evidence_fields = self._detail_professor_evidence_fields(professor, cleaned)
+            if not evidence_fields:
+                dropped_low_evidence += 1
+                self.logger.debug(
+                    "Drop low-evidence detail professor payload task_id=%s source=%s name=%s",
+                    getattr(task, "task_id", 0),
+                    getattr(task, "source_url", ""),
+                    cleaned.get("name"),
+                )
+                continue
+
+            updated = dict(professor)
+            for key, value in cleaned.items():
+                updated[key] = value
+            if is_academician:
+                updated["is_academician"] = True
+            if professor.get("_self_academician_evidence") is True:
+                updated["_self_academician_evidence"] = True
+            accepted.append((self._detail_professor_evidence_score(updated, cleaned), index, updated))
+
+        if dropped_invalid:
+            self._pipeline_stats["detail_records_dropped_invalid"] = int(
+                self._pipeline_stats.get("detail_records_dropped_invalid", 0)
+            ) + dropped_invalid
+        if dropped_low_evidence:
+            self._pipeline_stats["detail_records_dropped_low_evidence"] = int(
+                self._pipeline_stats.get("detail_records_dropped_low_evidence", 0)
+            ) + dropped_low_evidence
+        if not accepted:
+            self._pipeline_stats["detail_payloads_dropped_no_evidence"] = int(
+                self._pipeline_stats.get("detail_payloads_dropped_no_evidence", 0)
+            ) + 1
+            return None
+
+        if len(accepted) > 1 and not self._detail_task_allows_multiple_professors(task):
+            accepted.sort(key=lambda item: (-item[0], item[1]))
+            suppressed = len(accepted) - 1
+            self._pipeline_stats["detail_multi_professor_suppressed"] = int(
+                self._pipeline_stats.get("detail_multi_professor_suppressed", 0)
+            ) + suppressed
+            self.logger.info(
+                "Suppress extra professors on single-profile detail task_id=%s source=%s kept=%s suppressed=%s",
+                getattr(task, "task_id", 0),
+                getattr(task, "source_url", ""),
+                accepted[0][2].get("name"),
+                suppressed,
+            )
+            return [accepted[0][2]]
+
+        accepted.sort(key=lambda item: item[1])
+        return [item[2] for item in accepted]
+
+    def _detail_professor_evidence_fields(
+        self,
+        raw: dict[str, Any],
+        cleaned: dict[str, Any],
+    ) -> set[str]:
+        fields: set[str] = set()
+        for field_name in (
+            "title",
+            "email",
+            "phone",
+            "research_areas",
+            "bio",
+            "publications",
+            "enrollment_pref",
+        ):
+            if self._has_profile_value(cleaned.get(field_name)):
+                fields.add(field_name)
+
+        homepage = normalize_professor_homepage(raw.get("homepage") or cleaned.get("homepage"))
+        if homepage:
+            fields.add("homepage")
+        if self._has_profile_value(raw.get("external_link") or cleaned.get("external_link")):
+            fields.add("external_link")
+        return fields
+
+    def _detail_professor_evidence_score(self, raw: dict[str, Any], cleaned: dict[str, Any]) -> int:
+        fields = self._detail_professor_evidence_fields(raw, cleaned)
+        weights = {
+            "title": 5,
+            "email": 6,
+            "phone": 4,
+            "research_areas": 5,
+            "bio": 5,
+            "homepage": 3,
+            "external_link": 2,
+            "publications": 2,
+            "enrollment_pref": 2,
+        }
+        score = sum(weights.get(field_name, 1) for field_name in fields)
+        if raw.get("is_academician") is True:
+            score += 3
+        return score
+
+    def _detail_task_allows_multiple_professors(self, task: _ExtractionTaskItem) -> bool:
+        text = str(getattr(task, "page_text_snapshot", "") or "")
+        url = str(getattr(task, "page_url", None) or getattr(task, "source_url", "") or "").lower()
+        if any(token in url for token in ("yuanshi", "academician", "yuan-shi", "lyys")):
+            return True
+        aggregate_hints = (
+            "团队成员",
+            "团队介绍",
+            "课题组成员",
+            "研究团队",
+            "教师团队",
+            "院士风采",
+            "院士名录",
+            "院士列表",
+            "两院院士",
+            "院士团队",
+            "team members",
+            "research team",
+        )
+        lowered_text = text.lower()
+        return any(hint in text or hint in lowered_text for hint in aggregate_hints)
 
     def _is_alias_for_org_unit(self, canonical_name: str, value: str) -> bool:
         canonical_key = self._normalize_org_unit_match_text(canonical_name)

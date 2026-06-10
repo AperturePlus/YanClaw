@@ -396,6 +396,12 @@ async def _agent(
             "https://www.example.edu.cn/cs/faculty": FetchResult(
                 "https://www.example.edu.cn/cs/faculty",
                 "faculty",
+                ["https://www.example.edu.cn/cs/faculty/info/ada.htm"],
+                200,
+            ),
+            "https://www.example.edu.cn/cs/faculty/info/ada.htm": FetchResult(
+                "https://www.example.edu.cn/cs/faculty/info/ada.htm",
+                "faculty detail Ada Professor",
                 [],
                 200,
             ),
@@ -440,6 +446,12 @@ async def test_agent_manual_faculty_entrance_bypasses_discovery(tmp_path):
         "https://www.example.edu.cn/cs/faculty": FetchResult(
             "https://www.example.edu.cn/cs/faculty",
             "faculty",
+            ["https://www.example.edu.cn/cs/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -461,7 +473,10 @@ async def test_agent_manual_faculty_entrance_bypasses_discovery(tmp_path):
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
-    assert fetcher.calls == ["https://www.example.edu.cn/cs/faculty"]
+    assert fetcher.calls == [
+        "https://www.example.edu.cn/cs/faculty",
+        "https://www.example.edu.cn/cs/info/1001/ada.htm",
+    ]
     assert "state=DISCOVER_ORG_UNIT_PAGES" not in agent.execution_log
     assert "state=FIND_FACULTY_PAGES" not in agent.execution_log
     async with db.session() as session:
@@ -487,7 +502,7 @@ async def test_agent_manual_faculty_entrance_bypasses_discovery(tmp_path):
 
 async def test_agent_manual_faculty_entrance_uses_canonical_name(tmp_path):
     class CanonicalFallbackLLM(FakeLLM):
-        async def chat(self, messages, tools=None, tool_handlers=None):
+        async def chat(self, messages, tools=None, tool_handlers=None, **kwargs):
             payload = json.loads(messages[-1]["content"])
             if payload.get("state") == "EXTRACT_PROFESSORS":
                 result = await tool_handlers["save_professors"](
@@ -512,6 +527,12 @@ async def test_agent_manual_faculty_entrance_uses_canonical_name(tmp_path):
         "https://www.example.edu.cn/mec/szdw/jsml.htm": FetchResult(
             "https://www.example.edu.cn/mec/szdw/jsml.htm",
             "faculty",
+            ["https://www.example.edu.cn/mec/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/mec/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/mec/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -533,14 +554,21 @@ async def test_agent_manual_faculty_entrance_uses_canonical_name(tmp_path):
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
-    assert fetcher.calls == ["https://www.example.edu.cn/mec/szdw/jsml.htm"]
+    assert fetcher.calls == [
+        "https://www.example.edu.cn/mec/szdw/jsml.htm",
+        "https://www.example.edu.cn/mec/info/1001/ada.htm",
+    ]
     async with db.session() as session:
         units = (await session.execute(select(OrgUnit))).scalars().all()
         professors = (await session.execute(select(Professor))).scalars().all()
         tasks = (await session.execute(select(CrawlTask))).scalars().all()
         assert [unit.name for unit in units] == ["机械工程学院"]
         assert [professor.org_unit_name for professor in professors] == ["机械工程学院"]
-        assert [task.org_unit_name for task in tasks] == ["机械工程学院"]
+        assert {task.org_unit_name for task in tasks} == {"机械工程学院"}
+        assert {task.task_kind for task in tasks} == {
+            CrawlTaskKind.LIST_PAGE.value,
+            CrawlTaskKind.DETAIL_PAGE.value,
+        }
     await db.close()
 
 
@@ -625,14 +653,14 @@ async def test_extract_professors_rewrites_sub_department_payload_to_parent_org_
     await agent._extract_professors_from_page(
         _QueuedUrl("https://auto.example.edu.cn/", 0, "自动化科学与电气工程学院"),
         FetchResult(
-            "https://auto.example.edu.cn/szdw/gongye.htm",
+            "https://auto.example.edu.cn/info/1001/gongye.htm",
             "faculty Sub Dept A",
             [],
             200,
         ),
         "save professors",
-        detail_mode=False,
-        requested_url="https://auto.example.edu.cn/szdw/gongye.htm",
+        detail_mode=True,
+        requested_url="https://auto.example.edu.cn/info/1001/gongye.htm",
     )
 
     async with db.session() as session:
@@ -825,8 +853,9 @@ async def test_resume_mode_recovers_tasks_without_refetching_historical_start_ur
     result = await agent.run()
 
     assert result.status == CrawlStatus.COMPLETED.value
-    assert result.saved_professors == 1
+    assert result.saved_professors == 0
     assert fetcher.calls == []
+    assert int(agent._pipeline_stats.get("recovery_list_suppressed", 0)) == 1
     assert "skip already_crawled url=https://www.example.edu.cn/" in agent.execution_log
     await db.close()
 
@@ -1024,7 +1053,8 @@ async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_
     assert summary[CrawlTaskStatus.DONE.value] == 5
     assert all(task.status == CrawlTaskStatus.DONE.value for task in tasks)
     assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
-    assert int(agent._pipeline_stats.get("records_created", 0)) == 1
+    assert int(agent._pipeline_stats.get("records_created", 0)) == 0
+    assert int(agent._pipeline_stats.get("recovery_list_suppressed", 0)) == 5
     await db.close()
 
 
@@ -1380,7 +1410,7 @@ async def _run_live_llm_task_case(
     assert task.status == CrawlTaskStatus.DONE.value
     assert not missing
     result = SimpleNamespace(
-        entity=entities_by_name[expected_names[0]],
+        entity=entities_by_name[expected_names[0]] if expected_names else None,
         entities=entities_by_name,
         task=SimpleNamespace(status=task.status, last_error=task.last_error, task_kind=task.task_kind),
         failures=[
@@ -1533,12 +1563,12 @@ def test_detail_snapshot_rejects_uestc_medical_empty_shell_navigation_bio():
 
 
 @pytest.mark.live_llm
-async def test_live_llm_scu_computer_roster_list_snapshot_saves_professors(tmp_path):
+async def test_live_llm_scu_computer_roster_list_snapshot_does_not_save_professors(tmp_path):
     result = await _run_live_llm_task_case(
         tmp_path,
         homepage="https://cs.scu.edu.cn/szdw/rjgcx.htm",
         snapshot=SCU_COMPUTER_ROSTER_TEXT,
-        expected_names=("严斌宇", "孙元", "张蕾"),
+        expected_names=(),
         entity_model=Professor,
         task_kind=CrawlTaskKind.LIST_PAGE,
         university_name="四川大学",
@@ -1547,10 +1577,9 @@ async def test_live_llm_scu_computer_roster_list_snapshot_saves_professors(tmp_p
         org_unit_name="计算机学院",
         org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
     )
-    assert "大数据" in (result.entities["严斌宇"].research_areas or "")
-    assert "多模态智能" in (result.entities["孙元"].research_areas or "")
-    assert "数据库" in (result.entities["张蕾"].research_areas or "")
-    assert int(result.stats.get("records_created", 0)) >= 3
+    assert result.entities == {}
+    assert int(result.stats.get("records_created", 0)) == 0
+    assert int(result.stats.get("list_save_suppressed", 0)) >= 1
 
 
 async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_serializes(tmp_path):
@@ -1619,11 +1648,12 @@ async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_seriali
                 university="TestU",
                 org_unit_name="CS",
                 org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                source_url=f"https://www.example.edu.cn/cs/info/1001/parallel-{index}.htm",
+                page_url=f"https://www.example.edu.cn/cs/info/1001/parallel-{index}.htm",
                 page_hash=f"parallel-task-{index}",
-                page_text_snapshot=f"faculty list Ada {index}",
+                page_text_snapshot=f"faculty detail Ada {index} Professor",
                 allowed_tools='["save_professors"]',
+                task_kind=CrawlTaskKind.DETAIL_PAGE,
                 status=CrawlTaskStatus.PENDING,
             )
 
@@ -1677,11 +1707,12 @@ async def test_pipeline_invalid_json_retry_does_not_deadlock_when_queue_is_full(
                 university="TestU",
                 org_unit_name="CS",
                 org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
+                source_url=f"https://www.example.edu.cn/cs/info/1001/retry-{index}.htm",
+                page_url=f"https://www.example.edu.cn/cs/info/1001/retry-{index}.htm",
                 page_hash=f"invalid-retry-task-{index}",
-                page_text_snapshot=f"faculty list Ada {index}",
+                page_text_snapshot=f"faculty detail Ada {index} Professor",
                 allowed_tools='["save_professors"]',
+                task_kind=CrawlTaskKind.DETAIL_PAGE,
                 status=CrawlTaskStatus.PENDING,
             )
 
@@ -1898,6 +1929,12 @@ async def test_agent_target_org_units_fuzzy_match_selects_best_single_org_unit(t
         "https://scse.example.edu.cn/faculty": FetchResult(
             "https://scse.example.edu.cn/faculty",
             "faculty profile list",
+            ["https://scse.example.edu.cn/info/1001/ada.htm"],
+            200,
+        ),
+        "https://scse.example.edu.cn/info/1001/ada.htm": FetchResult(
+            "https://scse.example.edu.cn/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -2033,6 +2070,12 @@ async def test_agent_excludes_blacklisted_org_units_before_faculty_discovery(tmp
         "https://cs.example.edu.cn/faculty": FetchResult(
             "https://cs.example.edu.cn/faculty",
             "faculty profile list",
+            ["https://cs.example.edu.cn/info/1001/ada.htm"],
+            200,
+        ),
+        "https://cs.example.edu.cn/info/1001/ada.htm": FetchResult(
+            "https://cs.example.edu.cn/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -2181,6 +2224,12 @@ async def test_agent_resume_skips_existing_blacklisted_org_units(tmp_path):
         "https://cs.example.edu.cn/faculty": FetchResult(
             "https://cs.example.edu.cn/faculty",
             "faculty profile list",
+            ["https://cs.example.edu.cn/info/1001/ada.htm"],
+            200,
+        ),
+        "https://cs.example.edu.cn/info/1001/ada.htm": FetchResult(
+            "https://cs.example.edu.cn/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -2406,6 +2455,12 @@ async def test_agent_pipeline_retries_invalid_json_once_then_saves(tmp_path):
         "https://www.example.edu.cn/cs/faculty": FetchResult(
             "https://www.example.edu.cn/cs/faculty",
             "faculty profile list",
+            ["https://www.example.edu.cn/cs/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -2489,6 +2544,12 @@ async def test_agent_keeps_invalid_json_exhausted_task_recoverable_and_fails_com
         "https://www.example.edu.cn/cs/faculty": FetchResult(
             "https://www.example.edu.cn/cs/faculty",
             "faculty profile list",
+            ["https://www.example.edu.cn/cs/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -2531,7 +2592,11 @@ async def test_agent_keeps_invalid_json_exhausted_task_recoverable_and_fails_com
     assert result.status == CrawlStatus.FAILED.value
     assert any("recoverable_extraction_tasks_remaining" in message for message in result.messages)
     async with db.session() as session:
-        task = (await session.execute(select(CrawlTask))).scalar_one()
+        task = (
+            await session.execute(
+                select(CrawlTask).where(CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value)
+            )
+        ).scalar_one()
         failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
     assert task.status == CrawlTaskStatus.RETRY.value
     assert task.attempt == 1
@@ -2562,12 +2627,13 @@ def test_professor_prompt_templates_include_retry_constraints():
     )
 
     assert CRAWLER_SYSTEM_PROMPT.startswith("You are a cautious university faculty crawler")
-    assert "Only save records that include at least one of email/phone/research_areas/bio" in detail_instruction
+    assert "at least one concrete evidence field" in detail_instruction
+    assert "If only a name is visible, do not save a placeholder" in detail_instruction
     assert "科研项目/论文著作/代表论文/科研成果/项目题名" in detail_instruction
     assert "学习工作经历/工作经历/教育经历/教学情况/管理经验" in detail_instruction
     assert "do not return explanatory prose only" in detail_instruction
     assert "名师风采/院士" in detail_instruction
-    assert "save visible names and academic titles" in list_instruction
+    assert "Do not call save_professors for roster/list pages" in list_instruction
     assert "include a short bio when visible" in retry_instruction
     assert "escape quotes inside JSON strings" in retry_instruction
     assert "avoid bio" not in retry_instruction
@@ -2637,7 +2703,7 @@ async def test_agent_pipeline_enqueues_detail_pages_as_extraction_tasks(tmp_path
     task_kind_by_url = {task.page_url: task.task_kind for task in tasks}
     assert task_kind_by_url[list_url] == "list_page"
     assert task_kind_by_url[detail_url] == "detail_page"
-    assert list_url in llm.extract_urls
+    assert list_url not in llm.extract_urls
     assert detail_url in llm.extract_urls
     assert int(agent._pipeline_stats.get("detail_enqueued", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_processed", 0)) == 1
@@ -2686,14 +2752,19 @@ async def test_extract_professors_retries_timeout_page_without_llm_payload(tmp_p
     await db.close()
 
 
-async def test_list_page_anchor_links_fill_missing_homepage_before_save(tmp_path):
+async def test_list_page_direct_extraction_suppresses_save_payload(tmp_path):
     list_url = "https://www.example.edu.cn/cs/faculty"
     detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
 
     class ListLinkHomepageLLM(FakeLLM):
+        def __init__(self):
+            super().__init__()
+            self.extract_calls = 0
+
         async def chat(self, messages, tools=None, tool_handlers=None):
             payload = json.loads(messages[-1]["content"])
             if payload.get("state") == "EXTRACT_PROFESSORS":
+                self.extract_calls += 1
                 result = await tool_handlers["save_professors"](
                     org_unit_name="CS",
                     org_unit_url="https://www.example.edu.cn/cs",
@@ -2703,7 +2774,8 @@ async def test_list_page_anchor_links_fill_missing_homepage_before_save(tmp_path
                 return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
             return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
 
-    agent, _fetcher, db = await _agent(tmp_path, ListLinkHomepageLLM())
+    llm = ListLinkHomepageLLM()
+    agent, _fetcher, db = await _agent(tmp_path, llm)
     await agent._extract_professors_from_page(
         _QueuedUrl(list_url, 1, "CS"),
         FetchResult(
@@ -2717,10 +2789,14 @@ async def test_list_page_anchor_links_fill_missing_homepage_before_save(tmp_path
         detail_mode=False,
     )
 
+    assert llm.extract_calls == 0
     async with db.session() as session:
-        professor = (await session.execute(select(Professor).where(Professor.name == "张三"))).scalar_one()
-    assert professor.homepage == detail_url
-    assert int(agent._pipeline_stats.get("homepage_filled_from_list_links", 0)) == 1
+        professors = (await session.execute(select(Professor))).scalars().all()
+        task = (await session.execute(select(CrawlTask).where(CrawlTask.source_url == list_url))).scalar_one()
+    assert professors == []
+    assert task.status == CrawlTaskStatus.DONE.value
+    assert task.task_kind == CrawlTaskKind.LIST_PAGE.value
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) == 1
     await db.close()
 
 
@@ -3228,13 +3304,17 @@ async def test_enqueue_extraction_task_allows_list_redirect_to_faculty_roster(tm
         priority=0,
     )
 
-    assert llm_queue.qsize() == 1
+    assert llm_queue.empty()
     assert int(agent._pipeline_stats.get("redirect_skipped", 0)) == 0
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) == 1
     async with db.session() as session:
         rows = (await session.execute(select(CrawlTask))).scalars().all()
     assert len(rows) == 1
     assert rows[0].source_url == source_url
-    assert rows[0].status == CrawlTaskStatus.PENDING.value
+    assert rows[0].status == CrawlTaskStatus.DONE.value
+    assert rows[0].task_kind == CrawlTaskKind.LIST_PAGE.value
+    assert rows[0].allowed_tools == "[]"
+    assert rows[0].last_error == "list_page_traversal_only"
     await db.close()
 
 
@@ -3375,15 +3455,17 @@ async def test_pipeline_save_payloads_counts_only_created_records_and_logs_roste
         task=task,
     )
 
-    assert first["created"] == 10
-    assert second["accepted"] == 10
+    assert first["created"] == 0
+    assert first["accepted"] == 0
+    assert second["accepted"] == 0
     assert second["created"] == 0
-    assert second["deduped_by_name_key"] == 10
-    assert agent.saved_professors == 10
-    assert int(agent._pipeline_stats.get("list_roster_overlap_high", 0)) == 1
+    assert second["deduped_by_name_key"] == 0
+    assert agent.saved_professors == 0
+    assert int(agent._pipeline_stats.get("list_records_suppressed", 0)) == 20
+    assert int(agent._pipeline_stats.get("list_roster_overlap_high", 0)) == 0
 
     async with db.session() as session:
-        assert await crawler_db.count_professors(session) == 10
+        assert await crawler_db.count_professors(session) == 0
     await db.close()
 
 
@@ -3448,9 +3530,10 @@ async def test_professor_instruction_distinguishes_list_and_detail_field_strictn
     list_instruction = agent._build_professor_instruction("CS", detail_mode=False, strict_retry=False)
     detail_instruction = agent._build_professor_instruction("CS", detail_mode=True, strict_retry=False)
 
-    assert "save visible names and academic titles" in list_instruction
-    assert "email/phone/research_areas are absent" in list_instruction
-    assert "Only save records that include at least one of email/phone/research_areas/bio" in detail_instruction
+    assert "Do not call save_professors for roster/list pages" in list_instruction
+    assert "Professor facts are saved only from personal detail pages" in list_instruction
+    assert "at least one concrete evidence field" in detail_instruction
+    assert "If only a name is visible, do not save a placeholder" in detail_instruction
     assert "linked anchor text" in detail_instruction
     assert "科研项目/论文著作/代表论文/科研成果/项目题名" in detail_instruction
     assert "个人简介/简介/个人概况/学习工作经历/工作经历/教育经历/教学情况/管理经验" in detail_instruction
@@ -3486,6 +3569,12 @@ async def test_agent_skips_noise_page_llm_but_keeps_followups(tmp_path):
         "https://www.example.edu.cn/cs/szdw/faculty.htm": FetchResult(
             "https://www.example.edu.cn/cs/szdw/faculty.htm",
             "faculty",
+            ["https://www.example.edu.cn/cs/szdw/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/szdw/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/szdw/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -3496,7 +3585,7 @@ async def test_agent_skips_noise_page_llm_but_keeps_followups(tmp_path):
             super().__init__()
             self.extract_urls: list[str] = []
 
-        async def chat(self, messages, tools=None, tool_handlers=None):
+        async def chat(self, messages, tools=None, tool_handlers=None, **kwargs):
             payload = json.loads(messages[-1]["content"])
             if payload.get("state") == "FIND_FACULTY_PAGES":
                 return LLMResult('{"links": ["https://www.example.edu.cn/cs/szdw/faculty_entry.htm"]}')
@@ -3529,8 +3618,9 @@ async def test_agent_skips_noise_page_llm_but_keeps_followups(tmp_path):
     assert result.status == CrawlStatus.COMPLETED.value
     assert result.saved_professors == 1
     assert "https://www.example.edu.cn/cs/szdw/faculty_entry.htm" not in llm.extract_urls
+    assert "https://www.example.edu.cn/cs/szdw/info/1001/ada.htm" in llm.extract_urls
     assert "https://www.example.edu.cn/cs/szdw/faculty.htm" in fetcher.calls
-    assert int(agent._pipeline_stats.get("llm_calls_skipped_by_gate", 0)) >= 1
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) >= 1
     await db.close()
 
 
@@ -3561,6 +3651,12 @@ async def test_agent_rejects_teacher_platform_and_sibling_faculty_domains(tmp_pa
         "https://www.example.edu.cn/cs/faculty": FetchResult(
             "https://www.example.edu.cn/cs/faculty",
             "faculty list",
+            ["https://www.example.edu.cn/cs/info/1001/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/info/1001/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/info/1001/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -3742,8 +3838,10 @@ async def test_agent_rejects_login_and_news_candidates_and_drops_elite_subset(tm
     assert result.status == CrawlStatus.COMPLETED.value
     assert "https://scse.example.edu.cn/xw_list_new.jsp?urltype=tree.TreeTempUrl&wbtreeid=1396" not in fetcher.calls
     assert "https://scse.example.edu.cn/system/resource/tplloginaccount.jsp?owner=1756449315" not in fetcher.calls
-    assert "https://scse.example.edu.cn/szdw/teacher_list.htm" in fetcher.calls
-    assert "https://scse.example.edu.cn/szdw/professor.htm" in fetcher.calls
+    assert {
+        "https://scse.example.edu.cn/szdw/teacher_list.htm",
+        "https://scse.example.edu.cn/szdw/professor.htm",
+    } & set(fetcher.calls)
     assert "https://scse.example.edu.cn/szdw/distinguished.htm" not in fetcher.calls
     await db.close()
 
@@ -3908,6 +4006,12 @@ async def test_agent_extracts_from_followup_faculty_pages_when_landing_page_has_
         "https://www.example.edu.cn/cs/faculty": FetchResult(
             "https://www.example.edu.cn/cs/faculty",
             "faculty",
+            ["https://www.example.edu.cn/cs/faculty/info/ada.htm"],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/faculty/info/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/faculty/info/ada.htm",
+            "faculty detail Ada Professor",
             [],
             200,
         ),
@@ -3949,7 +4053,16 @@ async def test_agent_still_follows_sub_faculty_links_after_saving_from_parent_pa
         "https://www.example.edu.cn/cs/landing": FetchResult(
             "https://www.example.edu.cn/cs/landing",
             "faculty landing",
-            ["https://www.example.edu.cn/cs/software"],
+            [
+                "https://www.example.edu.cn/cs/software",
+                "https://www.example.edu.cn/cs/landing/info/ada.htm",
+            ],
+            200,
+        ),
+        "https://www.example.edu.cn/cs/landing/info/ada.htm": FetchResult(
+            "https://www.example.edu.cn/cs/landing/info/ada.htm",
+            "faculty detail Ada Professor",
+            [],
             200,
         ),
         "https://www.example.edu.cn/cs/software": FetchResult(
@@ -3969,8 +4082,7 @@ async def test_agent_still_follows_sub_faculty_links_after_saving_from_parent_pa
 
     assert result.status == CrawlStatus.COMPLETED.value
     assert result.saved_professors == 1
-    assert int(agent._pipeline_stats.get("records_accepted", 0)) == 2
-    assert int(agent._pipeline_stats.get("deduped_by_name_key", 0)) >= 1
+    assert int(agent._pipeline_stats.get("records_accepted", 0)) == 1
     assert "https://www.example.edu.cn/cs/software" in fetcher.calls
     await db.close()
 
@@ -4818,7 +4930,8 @@ async def test_dynamic_form_pagination_states_schedule_distinct_list_tasks(tmp_p
     assert list_url in source_urls
     assert page2_identity in source_urls
     assert any(call.get("action", {}).get("form_name") == "fromWen" for call in fetcher.action_calls)
-    assert {professor.name for professor in professors} == {"教师一", "教师二"}
+    assert professors == []
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) >= 2
     assert int(agent._pipeline_stats.get("pagination_scheduled", 0)) >= 1
     pagination_nodes = [
         node for node in graph_nodes if node.type == CrawlGraphNodeType.PAGINATION_URL.value
@@ -5420,13 +5533,12 @@ async def test_software_sidebar_followups_do_not_repeat_failed_tasks(tmp_path):
 
     task_urls = [task.page_url for task in tasks]
     assert sorted(task_urls) == sorted([a_url, b_url, c_url])
-    assert all(task.status == CrawlTaskStatus.FAILED.value for task in tasks)
+    assert all(task.status == CrawlTaskStatus.DONE.value for task in tasks)
+    assert all(task.task_kind == CrawlTaskKind.LIST_PAGE.value for task in tasks)
     assert all(task.status != CrawlTaskStatus.IN_PROGRESS.value for task in tasks)
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) == 3
 
-    failure_counts: dict[str, int] = {}
-    for failure in failures:
-        failure_counts[failure.source_url] = failure_counts.get(failure.source_url, 0) + 1
-    assert failure_counts == {a_url: 1, b_url: 1, c_url: 1}
+    assert failures == []
     await db.close()
 
 
@@ -5588,7 +5700,8 @@ async def test_run_extraction_task_skips_notice_issuance_without_llm_call(tmp_pa
         page_hash="notice",
         page_text_snapshot="# 关于印发《教师岗位聘任办法》的通知\n各单位：请遵照执行。",
         allowed_tools=["save_professors"],
-        task_kind=CrawlTaskKind.LIST_PAGE.value,
+        detail_mode=True,
+        task_kind=CrawlTaskKind.DETAIL_PAGE.value,
     )
 
     outcome = await agent._run_extraction_task(task, "save professors")
@@ -5625,7 +5738,8 @@ async def test_run_extraction_task_skips_recent_school_news_opening_without_llm_
         page_hash="recent-news",
         page_text_snapshot="近日我院举办教师发展活动，学院领导和教师代表参加。",
         allowed_tools=["save_professors"],
-        task_kind=CrawlTaskKind.LIST_PAGE.value,
+        detail_mode=True,
+        task_kind=CrawlTaskKind.DETAIL_PAGE.value,
     )
 
     outcome = await agent._run_extraction_task(task, "save professors")
@@ -5662,7 +5776,8 @@ async def test_run_extraction_task_skips_event_kickoff_without_llm_call(tmp_path
         page_hash="event",
         page_text_snapshot="学院举办教师发展活动。活动正式拉开帷幕，师生代表参加。",
         allowed_tools=["save_professors"],
-        task_kind=CrawlTaskKind.LIST_PAGE.value,
+        detail_mode=True,
+        task_kind=CrawlTaskKind.DETAIL_PAGE.value,
     )
 
     outcome = await agent._run_extraction_task(task, "save professors")
@@ -5762,7 +5877,9 @@ async def test_graph_frontier_retry_node_is_reprocessed_on_resume(tmp_path):
     assert failed_node.attempt_count == 1
     assert failed_node in ready_after_failure
 
-    fetcher.pages[faculty_url] = FetchResult(faculty_url, "faculty Ada", [], 200)
+    detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    fetcher.pages[faculty_url] = FetchResult(faculty_url, "faculty Ada", [detail_url], 200)
+    fetcher.pages[detail_url] = FetchResult(detail_url, "faculty detail Ada Professor", [], 200)
     agent.visited_urls.clear()
     await agent._extract_professors([])
 
@@ -5770,7 +5887,7 @@ async def test_graph_frontier_retry_node_is_reprocessed_on_resume(tmp_path):
         done_node = await session.get(CrawlGraphNode, candidate.node_id)
         professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
 
-    assert fetcher.calls == [faculty_url, faculty_url]
+    assert fetcher.calls == [faculty_url, faculty_url, detail_url]
     assert done_node.status == CrawlGraphNodeStatus.DONE.value
     assert professor.org_unit_name == "CS"
     await db.close()

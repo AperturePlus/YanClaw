@@ -70,7 +70,7 @@ def test_extraction_models_are_importable_and_keep_legacy_agent_alias():
     assert outcome.payloads == event.payloads
 
 
-def test_payload_service_fills_missing_homepage_from_list_name_links():
+def test_payload_service_suppresses_list_page_professor_payloads():
     harness = _PayloadHarness()
     detail_url = "https://cs.scu.edu.cn/info/1292/17098.htm"
     task = _task(name_homepage_candidates={normalize_name_key("孙元"): detail_url})
@@ -81,9 +81,55 @@ def test_payload_service_fills_missing_homepage_from_list_name_links():
 
     normalized = harness._normalize_extraction_payload_for_task(payload, task=task)
 
+    assert normalized is None
+    assert harness._pipeline_stats["list_payloads_suppressed"] == 1
+    assert harness._pipeline_stats["list_records_suppressed"] == 1
+
+
+def test_payload_service_drops_detail_name_only_payload():
+    harness = _PayloadHarness()
+    detail_url = "https://cs.scu.edu.cn/info/1292/17098.htm"
+    task = _task(source_url=detail_url, page_url=detail_url, detail_mode=True)
+
+    normalized = harness._normalize_extraction_payload_for_task(
+        {
+            "org_unit_name": "计算机学院",
+            "source_url": detail_url,
+            "professors": [{"name": "孙元"}],
+        },
+        task=task,
+    )
+
+    assert normalized is None
+    assert harness._pipeline_stats["detail_records_dropped_low_evidence"] == 1
+    assert harness._pipeline_stats["detail_payloads_dropped_no_evidence"] == 1
+
+
+def test_payload_service_suppresses_extra_professors_on_single_detail_page():
+    harness = _PayloadHarness()
+    detail_url = "https://cs.scu.edu.cn/info/1292/17098.htm"
+    task = _task(source_url=detail_url, page_url=detail_url, detail_mode=True)
+
+    normalized = harness._normalize_extraction_payload_for_task(
+        {
+            "org_unit_name": "计算机学院",
+            "source_url": detail_url,
+            "professors": [
+                {"name": "弱证据", "title": "讲师"},
+                {
+                    "name": "强证据",
+                    "title": "副研究员",
+                    "email": "strong@scu.edu.cn",
+                    "research_areas": "多模态智能",
+                },
+            ],
+        },
+        task=task,
+    )
+
     assert normalized is not None
-    assert normalized["professors"][0]["homepage"] == detail_url
-    assert harness._pipeline_stats["homepage_filled_from_list_links"] == 1
+    assert [item["name"] for item in normalized["professors"]] == ["强证据"]
+    assert harness._pipeline_stats["detail_multi_professor_suppressed"] == 1
 
 
 def test_payload_service_synthesizes_payload_from_detail_snapshot():

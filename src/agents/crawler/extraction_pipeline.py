@@ -410,34 +410,8 @@ class ExtractionPipelineService(ExtractionPayloadService):
                             last_error="retired_page",
                         )
                         continue
-                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
-                    if skip_llm:
-                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
-                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
-                        ) + 1
-                        self.logger.debug(
-                            "Skip professor LLM extraction by gate url=%s reason=%s",
-                            fetched.url,
-                            skip_reason,
-                        )
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error=f"skipped_by_gate:{skip_reason or 'unknown'}",
-                        )
-                    else:
-                        saved = await self._extract_professors_from_page(
-                            current,
-                            fetched,
-                            skills,
-                            detail_mode=False,
-                        )
-                        if saved < 0:
-                            continue
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.DONE,
-                        )
+                    if await self._record_list_page_traversal_task(current, fetched) == "skipped":
+                        continue
                     reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
                     await self._enrich_profiles_with_detail_backend(
                         current,
@@ -528,31 +502,8 @@ class ExtractionPipelineService(ExtractionPayloadService):
                             last_error="retired_page",
                         )
                         continue
-                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
-                    if skip_llm:
-                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
-                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
-                        ) + 1
-                        self.logger.debug(
-                            "Skip professor LLM enqueue by gate url=%s reason=%s",
-                            fetched.url,
-                            skip_reason,
-                        )
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error=f"skipped_by_gate:{skip_reason or 'unknown'}",
-                        )
-                    else:
-                        enqueue_result = await self._enqueue_extraction_task(
-                            current,
-                            fetched,
-                            llm_queue=llm_queue,
-                            detail_mode=False,
-                            priority=0,
-                        )
-                        if enqueue_result == "skipped":
-                            continue
+                    if await self._record_list_page_traversal_task(current, fetched) == "skipped":
+                        continue
                     reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
                     previous_detail_queue = self._active_detail_llm_queue
                     self._active_detail_llm_queue = llm_queue
@@ -736,6 +687,104 @@ class ExtractionPipelineService(ExtractionPayloadService):
             return "skipped"
         return "retry"
 
+    async def _record_list_page_traversal_task(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        *,
+        requested_url: str | None = None,
+    ) -> str:
+        source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
+        if not source_url:
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="missing_source_url",
+            )
+            self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+            return "skipped"
+
+        final_url = _sanitize_url(fetched.url) or source_url
+        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
+            source_url,
+            final_url,
+            detail_mode=False,
+        )
+        if skip_redirect:
+            self._record_redirected_extraction_skip(detail_mode=False)
+            self.logger.warning(
+                "Skip list traversal after redirect source=%s final=%s reason=%s",
+                source_url,
+                final_url,
+                redirect_reason,
+            )
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error=f"redirect:{redirect_reason}",
+            )
+            return "skipped"
+
+        snapshot = self._compact_page_text(
+            fetched.text or "",
+            self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=False),
+        )
+        page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+        task_priority = -int(current.graph_priority_score) if float(current.graph_priority_score or 0.0) > 0.0 else 0
+        org_unit_name = current.label or "Unknown"
+        async with self.db.session() as session:
+            row = await crawler_db.upsert_crawl_task(
+                session,
+                university=self.university_name,
+                org_unit_name=org_unit_name,
+                org_unit_url=current.url,
+                source_url=source_url,
+                page_url=source_url,
+                page_hash=page_hash,
+                task_kind=CrawlTaskKind.LIST_PAGE,
+                page_text_snapshot=snapshot,
+                allowed_tools="[]",
+                attempt=0,
+                priority=task_priority,
+                status=CrawlTaskStatus.DONE,
+                last_error="list_page_traversal_only",
+            )
+
+        if row is None:
+            self._pipeline_stats["edu_cn_task_url_rejected"] = int(
+                self._pipeline_stats.get("edu_cn_task_url_rejected", 0)
+            ) + 1
+            self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="non_edu_cn_task_url",
+            )
+            return "skipped"
+
+        self._pipeline_stats["list_save_suppressed"] = int(
+            self._pipeline_stats.get("list_save_suppressed", 0)
+        ) + 1
+        self._pipeline_stats["done"] = int(self._pipeline_stats.get("done", 0)) + 1
+        self._pipeline_stats["processed_tasks"] = int(self._pipeline_stats.get("processed_tasks", 0)) + 1
+        self._pipeline_stats["list_processed"] = int(self._pipeline_stats.get("list_processed", 0)) + 1
+        if org_unit_name.strip() and org_unit_name.strip().lower() != "unknown":
+            self._pipeline_stats["list_known_org_unit_processed"] = int(
+                self._pipeline_stats.get("list_known_org_unit_processed", 0)
+            ) + 1
+        await self.graph_frontier.mark_node_status(
+            current.graph_node_id,
+            status=CrawlGraphNodeStatus.DONE,
+            metadata={"crawl_task_id": int(row.id), "task_kind": CrawlTaskKind.LIST_PAGE.value},
+        )
+        self.logger.debug(
+            "Suppress list-page professor save and keep traversal task_id=%s org_unit=%s url=%s",
+            row.id,
+            org_unit_name,
+            source_url,
+        )
+        return "done"
+
     async def _enqueue_extraction_task(
         self,
         current: _QueuedUrl,
@@ -751,6 +800,12 @@ class ExtractionPipelineService(ExtractionPayloadService):
                 current,
                 fetched,
                 detail_mode=detail_mode,
+            )
+        if not detail_mode:
+            return await self._record_list_page_traversal_task(
+                current,
+                fetched,
+                requested_url=requested_url,
             )
         source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
@@ -1012,6 +1067,10 @@ class ExtractionPipelineService(ExtractionPayloadService):
                 "status": row.status,
                 "last_error": row.last_error,
             }
+            if not detail_mode:
+                await self._mark_recovered_list_task_suppressed(row_data)
+                recovered_count += 1
+                continue
             terminal_skip, terminal_reason = self._should_skip_recovered_task(row_data, detail_mode=detail_mode)
             if terminal_skip:
                 await self._mark_recovered_task_terminal(
@@ -1256,6 +1315,52 @@ class ExtractionPipelineService(ExtractionPayloadService):
             if skip_redirect:
                 return True, redirect_reason
         return False, ""
+
+    async def _mark_recovered_list_task_suppressed(self, row_data: dict[str, Any]) -> None:
+        task_id = int(row_data["id"])
+        source_url = str(row_data.get("source_url") or row_data.get("page_url") or "")
+        org_unit_name = str(row_data.get("org_unit_name") or "Unknown")
+        graph_candidate = await self.graph_frontier.ensure_url_node(
+            url=source_url,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            org_unit_name=org_unit_name,
+            status=CrawlGraphNodeStatus.DONE,
+            depth=1,
+            priority_score=float(row_data.get("priority") or 0),
+            metadata={"crawl_task_id": task_id, "recovered": True, "list_save_suppressed": True},
+        )
+        async with self.db.session() as session:
+            await crawler_db.set_crawl_task_status(
+                session,
+                task_id,
+                status=CrawlTaskStatus.DONE,
+                attempt=int(row_data.get("attempt") or 0),
+                last_error="list_save_suppressed",
+            )
+        await self.graph_frontier.mark_node_status(
+            graph_candidate.node_id if graph_candidate is not None else None,
+            status=CrawlGraphNodeStatus.DONE,
+            metadata={"crawl_task_id": task_id, "list_save_suppressed": True},
+        )
+        self._pipeline_stats["list_save_suppressed"] = int(
+            self._pipeline_stats.get("list_save_suppressed", 0)
+        ) + 1
+        self._pipeline_stats["done"] = int(self._pipeline_stats.get("done", 0)) + 1
+        self._pipeline_stats["processed_tasks"] = int(self._pipeline_stats.get("processed_tasks", 0)) + 1
+        self._pipeline_stats["list_processed"] = int(self._pipeline_stats.get("list_processed", 0)) + 1
+        if org_unit_name.strip() and org_unit_name.strip().lower() != "unknown":
+            self._pipeline_stats["list_known_org_unit_processed"] = int(
+                self._pipeline_stats.get("list_known_org_unit_processed", 0)
+            ) + 1
+        self._pipeline_stats["recovery_list_suppressed"] = int(
+            self._pipeline_stats.get("recovery_list_suppressed", 0)
+        ) + 1
+        self.logger.info(
+            "Suppress recovered list-page professor save task_id=%s org_unit=%s url=%s",
+            task_id,
+            org_unit_name,
+            source_url,
+        )
 
     async def _mark_recovered_task_terminal(self, task_id: int, last_error: str) -> None:
         async with self.db.session() as session:
@@ -1610,6 +1715,23 @@ class ExtractionPipelineService(ExtractionPayloadService):
         return None
 
     async def _run_extraction_task(self, task: _ExtractionTaskItem, skills: str) -> _ExtractionOutcome:
+        if self._task_kind_prefix(task) != "detail":
+            self._pipeline_stats["list_save_suppressed"] = int(
+                self._pipeline_stats.get("list_save_suppressed", 0)
+            ) + 1
+            self.logger.info(
+                "Suppress list-page professor extraction task_id=%s org_unit=%s url=%s",
+                task.task_id,
+                task.org_unit_name,
+                task.source_url,
+            )
+            return _ExtractionOutcome(
+                payloads=[],
+                invalid_json_events=[],
+                skipped_by_gate=True,
+                skip_reason="list_save_suppressed",
+            )
+
         skip_llm, skip_reason = self._should_skip_professor_llm(
             url=task.page_url or task.source_url,
             text=task.page_text_snapshot,
@@ -1691,7 +1813,7 @@ class ExtractionPipelineService(ExtractionPayloadService):
             if normalized_payload is None:
                 return {"accepted": 0}
             captured_payloads.append(normalized_payload)
-            return {"accepted": len(normalized_professors)}
+            return {"accepted": len(normalized_payload.get("professors", []) or [])}
 
         final_result = None
         for batch in batches:
@@ -1753,6 +1875,26 @@ class ExtractionPipelineService(ExtractionPayloadService):
             "deduped_by_name_key": 0,
             "deduped_by_homepage": 0,
         }
+        if task is not None and self._task_kind_prefix(task) != "detail":
+            dropped = 0
+            for payload in payloads:
+                professors = payload.get("professors") if isinstance(payload, dict) else None
+                dropped += len(professors) if isinstance(professors, list) else 0
+            self._pipeline_stats["list_save_suppressed"] = int(
+                self._pipeline_stats.get("list_save_suppressed", 0)
+            ) + 1
+            self._pipeline_stats["list_records_suppressed"] = int(
+                self._pipeline_stats.get("list_records_suppressed", 0)
+            ) + dropped
+            self.logger.info(
+                "Suppress list-page DB save task_id=%s org_unit=%s url=%s payloads=%s records=%s",
+                getattr(task, "task_id", 0),
+                getattr(task, "org_unit_name", "Unknown"),
+                getattr(task, "source_url", ""),
+                len(payloads),
+                dropped,
+            )
+            return totals
         for payload in payloads:
             if task is not None:
                 normalized_payload = self._normalize_extraction_payload_for_task(payload, task=task)

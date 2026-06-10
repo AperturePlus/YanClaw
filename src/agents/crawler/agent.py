@@ -438,6 +438,9 @@ class CrawlerAgent(ExtractionPipelineService):
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
 
+    def _has_traversal_only_extraction_progress(self) -> bool:
+        return int(self._pipeline_stats.get("list_known_org_unit_processed", 0) or 0) > 0
+
     async def _finalize_run(self, initial_professor_count: int) -> AgentResult:
         recoverable_task_result = await self._fail_if_recoverable_tasks_remain(context="crawl_completion")
         if recoverable_task_result is not None:
@@ -460,6 +463,20 @@ class CrawlerAgent(ExtractionPipelineService):
                     sorted(self._target_org_unit_ids),
                 )
                 return self._result(CrawlStatus.COMPLETED, [message])
+            if self._has_traversal_only_extraction_progress():
+                retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                    context="traversal_only_completion",
+                )
+                if retryable_failure_result is not None:
+                    return retryable_failure_result
+                await self._set_status(CrawlStatus.COMPLETED)
+                self.logger.info(
+                    "Crawler completed traversal-only run for %s list_processed=%s list_save_suppressed=%s",
+                    self.university_name,
+                    self._pipeline_stats.get("list_processed", 0),
+                    self._pipeline_stats.get("list_save_suppressed", 0),
+                )
+                return self._result(CrawlStatus.COMPLETED, ["No professors saved; list pages were traversal-only"])
             await self._set_status(CrawlStatus.FAILED)
             self.logger.warning(
                 "Crawler did not save any professors for %s; marking failed",
@@ -606,6 +623,20 @@ class CrawlerAgent(ExtractionPipelineService):
                 self.university_name,
                 total_professor_count,
                 newly_saved_count,
+            )
+            return self._result(CrawlStatus.COMPLETED, [])
+
+        if self._has_traversal_only_extraction_progress():
+            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                context="strict_resume_completion",
+            )
+            if retryable_failure_result is not None:
+                return retryable_failure_result
+            await self._set_status(CrawlStatus.COMPLETED)
+            self.logger.info(
+                "Strict resume completed traversal-only recovery university=%s recovered_list_tasks=%s",
+                self.university_name,
+                self._pipeline_stats.get("recovery_list_suppressed", 0),
             )
             return self._result(CrawlStatus.COMPLETED, [])
 
@@ -2085,7 +2116,12 @@ class CrawlerAgent(ExtractionPipelineService):
             },
         ]
         try:
-            result = await self.llm_client.chat(messages, tools=None, tool_handlers={}, max_tokens=256)
+            try:
+                result = await self.llm_client.chat(messages, tools=None, tool_handlers={}, max_tokens=256)
+            except TypeError as error:
+                if "max_tokens" not in str(error):
+                    raise
+                result = await self.llm_client.chat(messages, tools=None, tool_handlers={})
         except Exception as error:
             self.logger.warning(
                 "Uncertain faculty candidate adjudication failed org_unit=%s url=%s error=%s",
@@ -2137,6 +2173,15 @@ class CrawlerAgent(ExtractionPipelineService):
         detail_mode: bool,
         requested_url: str | None = None,
     ) -> int:
+        if not detail_mode:
+            saved_before = self.saved_professors
+            await self._record_list_page_traversal_task(
+                current,
+                fetched,
+                requested_url=requested_url,
+            )
+            return self.saved_professors - saved_before
+
         if is_retryable_fetch_failure(fetched.block_reason):
             result = await self._mark_retryable_fetch_failure(
                 current,

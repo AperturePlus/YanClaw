@@ -660,7 +660,7 @@ async def enrich_profiles_with_detail_backend(
     *,
     reserved_urls: set[str] | None = None,
 ) -> None:
-    if not self._is_interactive or not self.detail_enrich_enabled:
+    if not self.detail_enrich_enabled:
         return
     await self._enrich_profiles_with_human(current, fetched, skills, reserved_urls=reserved_urls)
 
