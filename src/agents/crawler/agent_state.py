@@ -9,3 +9,10 @@ class CrawlerState(str, Enum):
     FIND_FACULTY_PAGES = "FIND_FACULTY_PAGES"
     EXTRACT_PROFESSORS = "EXTRACT_PROFESSORS"
     DONE = "DONE"
+
+
+# Detail children inherit the parent faculty page's priority plus this boost so a
+# college's subtree is claimed contiguously (per-college locality, design §4.2).
+# Lives here (a dependency-free module) to avoid the agent_detail <->
+# extraction_pipeline import cycle.
+_DETAIL_PRIORITY_INHERIT_BOOST = 20.0

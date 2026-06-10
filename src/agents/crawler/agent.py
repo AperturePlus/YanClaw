@@ -2320,14 +2320,6 @@ class CrawlerAgent(ExtractionPipelineService):
             reserved_urls=reserved_urls,
         )
 
-    async def _process_detail_urls_with_human(
-        self,
-        urls: list[str | GraphFetchCandidate],
-        current: _QueuedUrl,
-        skills: str,
-    ) -> None:
-        await self.detail_enricher.process_detail_urls_with_human(urls, current, skills)
-
     def _extract_detail_profile_links(
         self,
         links: list[str],

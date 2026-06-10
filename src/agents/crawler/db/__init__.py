@@ -18,6 +18,7 @@ from agents.crawler.db.page_cache import (
 )
 from agents.crawler.db.graph import (
     get_graph_node_by_key,
+    find_inflight_or_done_graph_node_by_url,
     graph_node_key,
     claim_next_graph_node,
     list_ready_graph_nodes,
@@ -94,6 +95,7 @@ __all__ = [
     "get_or_create_org_unit",
     "get_cached_fetch_result",
     "get_graph_node_by_key",
+    "find_inflight_or_done_graph_node_by_url",
     "get_university_status",
     "graph_node_key",
     "is_edu_cn_task_url",

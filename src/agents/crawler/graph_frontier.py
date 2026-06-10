@@ -374,6 +374,7 @@ class GraphFrontier:
         node_types: Iterable[str | CrawlGraphNodeType] | None = None,
         org_unit_names: Iterable[str] | None = None,
         org_unit_ids: Iterable[int] | None = None,
+        exclude_node_ids: Iterable[int] | None = None,
     ) -> GraphFetchCandidate | None:
         async with self.agent.db.session() as session:
             row = await crawler_db.claim_next_graph_node(
@@ -381,6 +382,7 @@ class GraphFrontier:
                 node_types=node_types,
                 org_unit_names=org_unit_names,
                 org_unit_ids=org_unit_ids,
+                exclude_node_ids=exclude_node_ids,
             )
             if row is None:
                 return None

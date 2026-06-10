@@ -30,6 +30,10 @@ _GRAPH_NODE_METADATA_KEYS = {
 # effective priority. Matches the legacy -5.0 attempt step in
 # mark_graph_node_status so claim ordering and backoff stay consistent.
 _ATTEMPT_BACKOFF_PENALTY = 5.0
+# A node is no longer claimable once it has been attempted this many times. The
+# single claim-driver re-claims RETRY nodes immediately, so without this cap a
+# persistently-failing fetch or a no-data page would loop forever.
+_MAX_NODE_ATTEMPTS = 3
 
 
 def graph_node_key(
@@ -302,6 +306,7 @@ async def claim_next_graph_node(
     node_types: Iterable[str | CrawlGraphNodeType] | None = None,
     org_unit_names: Iterable[str] | None = None,
     org_unit_ids: Iterable[int] | None = None,
+    exclude_node_ids: Iterable[int] | None = None,
 ) -> CrawlGraphNode | None:
     """Atomically claim the highest-priority ready node: select the best
     PENDING/RETRY node and flip it to IN_PROGRESS in one transaction.
@@ -309,12 +314,21 @@ async def claim_next_graph_node(
     Ordering uses effective priority (base_priority - attempt_count * penalty)
     so attempt-backoff is honored and survives re-discovery (B3). A single
     driver makes the select-then-flip atomic by construction (spec §4.2).
+
+    ``exclude_node_ids`` lets the driver enforce its once-per-run invariant: a
+    node it already fetched this run (now back to RETRY after a transient
+    failure) is excluded so it is not re-fetched within the same run; it stays
+    claimable on the next run, bounded across runs by ``_MAX_NODE_ATTEMPTS``.
     """
     filters: list[Any] = [
         CrawlGraphNode.status.in_(
             [CrawlGraphNodeStatus.PENDING.value, CrawlGraphNodeStatus.RETRY.value]
-        )
+        ),
+        CrawlGraphNode.attempt_count < _MAX_NODE_ATTEMPTS,
     ]
+    excluded_ids = [int(node_id) for node_id in (exclude_node_ids or []) if node_id is not None]
+    if excluded_ids:
+        filters.append(CrawlGraphNode.id.notin_(excluded_ids))
     if node_types:
         type_values = [_enum_value(item) for item in node_types]
         filters.append(CrawlGraphNode.type.in_(type_values))
@@ -407,6 +421,41 @@ async def record_graph_node_result(
 async def get_graph_node_by_key(session: AsyncSession, node_key: str) -> CrawlGraphNode | None:
     return (
         await session.execute(select(CrawlGraphNode).where(CrawlGraphNode.node_key == node_key).limit(1))
+    ).scalars().first()
+
+
+async def find_inflight_or_done_graph_node_by_url(
+    session: AsyncSession,
+    url: str,
+    *,
+    exclude_node_id: int | None = None,
+) -> CrawlGraphNode | None:
+    """Return another node for the same normalized URL that is already DONE or
+    in-flight (IN_PROGRESS), if one exists. Used for claim-dedup (B4).
+
+    The same profile URL can be discovered under two org units, producing two
+    org-scoped detail nodes. Once any node for that URL has been claimed for
+    processing (IN_PROGRESS) or completed (DONE), the duplicate need not be
+    re-fetched/re-extracted; ``save_professors`` dedups by name_key/homepage so no
+    data is lost. IN_PROGRESS (not just DONE) is included because in pipeline mode
+    the worker marks the node DONE asynchronously — by the time the driver claims
+    the sibling, the first is typically still in-flight. Stale IN_PROGRESS nodes
+    are reset to RETRY at run start (B1), so within a run IN_PROGRESS means
+    "claimed this run".
+    """
+    normalized = _normalize_url(url)
+    if not normalized:
+        return None
+    query = select(CrawlGraphNode).where(
+        CrawlGraphNode.url == normalized,
+        CrawlGraphNode.status.in_(
+            [CrawlGraphNodeStatus.DONE.value, CrawlGraphNodeStatus.IN_PROGRESS.value]
+        ),
+    )
+    if exclude_node_id is not None:
+        query = query.where(CrawlGraphNode.id != int(exclude_node_id))
+    return (
+        await session.execute(query.order_by(CrawlGraphNode.id.asc()).limit(1))
     ).scalars().first()
 
 
@@ -544,6 +593,7 @@ def _resolve_status_on_upsert(current: str, incoming: str) -> str:
 
 __all__ = [
     "claim_next_graph_node",
+    "find_inflight_or_done_graph_node_by_url",
     "get_graph_node_by_key",
     "graph_node_key",
     "list_ready_graph_nodes",

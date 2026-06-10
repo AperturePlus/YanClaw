@@ -21,6 +21,7 @@ from agents.crawler.extraction_models import (
 from agents.crawler.extraction_payloads import ExtractionPayloadService
 from agents.crawler.fetch_failures import is_retryable_fetch_failure
 from agents.crawler.fetchers import FetchResult
+from agents.crawler.graph_frontier import GraphFetchCandidate
 from agents.crawler.models import (
     CrawlGraphEdgeType,
     CrawlGraphNodeStatus,
@@ -76,6 +77,14 @@ _ACADEMIC_TITLE_TOKENS = (
     "助理教授",
     "高级工程师",
 )
+# Node types the faculty-onward claim-driver processes (Phase 1b). Org-listing /
+# org-unit discovery is still done outside the driver until Phase 2.
+_DRIVER_NODE_TYPES = (
+    CrawlGraphNodeType.FACULTY_LIST_URL,
+    CrawlGraphNodeType.PAGINATION_URL,
+    CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+    CrawlGraphNodeType.DETAIL_URL,
+)
 
 
 class ExtractionPipeline:
@@ -120,64 +129,63 @@ class ExtractionPipelineService(ExtractionPayloadService):
     ) -> None:
         self._log_state(CrawlerState.EXTRACT_PROFESSORS)
         skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
-        max_pages = min(max(40, len(faculty_links)), 120)
         self.logger.info(
-            "Extraction pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s llm_max_concurrent=%s llm_min_interval_seconds=%s",
+            "Claim-driver pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s",
             self.pipeline_enabled,
             self.pipeline_llm_workers,
             self.pipeline_db_workers,
             self.pipeline_queue_cap,
-            self.invalid_json_max_retry,
-            getattr(self.llm_client, "max_concurrent", "unknown"),
-            getattr(self.llm_client, "min_interval", "unknown"),
         )
 
-        scheduled_urls: set[str] = set()
-        processed_urls: set[str] = set()
-        frontier_node_types = [
-            CrawlGraphNodeType.FACULTY_LIST_URL,
-            CrawlGraphNodeType.PAGINATION_URL,
-            CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
-        ]
+        # B1: orphaned IN_PROGRESS nodes from a crashed run become claimable again.
+        stale = await self.graph_frontier.recover_stale_in_progress()
+        if stale:
+            self._pipeline_stats["stale_in_progress_recovered"] = int(
+                self._pipeline_stats.get("stale_in_progress_recovered", 0)
+            ) + int(stale)
+            self.logger.info("Recovered %s stale in_progress graph nodes", stale)
 
-        def _queue_key(url: str) -> str:
-            return _sanitize_url(url) or (url or "").strip()
+        await self._seed_faculty_link_nodes(faculty_links)
 
-        def _mark_scheduled(item_or_url: _QueuedUrl | str) -> bool:
-            url = item_or_url.queue_url if isinstance(item_or_url, _QueuedUrl) else item_or_url
-            key = _queue_key(url)
-            if not key:
-                return False
-            if key in scheduled_urls or key in processed_urls:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                return False
-            scheduled_urls.add(key)
-            return True
+        # Org scope keeps streaming mode per-college; empty (resume) -> claim globally.
+        org_names = [item.label for item in faculty_links if item.label] or None
+        org_ids = [item.org_unit_id for item in faculty_links if item.org_unit_id is not None] or None
 
-        def _mark_processing(item_or_url: _QueuedUrl | str) -> bool:
-            url = item_or_url.queue_url if isinstance(item_or_url, _QueuedUrl) else item_or_url
-            key = _queue_key(url)
-            if not key:
-                return False
-            if key in processed_urls:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                return False
-            processed_urls.add(key)
-            return True
-
-        async def _ensure_graph_context(item: _QueuedUrl) -> _QueuedUrl:
-            if item.graph_node_id is not None:
-                return item
-            node_type = (
-                item.graph_node_type
-                if item.graph_node_type
-                else CrawlGraphNodeType.FACULTY_LIST_URL
+        if not self.pipeline_enabled:
+            await self._run_claim_driver(
+                skills, llm_queue=None, db_queue=None, org_names=org_names, org_ids=org_ids
             )
-            graph_candidate = await self.graph_frontier.ensure_url_node(
+            return
+
+        llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
+        db_queue: asyncio.Queue[_SaveEvent | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
+        llm_workers = [
+            asyncio.create_task(self._pipeline_llm_worker(llm_queue, db_queue, skills), name=f"llm_worker_{i}")
+            for i in range(self.pipeline_llm_workers)
+        ]
+        db_workers = [
+            asyncio.create_task(self._pipeline_db_worker(db_queue), name=f"db_worker_{i}")
+            for i in range(self.pipeline_db_workers)
+        ]
+        try:
+            await self._run_claim_driver(
+                skills, llm_queue=llm_queue, db_queue=db_queue, org_names=org_names, org_ids=org_ids
+            )
+        finally:
+            await llm_queue.join()
+            for _ in llm_workers:
+                await llm_queue.put(None)
+            await asyncio.gather(*llm_workers, return_exceptions=False)
+            await db_queue.join()
+            for _ in db_workers:
+                await db_queue.put(None)
+            await asyncio.gather(*db_workers, return_exceptions=False)
+            self._log_pipeline_stats()
+
+    async def _seed_faculty_link_nodes(self, faculty_links: list[_QueuedUrl]) -> None:
+        for item in faculty_links:
+            node_type = item.graph_node_type or CrawlGraphNodeType.FACULTY_LIST_URL.value
+            await self.graph_frontier.ensure_url_node(
                 url=item.identity_url or item.url,
                 node_type=node_type,
                 org_unit_name=item.label,
@@ -190,86 +198,244 @@ class ExtractionPipelineService(ExtractionPayloadService):
                     "source": "extraction_seed",
                 },
             )
-            if graph_candidate is None:
-                return item
-            return self.graph_frontier.to_queued_url(graph_candidate, _QueuedUrl)
 
-        async def _seed_frontier_items() -> list[_QueuedUrl]:
-            items: list[_QueuedUrl] = []
-            seed_keys: set[str] = set()
-            for item in faculty_links[:max_pages]:
-                graph_item = await _ensure_graph_context(item)
-                key = _queue_key(graph_item.queue_url)
-                if not key or key in seed_keys:
-                    continue
-                seed_keys.add(key)
-                items.append(graph_item)
+    async def _run_claim_driver(
+        self,
+        skills: str,
+        *,
+        llm_queue: "asyncio.Queue[_ExtractionTaskItem | None] | None",
+        db_queue: "asyncio.Queue[_SaveEvent | None] | None",
+        org_names: list[str] | None,
+        org_ids: list[int] | None,
+    ) -> None:
+        # Once-per-run invariant: a node fetched this run is excluded from further
+        # claims, so a transient fetch failure (-> RETRY) is retried on the *next*
+        # run, never re-fetched in a hot loop. Across runs, _MAX_NODE_ATTEMPTS caps
+        # total attempts. Without this guard the driver would spin forever on a
+        # permanently-failing fetch (it re-claims RETRY immediately).
+        attempted: set[int] = set()
 
-            if recovery_limit is not None:
-                return self.graph_frontier.sort_queue_items(items)[:max_pages]
+        def _remember(candidate: GraphFetchCandidate) -> None:
+            if candidate.node_id is not None:
+                attempted.add(int(candidate.node_id))
 
-            graph_candidates = await self.graph_frontier.next_fetch_candidates(
-                limit=max_pages,
-                node_types=frontier_node_types,
-                org_unit_names=([item.label for item in items if item.label] or None),
-                org_unit_ids=([item.org_unit_id for item in items if item.org_unit_id is not None] or None),
+        while True:
+            candidate = await self.graph_frontier.claim_next(
+                node_types=_DRIVER_NODE_TYPES,
+                org_unit_names=org_names,
+                org_unit_ids=org_ids,
+                exclude_node_ids=attempted,
             )
-            for candidate in graph_candidates:
-                graph_item = self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
-                key = _queue_key(graph_item.queue_url)
-                if not key or key in seed_keys:
-                    continue
-                seed_keys.add(key)
-                items.append(graph_item)
-            return self.graph_frontier.sort_queue_items(items)[:max_pages]
-
-        async def _schedule_related_pages(
-            current: _QueuedUrl,
-            fetched: FetchResult,
-            pages_to_process: list[_QueuedUrl],
-        ) -> set[str]:
-            skipped_duplicates = 0
-            followup_items: list[_QueuedUrl] = []
-            followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-            for link in followups[:_FOLLOWUP_PAGE_LIMIT]:
-                next_depth = current.depth + 1
-                if not self._within_depth(next_depth):
-                    continue
-                followup_item = _QueuedUrl(
-                    url=link,
-                    depth=next_depth,
-                    label=current.label,
-                    org_unit_id=current.org_unit_id,
+            if candidate is None:
+                if llm_queue is None:
+                    break
+                # Let in-flight detail jobs settle, then one final re-check. Workers
+                # create no navigation nodes, so this only picks up a node never
+                # fetched this run (already-fetched RETRY nodes stay excluded).
+                await llm_queue.join()
+                await db_queue.join()
+                candidate = await self.graph_frontier.claim_next(
+                    node_types=_DRIVER_NODE_TYPES,
+                    org_unit_names=org_names,
+                    org_unit_ids=org_ids,
+                    exclude_node_ids=attempted,
                 )
-                if not _mark_scheduled(followup_item):
-                    skipped_duplicates += 1
-                    continue
-                followup_items.append(followup_item)
+                if candidate is None:
+                    break
+            _remember(candidate)
+            await self._drive_graph_node(candidate, skills, llm_queue=llm_queue, db_queue=db_queue)
 
-            pagination_items: list[_QueuedUrl] = []
-            pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
-            for plink in pagination_links:
-                if not self._within_depth(current.depth):
-                    continue
-                page_item = _QueuedUrl(
-                    url=plink,
-                    depth=current.depth,
-                    label=current.label,
-                    org_unit_id=current.org_unit_id,
+    async def _drive_graph_node(
+        self,
+        candidate: GraphFetchCandidate,
+        skills: str,
+        *,
+        llm_queue: "asyncio.Queue[_ExtractionTaskItem | None] | None",
+        db_queue: "asyncio.Queue[_SaveEvent | None] | None",
+    ) -> None:
+        current = self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+        is_detail = candidate.node_type == CrawlGraphNodeType.DETAIL_URL.value
+
+        if self._is_noise_or_login_candidate(current.url):
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="noise_or_login_candidate",
+            )
+            return
+        # Detail/profile pages are the terminal goal, not navigation: a profile
+        # discovered from a list page at the depth boundary sits one level beyond
+        # the budget but must still be fetched (matches the pre-driver inline
+        # behavior). Anything deeper, or an off-site/non-primary profile beyond the
+        # budget, is skipped with a reason. List/pagination/followup fetches stay
+        # depth-bounded.
+        allow_depth_excess = False
+        if is_detail and not self._within_depth(current.depth):
+            if current.depth > self.max_depth + 1:
+                self._pipeline_stats["detail_depth_excess_skipped"] = int(
+                    self._pipeline_stats.get("detail_depth_excess_skipped", 0)
+                ) + 1
+                await self.graph_frontier.mark_node_status(
+                    current.graph_node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="detail_depth_excess",
                 )
-                if not _mark_scheduled(page_item):
-                    skipped_duplicates += 1
-                    continue
-                pagination_items.append(page_item)
+                return
+            if not agent_detail._is_same_site_primary_profile_url(
+                current.url, start_url=getattr(self, "start_url", "")
+            ):
+                self._pipeline_stats["detail_profile_depth_gate_skipped"] = int(
+                    self._pipeline_stats.get("detail_profile_depth_gate_skipped", 0)
+                ) + 1
+                await self.graph_frontier.mark_node_status(
+                    current.graph_node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error="profile_depth_gate",
+                )
+                return
+            allow_depth_excess = True
+        if is_detail:
+            # B4 claim-dedup: the same profile URL discovered under two org units
+            # yields two detail nodes; once a peer node for this URL is in-flight or
+            # DONE, skip the duplicate before fetching (single fetch + single LLM
+            # extraction). save_professors dedups by name_key/homepage anyway.
+            dedup_url = current.queue_url or current.url
+            async with self.db.session() as session:
+                duplicate = await crawler_db.find_inflight_or_done_graph_node_by_url(
+                    session, dedup_url, exclude_node_id=current.graph_node_id
+                )
+            if duplicate is not None:
+                self._pipeline_stats["detail_duplicate_url_skipped"] = int(
+                    self._pipeline_stats.get("detail_duplicate_url_skipped", 0)
+                ) + 1
+                await self.graph_frontier.mark_node_status(
+                    current.graph_node_id,
+                    status=CrawlGraphNodeStatus.SKIPPED,
+                    last_error=f"duplicate_url:peer_node:{int(duplicate.id)}",
+                )
+                self.logger.debug(
+                    "Skip duplicate detail URL handled by peer node url=%s peer_node=%s peer_status=%s",
+                    dedup_url,
+                    duplicate.id,
+                    duplicate.status,
+                )
+                return
+        fetched = await self._fetch_url(
+            current.url,
+            current.depth,
+            action=current.fetch_action,
+            identity_url=current.identity_url,
+            allow_depth_excess=allow_depth_excess,
+        )
+        if fetched is None:
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.RETRY,
+                last_error="fetch_failed",
+                increment_attempt=True,
+            )
+            return
+        if is_retryable_fetch_failure(fetched.block_reason):
+            await self._mark_retryable_fetch_failure(current, fetched, detail_mode=is_detail)
+            return
+        if self._is_noise_or_login_candidate(fetched.url):
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="noise_or_login_page",
+            )
+            return
+        if self._is_retired_page(fetched):
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="retired_page",
+            )
+            return
 
-            for state in getattr(fetched, "pagination_states", ()) or ():
-                action = form_pagination.pagination_state_to_fetch_action(state)
-                if not action:
-                    continue
-                identity_url = str(action.get("synthetic_url") or "").strip()
-                if not identity_url:
-                    continue
-                page_item = _QueuedUrl(
+        if is_detail:
+            await self._drive_detail_node(current, fetched, skills, llm_queue=llm_queue)
+        else:
+            await self._drive_list_node(current, fetched, skills, llm_queue=llm_queue)
+
+    async def _drive_list_node(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        skills: str,
+        *,
+        llm_queue: "asyncio.Queue[_ExtractionTaskItem | None] | None",
+    ) -> None:
+        # Traversal-only: record the list page DONE (no save) and discover children
+        # as PENDING nodes the driver will claim later.
+        if await self._record_list_page_traversal_task(current, fetched) == "skipped":
+            return
+        reserved_urls = await self._discover_related_page_nodes(current, fetched)
+        await self._enrich_profiles_with_detail_backend(
+            current, fetched, skills, reserved_urls=reserved_urls
+        )
+
+    async def _drive_detail_node(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        skills: str,
+        *,
+        llm_queue: "asyncio.Queue[_ExtractionTaskItem | None] | None",
+    ) -> None:
+        if llm_queue is None:
+            # Synchronous (pipeline-disabled) path: extract inline and mark terminal.
+            saved = await self._extract_professors_from_page(
+                current, fetched, skills, detail_mode=True, requested_url=current.queue_url
+            )
+            if saved >= 0:
+                await self.graph_frontier.mark_node_status(
+                    current.graph_node_id, status=CrawlGraphNodeStatus.DONE
+                )
+            return
+        # Pipeline path: enqueue the LLM job; the worker pool owns terminal status.
+        await self._enqueue_extraction_task(
+            current,
+            fetched,
+            llm_queue=llm_queue,
+            detail_mode=True,
+            priority=1,
+            requested_url=current.queue_url,
+        )
+
+    async def _discover_related_page_nodes(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+    ) -> set[str]:
+        def _key(url: str) -> str:
+            return _sanitize_url(url) or (url or "").strip()
+
+        followup_items: list[_QueuedUrl] = []
+        for link in self._extract_followup_faculty_links(fetched.links, fetched.url)[:_FOLLOWUP_PAGE_LIMIT]:
+            next_depth = current.depth + 1
+            if not self._within_depth(next_depth):
+                continue
+            followup_items.append(
+                _QueuedUrl(url=link, depth=next_depth, label=current.label, org_unit_id=current.org_unit_id)
+            )
+
+        pagination_items: list[_QueuedUrl] = []
+        for plink in self._extract_pagination_links(fetched.links, fetched.url):
+            if not self._within_depth(current.depth):
+                continue
+            pagination_items.append(
+                _QueuedUrl(url=plink, depth=current.depth, label=current.label, org_unit_id=current.org_unit_id)
+            )
+        for state in getattr(fetched, "pagination_states", ()) or ():
+            action = form_pagination.pagination_state_to_fetch_action(state)
+            if not action:
+                continue
+            identity_url = str(action.get("synthetic_url") or "").strip()
+            if not identity_url:
+                continue
+            pagination_items.append(
+                _QueuedUrl(
                     url=str(action.get("url") or fetched.url),
                     depth=current.depth,
                     label=current.label,
@@ -277,291 +443,72 @@ class ExtractionPipelineService(ExtractionPayloadService):
                     fetch_action=action,
                     identity_url=identity_url,
                 )
-                if not _mark_scheduled(page_item):
-                    skipped_duplicates += 1
-                    continue
-                pagination_items.append(page_item)
-
-            followup_candidates = []
-            pagination_candidates = []
-            if followup_items:
-                followup_candidates = await self.graph_frontier.record_discovered_links(
-                    source_url=fetched.url,
-                    links=followup_items,
-                    node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
-                    edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
-                    source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
-                    org_unit_name=current.label,
-                    org_unit_id=current.org_unit_id,
-                    depth=current.depth + 1,
-                    confidence=0.8,
-                    metadata={"source": "faculty_followup"},
-                )
-            if pagination_items:
-                pagination_candidates = await self.graph_frontier.record_discovered_links(
-                    source_url=fetched.url,
-                    links=pagination_items,
-                    node_type=CrawlGraphNodeType.PAGINATION_URL,
-                    edge_type=CrawlGraphEdgeType.PAGINATION_OF,
-                    source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
-                    org_unit_name=current.label,
-                    org_unit_id=current.org_unit_id,
-                    depth=current.depth,
-                    confidence=0.9,
-                    metadata={"source": "pagination"},
-                )
-
-            appended_items: list[_QueuedUrl] = []
-            if pagination_candidates:
-                appended_items.extend(
-                    self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
-                    for candidate in pagination_candidates
-                )
-            else:
-                appended_items.extend(pagination_items)
-            if followup_candidates:
-                appended_items.extend(
-                    self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
-                    for candidate in followup_candidates
-                )
-            else:
-                appended_items.extend(followup_items)
-            pages_to_process.extend(appended_items)
-            pages_to_process[:] = self.graph_frontier.sort_queue_items(pages_to_process)
-
-            added_followups = [item.queue_url for item in followup_items]
-            added_pagination = [item.queue_url for item in pagination_items]
-
-            if added_followups:
-                self._pipeline_stats["followups_scheduled"] = int(
-                    self._pipeline_stats.get("followups_scheduled", 0)
-                ) + len(added_followups)
-            if added_pagination:
-                self._pipeline_stats["pagination_scheduled"] = int(
-                    self._pipeline_stats.get("pagination_scheduled", 0)
-                ) + len(added_pagination)
-            if skipped_duplicates:
-                self._pipeline_stats["duplicate_followups_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_followups_skipped", 0)
-                ) + skipped_duplicates
-            if added_followups or added_pagination or skipped_duplicates:
-                sample = (added_followups + added_pagination)[:5]
-                self.logger.debug(
-                    "Queued faculty followups current=%s added_followups=%s added_pagination=%s skipped_duplicates=%s sample=%s",
-                    fetched.url,
-                    len(added_followups),
-                    len(added_pagination),
-                    skipped_duplicates,
-                    sample,
-                )
-            return {_queue_key(url) for url in added_followups + added_pagination if _queue_key(url)}
-
-        if not self.pipeline_enabled:
-            for item in await _seed_frontier_items():
-                if not _mark_scheduled(item):
-                    continue
-                pages_to_process = [item]
-                while pages_to_process:
-                    pages_to_process[:] = self.graph_frontier.sort_queue_items(pages_to_process)
-                    current = pages_to_process.pop(0)
-                    if not _mark_processing(current):
-                        continue
-                    await self.graph_frontier.mark_node_status(
-                        current.graph_node_id,
-                        status=CrawlGraphNodeStatus.IN_PROGRESS,
-                    )
-                    if self._is_noise_or_login_candidate(current.url):
-                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="noise_or_login_candidate",
-                        )
-                        continue
-                    fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
-                    if fetched is None:
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.RETRY,
-                            last_error="fetch_failed",
-                            increment_attempt=True,
-                        )
-                        continue
-                    if is_retryable_fetch_failure(fetched.block_reason):
-                        await self._mark_retryable_fetch_failure(
-                            current,
-                            fetched,
-                            detail_mode=False,
-                        )
-                        continue
-                    if self._is_noise_or_login_candidate(fetched.url):
-                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="noise_or_login_page",
-                        )
-                        continue
-                    if self._is_retired_page(fetched):
-                        self.logger.info("Skip retired faculty page url=%s", fetched.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="retired_page",
-                        )
-                        continue
-                    if await self._record_list_page_traversal_task(current, fetched) == "skipped":
-                        continue
-                    reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
-                    await self._enrich_profiles_with_detail_backend(
-                        current,
-                        fetched,
-                        skills,
-                        reserved_urls=reserved_urls,
-                    )
-            return
-
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
-        db_queue: asyncio.Queue[_SaveEvent | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
-
-        llm_workers = [
-            asyncio.create_task(self._pipeline_llm_worker(llm_queue, db_queue, skills), name=f"llm_worker_{i}")
-            for i in range(self.pipeline_llm_workers)
-        ]
-        db_workers = [
-            asyncio.create_task(self._pipeline_db_worker(db_queue), name=f"db_worker_{i}")
-            for i in range(self.pipeline_db_workers)
-        ]
-
-        try:
-            if self.pipeline_enabled and self.task_recovery_enabled:
-                default_recovery_limit = self.pipeline_queue_cap * 4
-                effective_recovery_limit = max(default_recovery_limit, int(recovery_limit or 0))
-                recovered_count = await self._recover_pipeline_tasks(
-                    llm_queue=llm_queue,
-                    limit=effective_recovery_limit,
-                )
-                if recovered_count:
-                    self.logger.info(
-                        "Recovered %s pending extraction tasks from DB queue_cap=%s recovery_limit=%s",
-                        recovered_count,
-                        self.pipeline_queue_cap,
-                        effective_recovery_limit,
-                    )
-
-            for item in await _seed_frontier_items():
-                if not _mark_scheduled(item):
-                    continue
-                pages_to_process = [item]
-                while pages_to_process:
-                    pages_to_process[:] = self.graph_frontier.sort_queue_items(pages_to_process)
-                    current = pages_to_process.pop(0)
-                    if not _mark_processing(current):
-                        continue
-                    await self.graph_frontier.mark_node_status(
-                        current.graph_node_id,
-                        status=CrawlGraphNodeStatus.IN_PROGRESS,
-                    )
-                    if self._is_noise_or_login_candidate(current.url):
-                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="noise_or_login_candidate",
-                        )
-                        continue
-                    fetched = await self._fetch_url(current.url, current.depth, action=current.fetch_action, identity_url=current.identity_url)
-                    if fetched is None:
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.RETRY,
-                            last_error="fetch_failed",
-                            increment_attempt=True,
-                        )
-                        continue
-                    if is_retryable_fetch_failure(fetched.block_reason):
-                        await self._mark_retryable_fetch_failure(
-                            current,
-                            fetched,
-                            detail_mode=False,
-                        )
-                        continue
-                    if self._is_noise_or_login_candidate(fetched.url):
-                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="noise_or_login_page",
-                        )
-                        continue
-                    if self._is_retired_page(fetched):
-                        self.logger.info("Skip retired faculty page url=%s", fetched.url)
-                        await self.graph_frontier.mark_node_status(
-                            current.graph_node_id,
-                            status=CrawlGraphNodeStatus.SKIPPED,
-                            last_error="retired_page",
-                        )
-                        continue
-                    if await self._record_list_page_traversal_task(current, fetched) == "skipped":
-                        continue
-                    reserved_urls = await _schedule_related_pages(current, fetched, pages_to_process)
-                    previous_detail_queue = self._active_detail_llm_queue
-                    self._active_detail_llm_queue = llm_queue
-                    try:
-                        await self._enrich_profiles_with_detail_backend(
-                            current,
-                            fetched,
-                            skills,
-                            reserved_urls=reserved_urls,
-                        )
-                    finally:
-                        self._active_detail_llm_queue = previous_detail_queue
-        finally:
-            await llm_queue.join()
-            for _ in llm_workers:
-                await llm_queue.put(None)
-            await asyncio.gather(*llm_workers, return_exceptions=False)
-
-            await db_queue.join()
-            for _ in db_workers:
-                await db_queue.put(None)
-            await asyncio.gather(*db_workers, return_exceptions=False)
-
-            self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s deduped_by_homepage=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s recovery_refetched=%s recovery_enqueued=%s recovery_consumed=%s recovery_refetch_skipped_with_snapshot=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
-                self._pipeline_stats.get("queue_depth", 0),
-                self._pipeline_stats.get("processed_tasks", 0),
-                self._pipeline_stats.get("retries", 0),
-                self._pipeline_stats.get("failed", 0),
-                self._pipeline_stats.get("list_processed", 0),
-                self._pipeline_stats.get("list_failed", 0),
-                self._pipeline_stats.get("detail_enqueued", 0),
-                self._pipeline_stats.get("detail_processed", 0),
-                self._pipeline_stats.get("detail_failed", 0),
-                self._pipeline_stats.get("detail_skipped", 0),
-                self._pipeline_stats.get("records_accepted", 0),
-                self._pipeline_stats.get("records_created", 0),
-                self._pipeline_stats.get("records_updated", 0),
-                self._pipeline_stats.get("records_unchanged", 0),
-                self._pipeline_stats.get("deduped_by_name_key", 0),
-                self._pipeline_stats.get("deduped_by_homepage", 0),
-                self._pipeline_stats.get("list_roster_overlap_high", 0),
-                self._pipeline_stats.get("stale_in_progress_recovered", 0),
-                self._pipeline_stats.get("recovery_refetched", 0),
-                self._pipeline_stats.get("recovery_enqueued", 0),
-                self._pipeline_stats.get("recovery_consumed", 0),
-                self._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0),
-                float(self._pipeline_stats.get("average_task_ms", 0.0)),
-                self._pipeline_stats.get("llm_calls_total", 0),
-                self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
-                self._pipeline_stats.get("followups_scheduled", 0),
-                self._pipeline_stats.get("pagination_scheduled", 0),
-                self._pipeline_stats.get("duplicate_tasks_skipped", 0),
-                self._pipeline_stats.get("detail_links_dropped_directory", 0),
-                self._pipeline_stats.get("detail_links_reserved_for_list", 0),
-                self._pipeline_stats.get("detail_directory_skipped", 0),
-                float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
             )
+
+        if followup_items:
+            await self.graph_frontier.record_discovered_links(
+                source_url=fetched.url,
+                links=followup_items,
+                node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+                edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                org_unit_name=current.label,
+                org_unit_id=current.org_unit_id,
+                depth=current.depth + 1,
+                confidence=0.8,
+                metadata={"source": "faculty_followup"},
+            )
+            self._pipeline_stats["followups_scheduled"] = int(
+                self._pipeline_stats.get("followups_scheduled", 0)
+            ) + len(followup_items)
+        if pagination_items:
+            await self.graph_frontier.record_discovered_links(
+                source_url=fetched.url,
+                links=pagination_items,
+                node_type=CrawlGraphNodeType.PAGINATION_URL,
+                edge_type=CrawlGraphEdgeType.PAGINATION_OF,
+                source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                org_unit_name=current.label,
+                org_unit_id=current.org_unit_id,
+                depth=current.depth,
+                confidence=0.9,
+                metadata={"source": "pagination"},
+            )
+            self._pipeline_stats["pagination_scheduled"] = int(
+                self._pipeline_stats.get("pagination_scheduled", 0)
+            ) + len(pagination_items)
+
+        return {
+            _key(item.queue_url)
+            for item in (followup_items + pagination_items)
+            if _key(item.queue_url)
+        }
+
+    def _log_pipeline_stats(self) -> None:
+        self.logger.info(
+            "Claim-driver stats processed=%s list_processed=%s list_save_suppressed=%s "
+            "detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s "
+            "records_created=%s records_updated=%s deduped_by_name_key=%s deduped_by_homepage=%s "
+            "stale_in_progress_recovered=%s detail_duplicate_url_skipped=%s followups=%s pagination=%s "
+            "avg_task_ms=%.1f llm_calls=%s",
+            self._pipeline_stats.get("processed_tasks", 0),
+            self._pipeline_stats.get("list_processed", 0),
+            self._pipeline_stats.get("list_save_suppressed", 0),
+            self._pipeline_stats.get("detail_enqueued", 0),
+            self._pipeline_stats.get("detail_processed", 0),
+            self._pipeline_stats.get("detail_failed", 0),
+            self._pipeline_stats.get("detail_skipped", 0),
+            self._pipeline_stats.get("records_created", 0),
+            self._pipeline_stats.get("records_updated", 0),
+            self._pipeline_stats.get("deduped_by_name_key", 0),
+            self._pipeline_stats.get("deduped_by_homepage", 0),
+            self._pipeline_stats.get("stale_in_progress_recovered", 0),
+            self._pipeline_stats.get("detail_duplicate_url_skipped", 0),
+            self._pipeline_stats.get("followups_scheduled", 0),
+            self._pipeline_stats.get("pagination_scheduled", 0),
+            float(self._pipeline_stats.get("average_task_ms", 0.0)),
+            self._pipeline_stats.get("llm_calls_total", 0),
+        )
 
     @staticmethod
     def _redirect_identity_key(url: str) -> tuple[str, str, str]:
@@ -1034,346 +981,6 @@ class ExtractionPipelineService(ExtractionPayloadService):
             return None
         return homepage
 
-    async def _recover_pipeline_tasks(
-        self,
-        *,
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
-        limit: int,
-    ) -> int:
-        async with self.db.session() as session:
-            stale_count = await crawler_db.recover_stale_in_progress_crawl_tasks(session)
-            rows = await crawler_db.list_recoverable_crawl_tasks(session, limit=limit)
-        if stale_count:
-            self._pipeline_stats["stale_in_progress_recovered"] = int(
-                self._pipeline_stats.get("stale_in_progress_recovered", 0)
-            ) + int(stale_count)
-            self.logger.info("Recovered %s stale in_progress extraction tasks", stale_count)
-        recovered_count = 0
-        for row in rows:
-            allowed_tools = ["save_professors"]
-            task_kind = str(getattr(row, "task_kind", None) or CrawlTaskKind.LIST_PAGE.value)
-            detail_mode = task_kind == CrawlTaskKind.DETAIL_PAGE.value
-            row_data = {
-                "id": int(row.id),
-                "university": row.university or self.university_name,
-                "org_unit_name": row.org_unit_name,
-                "org_unit_url": row.org_unit_url,
-                "source_url": row.source_url,
-                "page_url": row.page_url,
-                "page_hash": row.page_hash,
-                "page_text_snapshot": row.page_text_snapshot,
-                "attempt": int(row.attempt or 0),
-                "priority": int(row.priority or 0),
-                "status": row.status,
-                "last_error": row.last_error,
-            }
-            if not detail_mode:
-                await self._mark_recovered_list_task_suppressed(row_data)
-                recovered_count += 1
-                continue
-            terminal_skip, terminal_reason = self._should_skip_recovered_task(row_data, detail_mode=detail_mode)
-            if terminal_skip:
-                await self._mark_recovered_task_terminal(
-                    int(row_data["id"]),
-                    last_error=f"terminal_noise:{terminal_reason or 'unknown'}",
-                )
-                continue
-            graph_node_type = (
-                CrawlGraphNodeType.DETAIL_URL
-                if detail_mode
-                else CrawlGraphNodeType.FACULTY_LIST_URL
-            )
-            graph_candidate = await self.graph_frontier.ensure_url_node(
-                url=str(row_data["source_url"] or row_data["page_url"] or ""),
-                node_type=graph_node_type,
-                org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
-                status=CrawlGraphNodeStatus.RETRY
-                if row_data["status"] == CrawlTaskStatus.RETRY.value
-                else CrawlGraphNodeStatus.PENDING,
-                depth=1,
-                priority_score=float(row_data["priority"] or 0),
-                metadata={"crawl_task_id": int(row_data["id"]), "recovered": True},
-            )
-            if self._recovered_task_needs_refetch(row_data, detail_mode=detail_mode):
-                refreshed = await self._refetch_recovered_detail_task(row_data)
-                if refreshed is None:
-                    if graph_candidate is not None:
-                        await self.graph_frontier.mark_node_status(
-                            graph_candidate.node_id,
-                            status=CrawlGraphNodeStatus.RETRY,
-                            last_error="recovered_refetch_failed",
-                            increment_attempt=True,
-                            metadata={"crawl_task_id": int(row_data["id"])},
-                        )
-                    continue
-                row_data = refreshed
-            if row.allowed_tools:
-                try:
-                    parsed = json.loads(row.allowed_tools)
-                    if isinstance(parsed, list) and parsed:
-                        allowed_tools = [str(item) for item in parsed]
-                except Exception:
-                    pass
-            task = _ExtractionTaskItem(
-                task_id=int(row_data["id"]),
-                university=str(row_data["university"] or self.university_name),
-                org_unit_name=str(row_data["org_unit_name"] or "Unknown"),
-                org_unit_url=row_data["org_unit_url"],
-                source_url=str(row_data["source_url"] or ""),
-                page_url=str(row_data["page_url"] or row_data["source_url"] or ""),
-                page_hash=str(row_data["page_hash"] or ""),
-                page_text_snapshot=str(row_data["page_text_snapshot"] or ""),
-                allowed_tools=allowed_tools,
-                attempt=int(row_data["attempt"] or 0),
-                priority=int(row_data["priority"] or 0),
-                strict_retry=(int(row_data["attempt"] or 0) > 0),
-                detail_mode=detail_mode,
-                task_kind=task_kind,
-                recovered=True,
-                name_homepage_candidates=(
-                    {}
-                    if detail_mode
-                    else self._extract_name_homepage_candidates_from_snapshot(
-                        str(row_data["page_text_snapshot"] or ""),
-                        source_url=str(row_data["source_url"] or row_data["page_url"] or ""),
-                    )
-                ),
-                graph_node_id=graph_candidate.node_id if graph_candidate is not None else None,
-            )
-            if row_data["status"] == CrawlTaskStatus.RETRY.value:
-                self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
-            else:
-                self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
-            if detail_mode:
-                self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
-            else:
-                self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
-            await llm_queue.put(task)
-            recovered_count += 1
-            self._pipeline_stats["recovery_enqueued"] = int(
-                self._pipeline_stats.get("recovery_enqueued", 0)
-            ) + 1
-            self._pipeline_stats["queue_depth"] = llm_queue.qsize()
-        return recovered_count
-
-    def _recovered_task_needs_refetch(self, row_data: dict[str, Any], *, detail_mode: bool) -> bool:
-        if not detail_mode:
-            return False
-        last_error = str(row_data.get("last_error") or "")
-        snapshot = str(row_data.get("page_text_snapshot") or "")
-        if not snapshot.strip():
-            return True
-        if last_error == "completion_recrawl_refetched":
-            self._pipeline_stats["recovery_refetch_skipped_with_snapshot"] = int(
-                self._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0)
-            ) + 1
-            return False
-        return last_error.startswith(_COMPLETION_RECRAWL_LAST_ERROR_PREFIX)
-
-    async def _refetch_recovered_detail_task(self, row_data: dict[str, Any]) -> dict[str, Any] | None:
-        task_id = int(row_data["id"])
-        source_url = _sanitize_url(str(row_data.get("source_url") or row_data.get("page_url") or ""))
-        if not source_url:
-            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
-            return None
-
-        self._add_resume_force_refetch_urls([source_url])
-        fetched = await self._fetch_url(source_url, 1)
-        if fetched is None:
-            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
-            self.logger.warning(
-                "Recovered detail task refetch failed task_id=%s source=%s",
-                task_id,
-                source_url,
-            )
-            return None
-        if fetched.block_reason:
-            last_error = f"{_COMPLETION_RECRAWL_REFETCH_BLOCKED_PREFIX}:{fetched.block_reason}"
-            await self._mark_recovered_refetch_retry(task_id, last_error)
-            self.logger.warning(
-                "Recovered detail task refetch blocked task_id=%s source=%s reason=%s",
-                task_id,
-                source_url,
-                fetched.block_reason,
-            )
-            return None
-
-        final_url = _sanitize_url(fetched.url) or source_url
-        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
-            source_url,
-            final_url,
-            detail_mode=True,
-        )
-        if skip_redirect:
-            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
-            self.logger.warning(
-                "Recovered detail task refetch redirected away task_id=%s source=%s final=%s reason=%s",
-                task_id,
-                source_url,
-                final_url,
-                redirect_reason,
-            )
-            return None
-
-        text_limit = self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=True)
-        snapshot = self._compact_page_text(fetched.text or "", text_limit)
-        if not snapshot.strip():
-            await self._mark_recovered_refetch_retry(task_id, _COMPLETION_RECRAWL_REFETCH_FAILED)
-            self.logger.warning(
-                "Recovered detail task refetch produced empty snapshot task_id=%s source=%s final=%s",
-                task_id,
-                source_url,
-                final_url,
-            )
-            return None
-
-        page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
-        allowed_tools = json.dumps(["save_professors"], ensure_ascii=False, separators=(",", ":"))
-        async with self.db.session() as session:
-            refreshed = await crawler_db.upsert_crawl_task(
-                session,
-                university=str(row_data.get("university") or self.university_name),
-                org_unit_name=str(row_data.get("org_unit_name") or "Unknown"),
-                org_unit_url=(str(row_data.get("org_unit_url")) if row_data.get("org_unit_url") else None),
-                source_url=source_url,
-                page_url=source_url,
-                page_hash=page_hash,
-                task_kind=CrawlTaskKind.DETAIL_PAGE,
-                page_text_snapshot=snapshot,
-                allowed_tools=allowed_tools,
-                attempt=int(row_data.get("attempt") or 0),
-                priority=int(row_data.get("priority") or 0),
-                status=CrawlTaskStatus.RETRY,
-                last_error="completion_recrawl_refetched",
-            )
-            if refreshed is None:
-                await self._mark_recovered_refetch_retry(task_id, "non_edu_cn_task_url")
-                self.logger.warning(
-                    "Recovered detail task rejected by edu.cn sanitizer task_id=%s source=%s",
-                    task_id,
-                    source_url,
-                )
-                return None
-            refreshed.page_text_snapshot = snapshot
-            refreshed.page_hash = page_hash
-            refreshed.page_url = source_url
-            refreshed.allowed_tools = allowed_tools
-            refreshed.task_kind = CrawlTaskKind.DETAIL_PAGE.value
-            refreshed.status = CrawlTaskStatus.RETRY.value
-            refreshed.last_error = "completion_recrawl_refetched"
-            await session.flush()
-            self._pipeline_stats["recovery_refetched"] = int(
-                self._pipeline_stats.get("recovery_refetched", 0)
-            ) + 1
-            return {
-                "id": int(refreshed.id),
-                "university": refreshed.university or self.university_name,
-                "org_unit_name": refreshed.org_unit_name,
-                "org_unit_url": refreshed.org_unit_url,
-                "source_url": refreshed.source_url,
-                "page_url": refreshed.page_url,
-                "page_hash": refreshed.page_hash,
-                "page_text_snapshot": refreshed.page_text_snapshot,
-                "attempt": int(refreshed.attempt or 0),
-                "priority": int(refreshed.priority or 0),
-                "status": refreshed.status,
-                "last_error": refreshed.last_error,
-            }
-
-    async def _mark_recovered_refetch_retry(self, task_id: int, last_error: str) -> None:
-        async with self.db.session() as session:
-            await crawler_db.set_crawl_task_status(
-                session,
-                task_id,
-                status=CrawlTaskStatus.RETRY,
-                last_error=last_error,
-            )
-        self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
-
-    def _should_skip_recovered_task(
-        self,
-        row_data: dict[str, Any],
-        *,
-        detail_mode: bool,
-    ) -> tuple[bool, str]:
-        source_url = _sanitize_url(str(row_data.get("source_url") or row_data.get("page_url") or ""))
-        page_url = _sanitize_url(str(row_data.get("page_url") or row_data.get("source_url") or ""))
-        for candidate in (source_url, page_url):
-            if not candidate:
-                continue
-            terminal, reason = self._is_terminal_redirect_url(candidate)
-            if terminal:
-                return True, reason
-            if self._is_noise_or_login_candidate(candidate) or _is_non_faculty_noise_url(candidate):
-                return True, "noise_or_login_task"
-        if source_url and page_url:
-            skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
-                source_url,
-                page_url,
-                detail_mode=detail_mode,
-            )
-            if skip_redirect:
-                return True, redirect_reason
-        return False, ""
-
-    async def _mark_recovered_list_task_suppressed(self, row_data: dict[str, Any]) -> None:
-        task_id = int(row_data["id"])
-        source_url = str(row_data.get("source_url") or row_data.get("page_url") or "")
-        org_unit_name = str(row_data.get("org_unit_name") or "Unknown")
-        graph_candidate = await self.graph_frontier.ensure_url_node(
-            url=source_url,
-            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
-            org_unit_name=org_unit_name,
-            status=CrawlGraphNodeStatus.DONE,
-            depth=1,
-            priority_score=float(row_data.get("priority") or 0),
-            metadata={"crawl_task_id": task_id, "recovered": True, "list_save_suppressed": True},
-        )
-        async with self.db.session() as session:
-            await crawler_db.set_crawl_task_status(
-                session,
-                task_id,
-                status=CrawlTaskStatus.DONE,
-                attempt=int(row_data.get("attempt") or 0),
-                last_error="list_save_suppressed",
-            )
-        await self.graph_frontier.mark_node_status(
-            graph_candidate.node_id if graph_candidate is not None else None,
-            status=CrawlGraphNodeStatus.DONE,
-            metadata={"crawl_task_id": task_id, "list_save_suppressed": True},
-        )
-        self._pipeline_stats["list_save_suppressed"] = int(
-            self._pipeline_stats.get("list_save_suppressed", 0)
-        ) + 1
-        self._pipeline_stats["done"] = int(self._pipeline_stats.get("done", 0)) + 1
-        self._pipeline_stats["processed_tasks"] = int(self._pipeline_stats.get("processed_tasks", 0)) + 1
-        self._pipeline_stats["list_processed"] = int(self._pipeline_stats.get("list_processed", 0)) + 1
-        if org_unit_name.strip() and org_unit_name.strip().lower() != "unknown":
-            self._pipeline_stats["list_known_org_unit_processed"] = int(
-                self._pipeline_stats.get("list_known_org_unit_processed", 0)
-            ) + 1
-        self._pipeline_stats["recovery_list_suppressed"] = int(
-            self._pipeline_stats.get("recovery_list_suppressed", 0)
-        ) + 1
-        self.logger.info(
-            "Suppress recovered list-page professor save task_id=%s org_unit=%s url=%s",
-            task_id,
-            org_unit_name,
-            source_url,
-        )
-
-    async def _mark_recovered_task_terminal(self, task_id: int, last_error: str) -> None:
-        async with self.db.session() as session:
-            await crawler_db.set_crawl_task_status(
-                session,
-                task_id,
-                status=CrawlTaskStatus.FAILED,
-                last_error=last_error,
-            )
-        self._pipeline_stats["recovery_terminal_skipped"] = int(
-            self._pipeline_stats.get("recovery_terminal_skipped", 0)
-        ) + 1
-
     async def _mark_extraction_task_skipped_by_gate(self, task: _ExtractionTaskItem, reason: str) -> None:
         async with self.db.session() as session:
             await crawler_db.set_crawl_task_status(
@@ -1574,6 +1181,7 @@ class ExtractionPipelineService(ExtractionPayloadService):
                 task.graph_node_id,
                 status=CrawlGraphNodeStatus.RETRY,
                 last_error=_RICH_DETAIL_NO_STRUCTURED_DATA,
+                increment_attempt=True,
                 metadata={"crawl_task_id": task.task_id},
             )
             self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1

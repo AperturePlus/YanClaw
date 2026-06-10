@@ -828,38 +828,6 @@ async def test_resume_mode_merges_sub_department_org_units_before_cached_homepag
     await db.close()
 
 
-async def test_resume_mode_recovers_tasks_without_refetching_historical_start_url(tmp_path):
-    agent, fetcher, db = await _agent(tmp_path, FakeLLM(), pages={}, resume_mode=True)
-    async with db.session() as session:
-        await crawler_db.log_crawl(
-            session,
-            "https://www.example.edu.cn/",
-            CrawlLogStatus.SUCCESS,
-            "seeded-history",
-        )
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="CS",
-            org_unit_url="https://www.example.edu.cn/cs",
-            source_url="https://www.example.edu.cn/cs/faculty",
-            page_url="https://www.example.edu.cn/cs/faculty",
-            page_hash="resume-task",
-            page_text_snapshot="faculty list Ada",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
-
-    result = await agent.run()
-
-    assert result.status == CrawlStatus.COMPLETED.value
-    assert result.saved_professors == 0
-    assert fetcher.calls == []
-    assert int(agent._pipeline_stats.get("recovery_list_suppressed", 0)) == 1
-    assert "skip already_crawled url=https://www.example.edu.cn/" in agent.execution_log
-    await db.close()
-
-
 async def test_resume_force_existing_refetches_no_faculty_org_unit_despite_success_log(tmp_path):
     pages = {
         "https://www.example.edu.cn/cs": FetchResult(
@@ -1021,43 +989,6 @@ async def test_resume_keeps_university_failed_when_retryable_fetch_failure_remai
     await db.close()
 
 
-async def test_pipeline_recovers_more_tasks_than_queue_cap_without_deadlock(tmp_path):
-    agent, _fetcher, db = await _agent(
-        tmp_path,
-        FakeLLM(),
-        pages={},
-        pipeline_queue_cap=2,
-        pipeline_llm_workers=1,
-        pipeline_db_workers=1,
-    )
-    async with db.session() as session:
-        for index in range(5):
-            await crawler_db.upsert_crawl_task(
-                session,
-                university="TestU",
-                org_unit_name="CS",
-                org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_hash=f"resume-task-{index}",
-                page_text_snapshot=f"faculty list Ada {index}",
-                allowed_tools='["save_professors"]',
-                status=CrawlTaskStatus.PENDING,
-            )
-
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
-
-    async with db.session() as session:
-        summary = await crawler_db.summarize_crawl_task_status(session)
-        tasks = (await session.execute(select(CrawlTask))).scalars().all()
-    assert summary[CrawlTaskStatus.DONE.value] == 5
-    assert all(task.status == CrawlTaskStatus.DONE.value for task in tasks)
-    assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
-    assert int(agent._pipeline_stats.get("records_created", 0)) == 0
-    assert int(agent._pipeline_stats.get("recovery_list_suppressed", 0)) == 5
-    await db.close()
-
-
 async def test_pipeline_extracts_yan_binyu_profile_from_project_and_bio_sections(tmp_path):
     class PromptSensitiveYanLLM:
         async def chat(self, messages, tools=None, tool_handlers=None):
@@ -1096,7 +1027,7 @@ async def test_pipeline_extracts_yan_binyu_profile_from_project_and_bio_sections
             return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
 
     homepage = "https://cs.scu.edu.cn/info/1292/17098.htm"
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         PromptSensitiveYanLLM(),
         pages={},
@@ -1104,22 +1035,16 @@ async def test_pipeline_extracts_yan_binyu_profile_from_project_and_bio_sections
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="计算机学院",
-            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="yan-binyu-detail",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot=YAN_BINYU_DETAIL_TEXT,
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
+    agent.start_url = "https://cs.scu.edu.cn/"
+    fetcher.pages[homepage] = FetchResult(homepage, YAN_BINYU_DETAIL_TEXT, [], 200)
+    await agent.graph_frontier.ensure_url_node(
+        url=homepage,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
 
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
     async with db.session() as session:
         professor = (await session.execute(select(Professor).where(Professor.name == "严斌宇"))).scalar_one()
@@ -1138,7 +1063,7 @@ async def test_pipeline_keeps_rich_detail_without_payload_recoverable(tmp_path):
             return LLMResult("This is an individual professor profile but I will not call a tool.")
 
     homepage = "https://cs.scu.edu.cn/info/1292/17098.htm"
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         ProseOnlyLLM(),
         pages={},
@@ -1146,26 +1071,21 @@ async def test_pipeline_keeps_rich_detail_without_payload_recoverable(tmp_path):
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="计算机学院",
-            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="yan-binyu-prose-only",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot=YAN_BINYU_DETAIL_TEXT,
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
+    agent.start_url = "https://cs.scu.edu.cn/"
+    fetcher.pages[homepage] = FetchResult(homepage, YAN_BINYU_DETAIL_TEXT, [], 200)
+    await agent.graph_frontier.ensure_url_node(
+        url=homepage,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
 
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
     async with db.session() as session:
         task = (await session.execute(select(CrawlTask))).scalar_one()
         failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    # Rich profile with no payload is kept recoverable (RETRY), not dropped.
     assert task.status == CrawlTaskStatus.RETRY.value
     assert task.last_error == "rich_detail_no_structured_data"
     assert any(failure.failure_type == "no_structured_data" and failure.resolver == "retry" for failure in failures)
@@ -1178,7 +1098,7 @@ async def test_pipeline_synthesizes_hou_chaohuan_academician_from_detail_snapsho
             return LLMResult("This profile is not saved because the office address is outside SCU.")
 
     homepage = "https://cs.scu.edu.cn/info/1301/13765.htm"
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         ProseOnlyLLM(),
         pages={},
@@ -1186,6 +1106,8 @@ async def test_pipeline_synthesizes_hou_chaohuan_academician_from_detail_snapsho
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
+    agent.start_url = "https://cs.scu.edu.cn/"
+    fetcher.pages[homepage] = FetchResult(homepage, HOU_CHAOHUAN_DETAIL_TEXT, [], 200)
     async with db.session() as session:
         await crawler_db.upsert_academician(
             session,
@@ -1196,21 +1118,14 @@ async def test_pipeline_synthesizes_hou_chaohuan_academician_from_detail_snapsho
                 "homepage": homepage,
             },
         )
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="计算机学院",
-            org_unit_url="https://cs.scu.edu.cn/",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="hou-chaohuan-detail",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot=HOU_CHAOHUAN_DETAIL_TEXT,
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
+    await agent.graph_frontier.ensure_url_node(
+        url=homepage,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
 
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
     async with db.session() as session:
         academician = (await session.execute(select(Academician).where(Academician.name == "侯朝焕"))).scalar_one()
@@ -1257,7 +1172,7 @@ async def test_pipeline_fills_sun_yuan_bio_from_snapshot_after_sparse_invalid_js
             return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
 
     homepage = "https://cs.scu.edu.cn/info/1416/19827.htm"
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         InvalidThenSparseSunLLM(),
         pages={},
@@ -1265,22 +1180,16 @@ async def test_pipeline_fills_sun_yuan_bio_from_snapshot_after_sparse_invalid_js
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="计算机学院",
-            org_unit_url="https://cs.scu.edu.cn/",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="sun-yuan-detail",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot=SUN_YUAN_DETAIL_TEXT,
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
+    agent.start_url = "https://cs.scu.edu.cn/"
+    fetcher.pages[homepage] = FetchResult(homepage, SUN_YUAN_DETAIL_TEXT, [], 200)
+    await agent.graph_frontier.ensure_url_node(
+        url=homepage,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
 
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
     async with db.session() as session:
         professor = (await session.execute(select(Professor).where(Professor.name == "孙元"))).scalar_one()
@@ -1301,7 +1210,7 @@ async def test_pipeline_marks_plain_detail_without_payload_failed(tmp_path):
             return LLMResult("No extractable structured data.")
 
     homepage = "https://cs.scu.edu.cn/info/1292/plain.htm"
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         ProseOnlyLLM(),
         pages={},
@@ -1309,22 +1218,16 @@ async def test_pipeline_marks_plain_detail_without_payload_failed(tmp_path):
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="计算机学院",
-            org_unit_url="https://cs.scu.edu.cn/szdw/rjgcx.htm",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="plain-detail-prose-only",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot="## 严斌宇\n副教授\n四川大学 计算机学院\n",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.PENDING,
-        )
+    agent.start_url = "https://cs.scu.edu.cn/"
+    fetcher.pages[homepage] = FetchResult(homepage, "## 严斌宇\n副教授\n四川大学 计算机学院\n", [], 200)
+    await agent.graph_frontier.ensure_url_node(
+        url=homepage,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
 
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=1), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
     async with db.session() as session:
         task = (await session.execute(select(CrawlTask))).scalar_one()
@@ -1610,11 +1513,19 @@ async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_seriali
             finally:
                 self.active -= 1
 
+    detail_urls = [
+        f"https://www.example.edu.cn/cs/info/1001/parallel-{index}.htm" for index in range(4)
+    ]
+    pages = {
+        url: FetchResult(url, f"faculty detail Ada {index} Professor", [], 200)
+        for index, url in enumerate(detail_urls)
+    }
     llm = ParallelLLM(release_after=4)
-    agent, _fetcher, db = await _agent(
+    agent, fetcher, db = await _agent(
         tmp_path,
         llm,
-        pages={},
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
         pipeline_queue_cap=4,
         pipeline_llm_workers=4,
         pipeline_db_workers=1,
@@ -1641,29 +1552,30 @@ async def test_pipeline_llm_workers_consume_concurrently_while_db_worker_seriali
 
     agent._save_payloads_to_db = fake_save_payloads_to_db
 
+    # Seed the detail work as PENDING graph nodes; the claim-driver fetches each
+    # (serially, WAF invariant) and hands the LLM job to the worker pool.
+    for url in detail_urls:
+        await agent.graph_frontier.ensure_url_node(
+            url=url,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.PENDING,
+        )
+
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
+
     async with db.session() as session:
-        for index in range(4):
-            await crawler_db.upsert_crawl_task(
-                session,
-                university="TestU",
-                org_unit_name="CS",
-                org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/info/1001/parallel-{index}.htm",
-                page_url=f"https://www.example.edu.cn/cs/info/1001/parallel-{index}.htm",
-                page_hash=f"parallel-task-{index}",
-                page_text_snapshot=f"faculty detail Ada {index} Professor",
-                allowed_tools='["save_professors"]',
-                task_kind=CrawlTaskKind.DETAIL_PAGE,
-                status=CrawlTaskStatus.PENDING,
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(
+                    CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value
+                )
             )
-
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=4), timeout=10)
-
-    async with db.session() as session:
-        summary = await crawler_db.summarize_crawl_task_status(session)
+        ).scalars().all()
     assert llm.max_active == 4
     assert max_save_active == 1
-    assert summary[CrawlTaskStatus.DONE.value] == 4
+    assert len(detail_nodes) == 4
+    assert all(node.status == CrawlGraphNodeStatus.DONE.value for node in detail_nodes)
     await db.close()
 
 
@@ -1692,141 +1604,46 @@ async def test_pipeline_invalid_json_retry_does_not_deadlock_when_queue_is_full(
             )
             return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
 
-    agent, _fetcher, db = await _agent(
-        tmp_path,
-        QueueSaturationRetryLLM(),
-        pages={},
-        pipeline_queue_cap=2,
-        pipeline_llm_workers=1,
-        pipeline_db_workers=1,
-    )
-    async with db.session() as session:
-        for index in range(5):
-            await crawler_db.upsert_crawl_task(
-                session,
-                university="TestU",
-                org_unit_name="CS",
-                org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/info/1001/retry-{index}.htm",
-                page_url=f"https://www.example.edu.cn/cs/info/1001/retry-{index}.htm",
-                page_hash=f"invalid-retry-task-{index}",
-                page_text_snapshot=f"faculty detail Ada {index} Professor",
-                allowed_tools='["save_professors"]',
-                task_kind=CrawlTaskKind.DETAIL_PAGE,
-                status=CrawlTaskStatus.PENDING,
-            )
-
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
-
-    async with db.session() as session:
-        summary = await crawler_db.summarize_crawl_task_status(session)
-        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
-    assert summary[CrawlTaskStatus.DONE.value] == 5
-    assert summary[CrawlTaskStatus.PENDING.value] == 0
-    assert summary[CrawlTaskStatus.RETRY.value] == 0
-    assert any(failure.failure_type == "invalid_json" and failure.resolver == "retry" for failure in failures)
-    await db.close()
-
-
-async def test_pipeline_refetches_and_consumes_completion_recrawl_tasks_over_queue_cap(tmp_path):
+    detail_urls = [
+        f"https://www.example.edu.cn/cs/info/1001/retry-{index}.htm" for index in range(5)
+    ]
     pages = {
-        f"https://www.example.edu.cn/cs/info/ada-{index}.htm": FetchResult(
-            f"https://www.example.edu.cn/cs/info/ada-{index}.htm",
-            f"Ada 教授\n研究方向: systems {index}",
-            [],
-            200,
-        )
-        for index in range(5)
+        url: FetchResult(url, f"faculty detail Ada {index} Professor", [], 200)
+        for index, url in enumerate(detail_urls)
     }
     agent, fetcher, db = await _agent(
         tmp_path,
-        FakeLLMResearchDetail(),
+        QueueSaturationRetryLLM(),
         pages=pages,
         fetcher_cls=FakeHumanFetcher,
-        resume_mode=True,
         pipeline_queue_cap=2,
         pipeline_llm_workers=1,
         pipeline_db_workers=1,
     )
-    async with db.session() as session:
-        for index, homepage in enumerate(pages):
-            stale_snapshot = (
-                "stale profile without research " + ("x" * 400)
-                if index == 0
-                else ""
-            )
-            await crawler_db.upsert_crawl_task(
-                session,
-                university="TestU",
-                org_unit_name="CS",
-                org_unit_url="https://www.example.edu.cn/cs",
-                source_url=homepage,
-                page_url=homepage,
-                page_hash=f"empty-homepage-{index}",
-                task_kind=CrawlTaskKind.DETAIL_PAGE,
-                page_text_snapshot=stale_snapshot,
-                allowed_tools='["save_professors"]',
-                status=CrawlTaskStatus.RETRY,
-                priority=-10,
-                last_error="completion_recrawl_missing_profile_fields",
-            )
-
-    await asyncio.wait_for(agent._extract_professors([], recovery_limit=5), timeout=10)
-
-    assert fetcher.calls == list(pages)
-    assert int(agent._pipeline_stats.get("recovery_refetched", 0)) == 5
-    assert int(agent._pipeline_stats.get("recovery_enqueued", 0)) == 5
-    assert int(agent._pipeline_stats.get("recovery_consumed", 0)) == 5
-    async with db.session() as session:
-        summary = await crawler_db.summarize_crawl_task_status(session)
-        tasks = (await session.execute(select(CrawlTask))).scalars().all()
-    assert summary[CrawlTaskStatus.DONE.value] == 5
-    assert all("研究方向" in task.page_text_snapshot for task in tasks)
-    await db.close()
-
-
-async def test_strict_resume_recovers_more_tasks_than_queue_cap_without_fetching(tmp_path):
-    agent, fetcher, db = await _agent(
-        tmp_path,
-        FakeLLM(),
-        pages={},
-        resume_mode=True,
-        pipeline_queue_cap=2,
-        pipeline_llm_workers=1,
-        pipeline_db_workers=1,
-    )
-    async with db.session() as session:
-        await crawler_db.log_crawl(
-            session,
-            "https://www.example.edu.cn/",
-            CrawlLogStatus.SUCCESS,
-            "seeded-history",
+    for url in detail_urls:
+        await agent.graph_frontier.ensure_url_node(
+            url=url,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.PENDING,
         )
-        for index in range(5):
-            await crawler_db.upsert_crawl_task(
-                session,
-                university="TestU",
-                org_unit_name="CS",
-                org_unit_url="https://www.example.edu.cn/cs",
-                source_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_url=f"https://www.example.edu.cn/cs/faculty/{index}",
-                page_hash=f"strict-resume-task-{index}",
-                page_text_snapshot=f"faculty list Ada {index}",
-                allowed_tools='["save_professors"]',
-                status=CrawlTaskStatus.PENDING,
-            )
 
-    result = await asyncio.wait_for(agent.run(), timeout=10)
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)
 
-    assert result.status == CrawlStatus.COMPLETED.value
-    assert fetcher.calls == []
-    assert int(agent._pipeline_stats.get("processed_tasks", 0)) == 5
     async with db.session() as session:
-        summary = await crawler_db.summarize_crawl_task_status(session)
-    assert summary[CrawlTaskStatus.PENDING.value] == 0
-    assert summary[CrawlTaskStatus.RETRY.value] == 0
-    assert summary[CrawlTaskStatus.IN_PROGRESS.value] == 0
-    assert summary[CrawlTaskStatus.DONE.value] == 5
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(
+                    CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value
+                )
+            )
+        ).scalars().all()
+        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
+    # Queue cap 2 with 5 nodes: the worker's invalid-JSON retry is internal (no
+    # re-enqueue), so a full queue cannot deadlock; every node still reaches DONE.
+    assert len(detail_nodes) == 5
+    assert all(node.status == CrawlGraphNodeStatus.DONE.value for node in detail_nodes)
+    assert any(failure.failure_type == "invalid_json" and failure.resolver == "retry" for failure in failures)
     await db.close()
 
 
@@ -3038,230 +2855,6 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
     assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
     assert rows[1].page_hash == incoming_hash
     assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
-    await db.close()
-
-
-async def test_recovery_refetches_empty_completion_detail_task_and_updates_research(tmp_path):
-    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
-    agent, fetcher, db = await _agent(
-        tmp_path,
-        FakeLLMResearchDetail(),
-        pages={
-            homepage: FetchResult(
-                homepage,
-                "Ada 教授\n研究方向: systems",
-                [],
-                200,
-            ),
-        },
-        fetcher_cls=FakeHumanFetcher,
-        resume_mode=True,
-    )
-    async with db.session() as session:
-        await crawler_db.upsert_professor(
-            session,
-            {
-                "name": "Ada",
-                "org_unit_name": "CS",
-                "org_unit_url": "https://www.example.edu.cn/cs",
-                "homepage": homepage,
-                "source_url": "https://www.example.edu.cn/cs/faculty",
-            },
-        )
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="CS",
-            org_unit_url="https://www.example.edu.cn/cs",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="empty-homepage",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot="",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.RETRY,
-            priority=-10,
-            last_error="completion_recrawl_missing_research_areas",
-        )
-
-    await agent._extract_professors([], recovery_limit=1)
-
-    assert fetcher.calls == [homepage]
-    async with db.session() as session:
-        professor = (await session.execute(select(Professor).where(Professor.name == "Ada"))).scalar_one()
-        task = (await session.execute(select(CrawlTask))).scalar_one()
-        assert professor.research_areas == "systems"
-        assert task.status == CrawlTaskStatus.DONE.value
-        assert task.page_hash != "empty-homepage"
-        assert "研究方向" in task.page_text_snapshot
-    await db.close()
-
-
-async def test_detail_context_marks_academician_when_llm_omits_flag(tmp_path):
-    agent, _fetcher, db = await _agent(tmp_path, FakeLLMAcademicianOmitted())
-    detail_url = "https://www.example.edu.cn/cs/info/liwei.htm"
-
-    await agent._extract_professors_from_page(
-        _QueuedUrl(detail_url, 1, "计算机学院"),
-        FetchResult(
-            detail_url,
-            "李未，北京航空航天大学计算机学院教授，博士生导师，中国科学院院士。李未院士是我国著名的计算机科学家。",
-            [],
-            200,
-        ),
-        "save professors",
-        detail_mode=True,
-        requested_url=detail_url,
-    )
-
-    async with db.session() as session:
-        professors = (await session.execute(select(Professor).where(Professor.name == "李未"))).scalars().all()
-        academician = (await session.execute(select(Academician).where(Academician.name == "李未"))).scalar_one()
-        assert professors == []
-        assert academician.title == "院士"
-    await db.close()
-
-
-async def test_detail_context_does_not_mark_relation_academician_as_self(tmp_path):
-    agent, _fetcher, db = await _agent(tmp_path, FakeLLMRelationAcademicianFlag())
-    detail_url = "https://www.example.edu.cn/cs/info/lei.htm"
-
-    await agent._extract_professors_from_page(
-        _QueuedUrl(detail_url, 1, "计算机学院"),
-        FetchResult(
-            detail_url,
-            "雷文强，教授。与荷兰皇家科学院院士Maarten de Rijke教授等世界一流学者合作。",
-            [],
-            200,
-        ),
-        "save professors",
-        detail_mode=True,
-        requested_url=detail_url,
-    )
-
-    async with db.session() as session:
-        professor = (await session.execute(select(Professor).where(Professor.name == "雷文强"))).scalar_one()
-        academicians = (await session.execute(select(Academician).where(Academician.name == "雷文强"))).scalars().all()
-        assert professor.title == "教授"
-        assert academicians == []
-    await db.close()
-
-
-async def test_recovery_keeps_blocked_completion_detail_task_retry_without_llm(tmp_path):
-    homepage = "https://www.example.edu.cn/cs/info/1001/blocked.htm"
-    agent, fetcher, db = await _agent(
-        tmp_path,
-        FakeLLMResearchDetail(),
-        pages={
-            homepage: FetchResult(
-                homepage,
-                "",
-                [],
-                403,
-                block_reason="waf",
-            ),
-        },
-        fetcher_cls=FakeHumanFetcher,
-        resume_mode=True,
-    )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="CS",
-            org_unit_url="https://www.example.edu.cn/cs",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="empty-homepage",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot="",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.RETRY,
-            priority=-10,
-            last_error="completion_recrawl_missing_research_areas",
-        )
-
-    await agent._extract_professors([], recovery_limit=1)
-
-    assert fetcher.calls == [homepage]
-    async with db.session() as session:
-        task = (await session.execute(select(CrawlTask))).scalar_one()
-        failures = (await session.execute(select(CrawlExtractionFailure))).scalars().all()
-        assert task.status == CrawlTaskStatus.RETRY.value
-        assert task.last_error == "completion_recrawl_refetch_blocked:waf"
-        assert not any(failure.failure_type == "no_structured_data" for failure in failures)
-    await db.close()
-
-
-async def test_recovery_uses_existing_nonempty_snapshot_without_refetch(tmp_path):
-    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
-    agent, fetcher, db = await _agent(
-        tmp_path,
-        FakeLLM(),
-        pages={},
-        fetcher_cls=FakeHumanFetcher,
-        resume_mode=True,
-    )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="CS",
-            org_unit_url="https://www.example.edu.cn/cs",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="existing-snapshot",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot="faculty list Ada",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.RETRY,
-            last_error="invalid_json_retry",
-        )
-
-    await agent._extract_professors([], recovery_limit=1)
-
-    assert fetcher.calls == []
-    async with db.session() as session:
-        task = (await session.execute(select(CrawlTask))).scalar_one()
-        assert task.status == CrawlTaskStatus.DONE.value
-        assert task.page_hash == "existing-snapshot"
-    await db.close()
-
-
-async def test_recovery_uses_refetched_snapshot_without_repeating_refetch(tmp_path):
-    homepage = "https://www.example.edu.cn/cs/info/1001/ada.htm"
-    agent, fetcher, db = await _agent(
-        tmp_path,
-        FakeLLMResearchDetail(),
-        pages={},
-        fetcher_cls=FakeHumanFetcher,
-        resume_mode=True,
-    )
-    async with db.session() as session:
-        await crawler_db.upsert_crawl_task(
-            session,
-            university="TestU",
-            org_unit_name="CS",
-            org_unit_url="https://www.example.edu.cn/cs",
-            source_url=homepage,
-            page_url=homepage,
-            page_hash="refetched-homepage",
-            task_kind=CrawlTaskKind.DETAIL_PAGE,
-            page_text_snapshot="Ada 教授\n研究方向: systems",
-            allowed_tools='["save_professors"]',
-            status=CrawlTaskStatus.RETRY,
-            priority=-10,
-            last_error="completion_recrawl_refetched",
-        )
-
-    await agent._extract_professors([], recovery_limit=1)
-
-    assert fetcher.calls == []
-    assert int(agent._pipeline_stats.get("recovery_refetch_skipped_with_snapshot", 0)) == 1
-    assert int(agent._pipeline_stats.get("recovery_consumed", 0)) == 1
-    async with db.session() as session:
-        task = (await session.execute(select(CrawlTask))).scalar_one()
-        assert task.status == CrawlTaskStatus.DONE.value
     await db.close()
 
 
@@ -5045,21 +4638,27 @@ async def test_enrich_skips_detail_urls_when_anchor_matches_enriched_professor(t
         ),
     )
 
-    processed_urls: list[str] = []
+    current = _QueuedUrl(url=list_url, depth=2, label="软件学院", org_unit_id=None)
+    await agent._enrich_profiles_with_detail_backend(current, fetched, "")
 
-    async def _capture(self, urls, current, skills):
-        processed_urls.extend(getattr(item, "queue_url", item) for item in urls)
-
-    import agents.crawler.agent_detail as _agent_detail
-    original = _agent_detail.process_detail_urls_with_human
-    _agent_detail.process_detail_urls_with_human = _capture
-    try:
-        current = _QueuedUrl(url=list_url, depth=2, label="软件学院", org_unit_id=None)
-        await agent._enrich_profiles_with_detail_backend(current, fetched, "")
-    finally:
-        _agent_detail.process_detail_urls_with_human = original
-
-    assert processed_urls == [detail_new]
+    async with db.session() as session:
+        nodes = {
+            node.url: node
+            for node in (
+                await session.execute(
+                    select(CrawlGraphNode).where(
+                        CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value
+                    )
+                )
+            ).scalars().all()
+        }
+    # Upsert-only: the new candidate is left PENDING for the claim-driver; the link
+    # whose anchor matched an already-enriched professor is recorded SKIPPED with a
+    # reason (B5), never silently dropped, and enrich does not fetch inline.
+    assert nodes[detail_new].status == CrawlGraphNodeStatus.PENDING.value
+    assert nodes[detail_enriched].status == CrawlGraphNodeStatus.SKIPPED.value
+    assert nodes[detail_enriched].last_error == "already_enriched_name"
+    assert fetcher.calls == []
     assert int(agent._pipeline_stats.get("detail_links_dropped_already_enriched", 0)) == 1
     await db.close()
 
@@ -5188,7 +4787,10 @@ async def test_detail_graph_dedupes_url_and_keeps_multiple_source_edges(tmp_path
 
     assert len(detail_nodes) == 1
     assert len(detail_edges) == 2
-    assert fetcher.calls == [detail_url]
+    # Upsert-only: the same profile URL discovered from two list pages collapses to
+    # ONE deduped node while keeping both source edges, and discovery never fetches
+    # inline (the claim-driver fetches the single node later).
+    assert fetcher.calls == []
     await db.close()
 
 
@@ -5814,17 +5416,7 @@ async def test_detail_cap_deferred_graph_nodes_are_skipped_not_pending(tmp_path)
         ),
     )
     current = _QueuedUrl(url=list_url, depth=1, label="CS")
-    processed: list[str] = []
-    original = agent._process_detail_urls_with_human
-
-    async def _capture(urls, current_arg, skills):
-        processed.extend(getattr(item, "queue_url", str(item)) for item in urls)
-
-    agent._process_detail_urls_with_human = _capture
-    try:
-        await agent._enrich_profiles_with_detail_backend(current, fetched, "")
-    finally:
-        agent._process_detail_urls_with_human = original
+    await agent._enrich_profiles_with_detail_backend(current, fetched, "")
 
     async with db.session() as session:
         nodes = (
@@ -5837,7 +5429,10 @@ async def test_detail_cap_deferred_graph_nodes_are_skipped_not_pending(tmp_path)
         ).scalars().all()
 
     node_by_url = {node.url: node for node in nodes}
-    assert processed == [detail_a]
+    # Upsert-only: under the per-org cap, the first candidate is left PENDING for the
+    # claim-driver and the deferred one is recorded SKIPPED (not PENDING); enrich
+    # never fetches inline.
+    assert _fetcher.calls == []
     assert node_by_url[detail_a].status == CrawlGraphNodeStatus.PENDING.value
     assert node_by_url[detail_b].status == CrawlGraphNodeStatus.SKIPPED.value
     assert node_by_url[detail_b].last_error == "detail_cap_deferred"
@@ -5890,6 +5485,339 @@ async def test_graph_frontier_retry_node_is_reprocessed_on_resume(tmp_path):
     assert fetcher.calls == [faculty_url, faculty_url, detail_url]
     assert done_node.status == CrawlGraphNodeStatus.DONE.value
     assert professor.org_unit_name == "CS"
+    await db.close()
+
+
+class _UrlNamedDetailLLM(FakeLLM):
+    """Saves one distinct professor per detail page (name derived from the URL),
+    so concurrency/recovery tests get unique people instead of one deduped row."""
+
+    async def chat(self, messages, tools=None, tool_handlers=None):
+        payload = json.loads(messages[-1]["content"])
+        if payload.get("state") == "EXTRACT_PROFESSORS" and "faculty" in payload.get("page_text", ""):
+            url = payload["url"]
+            result = await tool_handlers["save_professors"](
+                org_unit_name="CS",
+                org_unit_url="https://www.example.edu.cn/cs",
+                source_url=url,
+                professors=[{"name": f"Prof {url.rsplit('/', 1)[-1]}", "title": "Professor"}],
+            )
+            return LLMResult("", [ToolCallRecord("save_professors", {"professors": []}, result)])
+        return await super().chat(messages, tools=tools, tool_handlers=tool_handlers)
+
+
+async def test_driver_and_workers_no_locking_correct_counts(tmp_path):
+    # Driver + N LLM workers over a multi-detail subtree with queue_cap < node count:
+    # no `database is locked`, every node DONE, one professor per node (§6).
+    detail_urls = [f"https://www.example.edu.cn/cs/info/1001/p{i}.htm" for i in range(12)]
+    pages = {
+        "https://www.example.edu.cn/cs/faculty": FetchResult(
+            "https://www.example.edu.cn/cs/faculty", "faculty roster", detail_urls, 200
+        ),
+    }
+    for i, url in enumerate(detail_urls):
+        pages[url] = FetchResult(url, f"faculty detail Prof {i} Professor", [], 200)
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        _UrlNamedDetailLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        pipeline_llm_workers=4,
+        pipeline_queue_cap=4,
+    )
+    await agent.graph_frontier.ensure_url_node(
+        url="https://www.example.edu.cn/cs/faculty",
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await asyncio.wait_for(
+        agent._extract_professors(
+            [_QueuedUrl("https://www.example.edu.cn/cs/faculty", 1, label="计算机学院")]
+        ),
+        timeout=20,
+    )
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(
+                    CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value
+                )
+            )
+        ).scalars().all()
+    assert len(professors) == 12
+    assert len(detail_nodes) == 12
+    assert all(node.status == CrawlGraphNodeStatus.DONE.value for node in detail_nodes)
+    await db.close()
+
+
+async def test_extract_professors_recovers_mixed_graph(tmp_path):
+    # A mixed graph (DONE/IN_PROGRESS/PENDING) recovered on a fresh run: DONE stays
+    # skipped, IN_PROGRESS is reset to RETRY and reclaimed (B1), PENDING is processed.
+    done_url = "https://www.example.edu.cn/cs/info/1001/done.htm"
+    stale_url = "https://www.example.edu.cn/cs/info/1001/stale.htm"
+    pending_url = "https://www.example.edu.cn/cs/info/1001/pending.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        _UrlNamedDetailLLM(),
+        pages={
+            stale_url: FetchResult(stale_url, "faculty detail Prof stale Professor", [], 200),
+            pending_url: FetchResult(pending_url, "faculty detail Prof pending Professor", [], 200),
+        },
+        fetcher_cls=FakeHumanFetcher,
+    )
+    async with db.session() as session:
+        await crawler_db.upsert_graph_node(
+            session, node_type=CrawlGraphNodeType.DETAIL_URL,
+            url=done_url, org_unit_name="CS", status=CrawlGraphNodeStatus.DONE,
+        )
+        await crawler_db.upsert_graph_node(
+            session, node_type=CrawlGraphNodeType.DETAIL_URL,
+            url=stale_url, org_unit_name="CS", status=CrawlGraphNodeStatus.IN_PROGRESS,
+        )
+        await crawler_db.upsert_graph_node(
+            session, node_type=CrawlGraphNodeType.DETAIL_URL,
+            url=pending_url, org_unit_name="CS", status=CrawlGraphNodeStatus.PENDING,
+        )
+
+    await agent._extract_professors([])  # resume: claim globally
+
+    assert done_url not in fetcher.calls
+    assert sorted(fetcher.calls) == sorted([pending_url, stale_url])
+    async with db.session() as session:
+        statuses = {
+            node.url: node.status
+            for node in (await session.execute(select(CrawlGraphNode))).scalars().all()
+        }
+        professors = (await session.execute(select(Professor))).scalars().all()
+    assert statuses[done_url] == CrawlGraphNodeStatus.DONE.value
+    assert statuses[stale_url] == CrawlGraphNodeStatus.DONE.value
+    assert statuses[pending_url] == CrawlGraphNodeStatus.DONE.value
+    assert len(professors) == 2
+    await db.close()
+
+
+async def test_extract_professors_claims_faculty_then_detail_from_graph(tmp_path):
+    # The driver claims the seeded faculty-list node, traverses it, discovers the
+    # detail link as a PENDING node, then claims+fetches it (serially) and saves.
+    faculty_url = "https://www.example.edu.cn/cs/faculty"
+    detail_url = "https://www.example.edu.cn/cs/info/1001/ada.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={
+            faculty_url: FetchResult(faculty_url, "faculty roster", [detail_url], 200),
+            detail_url: FetchResult(detail_url, "faculty detail Ada Professor", [], 200),
+        },
+        fetcher_cls=FakeHumanFetcher,
+    )
+    await agent.graph_frontier.ensure_url_node(
+        url=faculty_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await agent._extract_professors([_QueuedUrl(faculty_url, 1, label="计算机学院")])
+
+    assert fetcher.calls == [faculty_url, detail_url]
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        statuses = {
+            node.url: node.status
+            for node in (await session.execute(select(CrawlGraphNode))).scalars().all()
+        }
+    assert [p.name for p in professors] == ["Ada"]
+    assert statuses[faculty_url] == CrawlGraphNodeStatus.DONE.value
+    assert statuses[detail_url] == CrawlGraphNodeStatus.DONE.value
+    await db.close()
+
+
+async def test_driver_never_fetches_concurrently(tmp_path):
+    # WAF single-fetch invariant (§4.3): even with several detail workers, the
+    # single driver coroutine must never enter fetch concurrently.
+    faculty_url = "https://www.example.edu.cn/cs/faculty"
+    detail_urls = [f"https://www.example.edu.cn/cs/info/1001/{c}.htm" for c in "abc"]
+    pages = {faculty_url: FetchResult(faculty_url, "faculty roster", detail_urls, 200)}
+    for index, url in enumerate(detail_urls):
+        pages[url] = FetchResult(url, f"faculty detail {chr(65 + index)} Professor", [], 200)
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        _UrlNamedDetailLLM(),
+        pages=pages,
+        fetcher_cls=FakeHumanFetcher,
+        pipeline_llm_workers=4,
+        pipeline_queue_cap=8,
+    )
+
+    in_flight = 0
+    max_in_flight = 0
+    original_fetch = agent._fetch_url
+
+    async def instrumented_fetch(url, depth, **kwargs):
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            await asyncio.sleep(0)  # yield so a concurrent fetch could interleave if one existed
+            return await original_fetch(url, depth, **kwargs)
+        finally:
+            in_flight -= 1
+
+    agent._fetch_url = instrumented_fetch
+
+    await agent.graph_frontier.ensure_url_node(
+        url=faculty_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await asyncio.wait_for(
+        agent._extract_professors([_QueuedUrl(faculty_url, 1, label="计算机学院")]),
+        timeout=15,
+    )
+
+    assert max_in_flight == 1  # WAF single-fetch invariant
+    await db.close()
+
+
+async def test_driver_redirect_to_noise_writes_single_skipped_node_no_task(tmp_path):
+    # B6: a detail fetch that redirects off-section to a noise page is recorded as a
+    # single SKIPPED node with a reason and creates no crawl_task side-record.
+    requested = "https://www.example.edu.cn/cs/info/1001/x.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={requested: FetchResult("https://www.example.edu.cn/news/notice.htm", "通知公告", [], 200)},
+        fetcher_cls=FakeHumanFetcher,
+    )
+    await agent.graph_frontier.ensure_url_node(
+        url=requested,
+        node_type=CrawlGraphNodeType.DETAIL_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await agent._extract_professors([])  # empty seed -> claim globally
+
+    async with db.session() as session:
+        node = (
+            await session.execute(
+                select(CrawlGraphNode).where(CrawlGraphNode.url == requested)
+            )
+        ).scalars().first()
+        tasks = (await session.execute(select(CrawlTask))).scalars().all()
+    assert node.status == CrawlGraphNodeStatus.SKIPPED.value
+    assert node.last_error  # a concrete skip reason, never empty
+    assert all("/cs/info/1001/x.htm" not in (task.source_url or "") for task in tasks)
+    await db.close()
+
+
+async def test_driver_fetch_failure_is_transient_retry(tmp_path):
+    # Transient classification: a failed fetch routes the node to RETRY (re-claimable
+    # next run), increments the attempt, and records "fetch_failed".
+    faculty_url = "https://www.example.edu.cn/cs/faculty"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={},
+        fetcher_cls=FakeHumanFetcher,
+    )
+    original_fetch = agent._fetch_url
+
+    async def failing_fetch(url, depth, **kwargs):
+        if url == faculty_url:
+            return None
+        return await original_fetch(url, depth, **kwargs)
+
+    agent._fetch_url = failing_fetch
+    await agent.graph_frontier.ensure_url_node(
+        url=faculty_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await agent._extract_professors([])
+
+    async with db.session() as session:
+        node = (
+            await session.execute(
+                select(CrawlGraphNode).where(CrawlGraphNode.url == faculty_url)
+            )
+        ).scalars().first()
+    assert node.status == CrawlGraphNodeStatus.RETRY.value
+    assert node.attempt_count == 1
+    assert node.last_error == "fetch_failed"
+    await db.close()
+
+
+async def test_detail_drop_is_reasoned_and_counted(tmp_path):
+    # B5: a detail link already visited is dropped as a SKIPPED node WITH a reason and
+    # a counter, and is never fetched.
+    faculty_url = "https://www.example.edu.cn/cs/faculty"
+    seen_detail = "https://www.example.edu.cn/cs/info/1001/seen.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        pages={faculty_url: FetchResult(faculty_url, "faculty roster", [seen_detail], 200)},
+        fetcher_cls=FakeHumanFetcher,
+    )
+    agent.visited_urls.add(seen_detail)
+    await agent.graph_frontier.ensure_url_node(
+        url=faculty_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+    await agent._extract_professors([_QueuedUrl(faculty_url, 1, label="计算机学院")])
+
+    async with db.session() as session:
+        dropped = (
+            await session.execute(
+                select(CrawlGraphNode).where(CrawlGraphNode.url == seen_detail)
+            )
+        ).scalars().first()
+    assert dropped is not None
+    assert dropped.status == CrawlGraphNodeStatus.SKIPPED.value
+    assert dropped.last_error == "already_visited"
+    assert int(agent._pipeline_stats.get("detail_links_skipped_visited", 0)) == 1
+    assert seen_detail not in fetcher.calls
+    await db.close()
+
+
+async def test_duplicate_detail_url_across_orgs_extracted_once(tmp_path):
+    # B4: two org-scoped detail nodes for the SAME profile URL (as persisted from a
+    # prior run under two colleges) are fetched + extracted exactly once; the
+    # duplicate ends SKIPPED. (Within a single run the in-memory visited set already
+    # dedups discovery; this guards the cross-run/claim path.)
+    detail_url = "https://www.example.edu.cn/info/1001/shared.htm"
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        _UrlNamedDetailLLM(),
+        pages={detail_url: FetchResult(detail_url, "faculty detail Ada Professor", [], 200)},
+        fetcher_cls=FakeHumanFetcher,
+    )
+    async with db.session() as session:
+        for org in ("计算机学院", "人工智能学院"):
+            await crawler_db.upsert_graph_node(
+                session,
+                node_type=CrawlGraphNodeType.DETAIL_URL,
+                url=detail_url,
+                org_unit_name=org,
+                status=CrawlGraphNodeStatus.PENDING,
+            )
+    await agent._extract_professors([])  # claim globally across both orgs
+
+    assert fetcher.calls.count(detail_url) == 1  # B4: fetched once, not twice
+    async with db.session() as session:
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(CrawlGraphNode.url == detail_url)
+            )
+        ).scalars().all()
+    statuses = sorted(node.status for node in detail_nodes)
+    assert statuses == [CrawlGraphNodeStatus.DONE.value, CrawlGraphNodeStatus.SKIPPED.value]
+    assert int(agent._pipeline_stats.get("detail_duplicate_url_skipped", 0)) == 1
     await db.close()
 
 
