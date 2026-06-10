@@ -26,6 +26,11 @@ _GRAPH_NODE_METADATA_KEYS = {
     "skip_reason",
 }
 
+# Per-attempt penalty subtracted from base_priority to compute claim-time
+# effective priority. Matches the legacy -5.0 attempt step in
+# mark_graph_node_status so claim ordering and backoff stay consistent.
+_ATTEMPT_BACKOFF_PENALTY = 5.0
+
 
 def graph_node_key(
     node_type: str | CrawlGraphNodeType,
@@ -291,6 +296,67 @@ async def list_ready_graph_nodes(
     return list(rows)
 
 
+async def claim_next_graph_node(
+    session: AsyncSession,
+    *,
+    node_types: Iterable[str | CrawlGraphNodeType] | None = None,
+    org_unit_names: Iterable[str] | None = None,
+    org_unit_ids: Iterable[int] | None = None,
+) -> CrawlGraphNode | None:
+    """Atomically claim the highest-priority ready node: select the best
+    PENDING/RETRY node and flip it to IN_PROGRESS in one transaction.
+
+    Ordering uses effective priority (base_priority - attempt_count * penalty)
+    so attempt-backoff is honored and survives re-discovery (B3). A single
+    driver makes the select-then-flip atomic by construction (spec §4.2).
+    """
+    filters: list[Any] = [
+        CrawlGraphNode.status.in_(
+            [CrawlGraphNodeStatus.PENDING.value, CrawlGraphNodeStatus.RETRY.value]
+        )
+    ]
+    if node_types:
+        type_values = [_enum_value(item) for item in node_types]
+        filters.append(CrawlGraphNode.type.in_(type_values))
+    normalized_names = [
+        normalize_org_unit_name(name, default="")
+        for name in (org_unit_names or [])
+        if normalize_org_unit_name(name, default="")
+    ]
+    normalized_ids = [int(org_unit_id) for org_unit_id in (org_unit_ids or []) if org_unit_id is not None]
+    org_filters: list[Any] = []
+    if normalized_names:
+        org_filters.append(CrawlGraphNode.org_unit_name.in_(normalized_names))
+    if normalized_ids:
+        org_filters.append(CrawlGraphNode.org_unit_id.in_(normalized_ids))
+    if org_filters:
+        filters.append(or_(*org_filters))
+
+    effective_priority = CrawlGraphNode.base_priority - (
+        CrawlGraphNode.attempt_count * _ATTEMPT_BACKOFF_PENALTY
+    )
+    row = (
+        await session.execute(
+            select(CrawlGraphNode)
+            .where(and_(*filters))
+            .order_by(
+                effective_priority.desc(),
+                CrawlGraphNode.confidence.desc(),
+                CrawlGraphNode.depth.asc(),
+                CrawlGraphNode.attempt_count.asc(),
+                CrawlGraphNode.id.asc(),
+            )
+            .limit(1)
+        )
+    ).scalars().first()
+    if row is None:
+        return None
+    row.status = CrawlGraphNodeStatus.IN_PROGRESS.value
+    row.updated_at = _now_utc()
+    await session.flush()
+    return row
+
+
 async def recover_stale_in_progress_graph_nodes(session: AsyncSession) -> int:
     """Reset orphaned IN_PROGRESS graph nodes to RETRY (B1, spec §4.4).
 
@@ -477,6 +543,7 @@ def _resolve_status_on_upsert(current: str, incoming: str) -> str:
 
 
 __all__ = [
+    "claim_next_graph_node",
     "get_graph_node_by_key",
     "graph_node_key",
     "list_ready_graph_nodes",

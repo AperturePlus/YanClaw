@@ -19,6 +19,7 @@ from agents.crawler.db.page_cache import (
 from agents.crawler.db.graph import (
     get_graph_node_by_key,
     graph_node_key,
+    claim_next_graph_node,
     list_ready_graph_nodes,
     mark_graph_node_status,
     recover_stale_in_progress_graph_nodes,
@@ -79,6 +80,7 @@ __all__ = [
     "cleanup_excluded_org_units",
     "cleanup_non_edu_cn_crawl_tasks",
     "cleanup_org_unit_scope_pollution",
+    "claim_next_graph_node",
     "count_academicians",
     "count_professors",
     "count_retryable_fetch_failure_urls",

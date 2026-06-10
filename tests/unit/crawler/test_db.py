@@ -2152,3 +2152,71 @@ async def test_recover_stale_in_progress_graph_nodes_resets_only_in_progress(tmp
         assert pending_row.status == CrawlGraphNodeStatus.PENDING.value
         assert done_row.status == CrawlGraphNodeStatus.DONE.value
     await db.close()
+
+
+async def test_claim_next_graph_node_honors_backoff_across_rediscovery(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "graph_claim_backoff.db"))
+    await db.init_db()
+    async with db.session() as session:
+        fresh = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/fresh",
+            org_unit_name="CS",
+            priority_score=80,
+        )
+        backed_off = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/backed-off",
+            org_unit_name="CS",
+            priority_score=80,
+        )
+        # Two retry attempts back this node off (attempt_count -> 2).
+        await crawler_db.mark_graph_node_status(
+            session, backed_off.id, status=CrawlGraphNodeStatus.RETRY, increment_attempt=True
+        )
+        await crawler_db.mark_graph_node_status(
+            session, backed_off.id, status=CrawlGraphNodeStatus.RETRY, increment_attempt=True
+        )
+        # Re-discovery raises its intrinsic priority again — must NOT erase backoff (B3).
+        await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/backed-off",
+            org_unit_name="CS",
+            priority_score=80,
+        )
+
+        first = await crawler_db.claim_next_graph_node(session)
+        assert first.id == fresh.id
+        assert first.status == CrawlGraphNodeStatus.IN_PROGRESS.value
+
+        second = await crawler_db.claim_next_graph_node(session)
+        assert second.id == backed_off.id
+        assert second.status == CrawlGraphNodeStatus.IN_PROGRESS.value
+
+        # Both nodes are now IN_PROGRESS, so nothing is claimable.
+        assert await crawler_db.claim_next_graph_node(session) is None
+    await db.close()
+
+
+async def test_claim_next_graph_node_filters_by_node_type(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "graph_claim_filter.db"))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=80,
+        )
+        # No DETAIL_URL nodes exist, so a DETAIL-scoped claim returns None.
+        assert (
+            await crawler_db.claim_next_graph_node(
+                session, node_types=[CrawlGraphNodeType.DETAIL_URL]
+            )
+            is None
+        )
+    await db.close()
