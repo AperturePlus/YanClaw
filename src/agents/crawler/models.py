@@ -266,6 +266,7 @@ class CrawlGraphNode(Base):
     org_unit_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default=CrawlGraphNodeStatus.PENDING.value, index=True)
     priority_score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    base_priority: Mapped[float] = mapped_column(Float, default=0.0)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     depth: Mapped[int] = mapped_column(Integer, default=0)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)

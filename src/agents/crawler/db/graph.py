@@ -104,6 +104,7 @@ async def upsert_graph_node(
             org_unit_id=normalized_org_unit_id,
             status=status_value,
             priority_score=float(priority_score or 0.0),
+            base_priority=float(priority_score or 0.0),
             confidence=float(confidence or 0.0),
             depth=max(0, int(depth or 0)),
             attempt_count=max(0, int(attempt_count or 0)),
@@ -134,6 +135,9 @@ async def upsert_graph_node(
         changed = True
     if float(priority_score or 0.0) > float(row.priority_score or 0.0):
         row.priority_score = float(priority_score or 0.0)
+        changed = True
+    if float(priority_score or 0.0) > float(row.base_priority or 0.0):
+        row.base_priority = float(priority_score or 0.0)
         changed = True
     if float(confidence or 0.0) > float(row.confidence or 0.0):
         row.confidence = float(confidence or 0.0)

@@ -2035,3 +2035,39 @@ async def test_ensure_runtime_schema_creates_crawl_graph_tables_for_existing_db(
 
     assert set(tables) == {"crawl_graph_nodes", "crawl_graph_edges"}
     await db.close()
+
+
+async def test_graph_node_tracks_base_priority_raise_only(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "graph_base_priority.db"))
+    await db.init_db()
+    async with db.session() as session:
+        node = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=80,
+        )
+        assert node.base_priority == 80.0
+
+        # Higher re-discovery raises base_priority.
+        raised = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=95,
+        )
+        assert raised.id == node.id
+        assert raised.base_priority == 95.0
+
+        # Lower re-discovery does NOT lower base_priority.
+        lowered = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            priority_score=10,
+        )
+        assert lowered.base_priority == 95.0
+    await db.close()
