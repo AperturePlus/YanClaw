@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.crawler.db.utils import _normalize_url, _now_utc
@@ -291,6 +291,26 @@ async def list_ready_graph_nodes(
     return list(rows)
 
 
+async def recover_stale_in_progress_graph_nodes(session: AsyncSession) -> int:
+    """Reset orphaned IN_PROGRESS graph nodes to RETRY (B1, spec §4.4).
+
+    The mirror of recover_stale_in_progress_crawl_tasks: a single driver owns
+    IN_PROGRESS, so on run start any IN_PROGRESS node is a crash leftover and
+    must become claimable again.
+    """
+    result = await session.execute(
+        update(CrawlGraphNode)
+        .where(CrawlGraphNode.status == CrawlGraphNodeStatus.IN_PROGRESS.value)
+        .values(
+            status=CrawlGraphNodeStatus.RETRY.value,
+            last_error="recovered_stale_in_progress",
+            updated_at=_now_utc(),
+        )
+    )
+    await session.flush()
+    return int(result.rowcount or 0)
+
+
 async def record_graph_node_result(
     session: AsyncSession,
     *,
@@ -461,6 +481,7 @@ __all__ = [
     "graph_node_key",
     "list_ready_graph_nodes",
     "mark_graph_node_status",
+    "recover_stale_in_progress_graph_nodes",
     "record_graph_node_result",
     "upsert_graph_edge",
     "upsert_graph_node",

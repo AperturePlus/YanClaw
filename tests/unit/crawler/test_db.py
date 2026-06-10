@@ -2113,3 +2113,42 @@ async def test_graph_node_rediscovery_reopens_failed_but_keeps_done_sticky(tmp_p
         assert still_done.id == done.id
         assert still_done.status == CrawlGraphNodeStatus.DONE.value
     await db.close()
+
+
+async def test_recover_stale_in_progress_graph_nodes_resets_only_in_progress(tmp_path):
+    db = DatabaseManager(sqlite_url(tmp_path / "graph_recover.db"))
+    await db.init_db()
+    async with db.session() as session:
+        stale = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.IN_PROGRESS,
+        )
+        pending = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            url="https://cs.example.edu.cn/faculty/2.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.PENDING,
+        )
+        done = await crawler_db.upsert_graph_node(
+            session,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            url="https://cs.example.edu.cn/info/x.htm",
+            org_unit_name="CS",
+            status=CrawlGraphNodeStatus.DONE,
+        )
+
+        recovered = await crawler_db.recover_stale_in_progress_graph_nodes(session)
+        assert recovered == 1
+
+        stale_row = await session.get(CrawlGraphNode, stale.id)
+        pending_row = await session.get(CrawlGraphNode, pending.id)
+        done_row = await session.get(CrawlGraphNode, done.id)
+        assert stale_row.status == CrawlGraphNodeStatus.RETRY.value
+        assert stale_row.last_error == "recovered_stale_in_progress"
+        assert pending_row.status == CrawlGraphNodeStatus.PENDING.value
+        assert done_row.status == CrawlGraphNodeStatus.DONE.value
+    await db.close()
