@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from urllib.parse import urlparse
 
 
 STRONG_NOISE_URL_TOKENS = (
@@ -104,10 +105,68 @@ RECENT_NEWS_OPENING_PREFIXES = (
 )
 
 
+POSTDOC_TEXT_LABELS = (
+    "博士后",
+    "博后",
+    "师资博士后",
+    "postdoctoral",
+    "postdoc",
+    "post-doc",
+    "post doc",
+)
+# URL path-segment stems that denote a postdoc section/roster.
+POSTDOC_URL_STEMS = (
+    "bsh",
+    "boshihou",
+    "postdoc",
+    "postdoctoral",
+    "post-doc",
+    "post_doc",
+)
+_POSTDOC_LABEL_LOWER = tuple(label.lower() for label in POSTDOC_TEXT_LABELS)
+# A breadcrumb trail whose *bolded* terminal crumb (the one right after a 师资/faculty
+# ancestor) names the page's own section. Keyed on the bolded `**…**` terminal so the
+# site-wide nav menu — which lists 博士后 on every page, un-bolded — does not match.
+_BREADCRUMB_TERMINAL_RE = re.compile(
+    r"\[(?:师资队伍|师资力量|师资|教师队伍|教工队伍)\]\([^)]*\)\s*_?/?_?\s*"
+    r"\[\*\*([^*\]]+)\*\*\]\(([^)]+)\)"
+)
+
+
+def _postdoc_url_segments(url: str) -> list[str]:
+    return [seg for seg in urlparse((url or "").lower()).path.split("/") if seg]
+
+
+def has_postdoc_url_stem(url: str) -> bool:
+    return any(seg.rsplit(".", 1)[0] in POSTDOC_URL_STEMS for seg in _postdoc_url_segments(url))
+
+
+def is_postdoc_page(url: str, text: str) -> bool:
+    """True when a profile/section page belongs to a postdoc (博士后) roster.
+
+    Either signal suffices:
+    - the URL path carries a postdoc section stem (e.g. ``…/teacher/bsh/…``);
+    - the page breadcrumb's *bolded* terminal crumb is a postdoc label, or links to a
+      postdoc-section URL. Keying on the bolded breadcrumb terminal (not bare text)
+      avoids the site nav, which lists 博士后 on every page.
+    """
+    if has_postdoc_url_stem(url):
+        return True
+    match = _BREADCRUMB_TERMINAL_RE.search(text or "")
+    if match:
+        label = match.group(1).lower()
+        href = match.group(2)
+        if any(stem in label for stem in _POSTDOC_LABEL_LOWER) or has_postdoc_url_stem(href):
+            return True
+    return False
+
+
 def should_skip_professor_llm(*, url: str, text: str) -> tuple[bool, str]:
     lowered_url = (url or "").lower()
     lowered_text = (text or "").lower()
 
+    if is_postdoc_page(url, text):
+        return True, "postdoc_section"
     if looks_like_notice_issuance_page(text):
         return True, "notice_issuance_title"
     if looks_like_event_kickoff_noise_page(text):

@@ -91,36 +91,69 @@ _FACULTY_SECTION_DIRS = frozenset(
         "people",
     }
 )
+# Path segments that explicitly denote a faculty *detail* page (an individual person),
+# not a roster/section directory. Sites like the SJTU AI school publish each professor at
+# an extensionless `…/facultydetails/<section>/<slug>` URL; the literal "detail" marker is
+# what distinguishes these from section/roster dirs (e.g. SCU `/szdw/<name>.htm`, which
+# stays a section), so this set is kept narrow and keyword-anchored.
+_FACULTY_DETAIL_PATH_MARKERS = frozenset(
+    {
+        "facultydetails",
+        "facultydetail",
+        "teacherdetails",
+        "teacherdetail",
+        "teachersdetails",
+        "professordetails",
+        "professordetail",
+        "szdwdetails",
+        "szdwdetail",
+    }
+)
 # Leaf stems that are landing/category pages, never an individual person.
 _NON_PROFILE_LEAF_STEMS = frozenset({"index", "list", "default", "main", "more", "all"})
 
 
-def _looks_like_faculty_section_profile_url(url: str) -> bool:
-    """True for `/<faculty-dir>/<person-slug>.html` profile pages.
-
-    SJTU CS and similar sites publish each professor at e.g.
-    `…/jiaoshiml/duanshengxiong.html` — a faculty-section directory plus a
-    pinyin name leaf. These are profile-detail pages, not list/followup pages.
-    """
-    parsed = urlparse((url or "").lower())
-    path = parsed.path
-    if not path.endswith((".htm", ".html", ".shtml")):
-        return False
-    segments = [seg for seg in path.split("/") if seg]
-    if len(segments) < 2:
-        return False
-    parent = segments[-2]
-    leaf = segments[-1].rsplit(".", 1)[0]
-    if parent not in _FACULTY_SECTION_DIRS:
-        return False
+def _is_person_slug_leaf(leaf: str) -> bool:
+    """True when a URL leaf looks like an individual person slug (pinyin/latin),
+    not a numeric id, landing page, or faculty section/category stem."""
     if not leaf or leaf.isdigit():
         return False
     if leaf in _NON_PROFILE_LEAF_STEMS or leaf in _FACULTY_CATEGORY_STEMS:
+        return False
+    if leaf in _FACULTY_DETAIL_PATH_MARKERS:
         return False
     if leaf.endswith(("list", "index")):
         return False
     # Person slug: latin/pinyin (optionally with digits/underscore), e.g. "duanshengxiong", "lisiming2".
     return bool(re.fullmatch(r"[a-z][a-z0-9_]*", leaf))
+
+
+def _looks_like_faculty_section_profile_url(url: str) -> bool:
+    """True for faculty profile-detail URLs of two shapes:
+
+    1. ``/<faculty-dir>/<person-slug>.html`` — a faculty-section directory plus a pinyin
+       name leaf (e.g. SJTU CS ``…/jiaoshiml/duanshengxiong.html``).
+    2. ``…/<facultydetails-marker>/[<section>/]<person-slug>`` — an explicit faculty-detail
+       path segment plus a person-slug leaf, **extension optional** (e.g. SJTU AI school
+       ``…/cn/facultydetails/zzjs/zhanglinfeng``).
+
+    Both are individual profile-detail pages, not list/followup pages.
+    """
+    parsed = urlparse((url or "").lower())
+    path = parsed.path
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) < 2:
+        return False
+    leaf = segments[-1].rsplit(".", 1)[0]
+    if not _is_person_slug_leaf(leaf):
+        return False
+    # Shape 1: faculty-section dir + slug leaf; requires a page extension.
+    if path.endswith((".htm", ".html", ".shtml")) and segments[-2] in _FACULTY_SECTION_DIRS:
+        return True
+    # Shape 2: an explicit faculty-detail marker anywhere in the path; extension optional.
+    if any(segment in _FACULTY_DETAIL_PATH_MARKERS for segment in segments):
+        return True
+    return False
 
 
 _DETAIL_URL_HINTS = (

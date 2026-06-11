@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping
 
+from agents.crawler.professor_noise import POSTDOC_TEXT_LABELS, has_postdoc_url_stem
+
 
 _NULLISH_TEXTS = {
     "",
@@ -528,6 +530,46 @@ def contains_retired_hint(*values: Any) -> bool:
             continue
         lowered = text.lower()
         if any(hint in text or hint in lowered for hint in _RETIRED_HINTS):
+            return True
+    return False
+
+
+# Bio opener that identifies the person themselves as a postdoc, e.g. "张赟博士后，…".
+_POSTDOC_BIO_TAIL = r"(?:师资|科研|专职|在站)?(?:博士后|博后)"
+
+
+def contains_postdoc_hint(
+    *,
+    name: Any = None,
+    title: Any = None,
+    bio: Any = None,
+    source_url: Any = None,
+) -> bool:
+    """True when a record is a postdoc (博士后) and should be excluded from `professors`.
+
+    Detected by section and profile text together:
+    - an explicit postdoc ``title`` (博士后 / 师资博士后 / postdoc);
+    - a postdoc section in ``source_url`` (e.g. ``…/teacher/bsh/…``);
+    - a ``bio`` that *opens* by identifying the person as a postdoc (e.g. "张赟博士后，…").
+
+    Deliberately conservative on the bio so real professors are never dropped: a later
+    mention as career history ("从事博士后研究") or a funding-program name
+    ("海纳博士后资助计划") does NOT match — only a leading self-identification does.
+    """
+    title_text = (normalize_optional_text(title) or "").lower()
+    if title_text and any(label.lower() in title_text for label in POSTDOC_TEXT_LABELS):
+        return True
+    if source_url and has_postdoc_url_stem(str(source_url)):
+        return True
+    bio_text = _to_text(bio)
+    if bio_text:
+        clean_name = normalize_optional_text(name)
+        if clean_name and re.match(
+            r"^\W*" + re.escape(clean_name) + r"\s*[，,、:：]?\s*" + _POSTDOC_BIO_TAIL,
+            bio_text,
+        ):
+            return True
+        if re.match(r"^\s*" + _POSTDOC_BIO_TAIL + r"[，,。、\s]", bio_text):
             return True
     return False
 

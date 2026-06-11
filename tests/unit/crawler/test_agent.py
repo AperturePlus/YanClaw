@@ -1298,6 +1298,67 @@ async def test_namedleaf_profile_becomes_detail_node_and_saves(tmp_path):
     await db.close()
 
 
+async def test_facultydetails_slug_profile_becomes_detail_node_and_saves(tmp_path):
+    # SJTU AI school shape: the 专职教师 roster `…/cn/faculty/zzjs` links each
+    # professor at an extensionless `…/cn/facultydetails/zzjs/<slug>` URL. That link
+    # must classify as a profile-detail URL (not a save-suppressed followup), so the
+    # driver creates a DETAIL_URL node, fetches it, extracts (snapshot fallback), and
+    # saves a Professor — while the roster list page is DONE.
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("This is an individual professor profile; I will not call a tool.")
+
+    roster_url = "https://soai.sjtu.edu.cn/cn/faculty/zzjs"
+    profile_url = "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/zhanglinfeng"
+    profile_text = (
+        "## 张林峰\n"
+        "姓名：张林峰\n"
+        "职称：助理教授\n"
+        "研究方向：人工智能模型与数据的压缩加速\n"
+        "电子邮箱：zhanglinfeng@sjtu.edu.cn\n"
+        "个人简介：张林峰，2024年在清华大学交叉信息学院获得博士学位，"
+        "当前研究方向为人工智能模型与数据的压缩加速。\n"
+    )
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={
+            roster_url: FetchResult(roster_url, "师资队伍 专职教师 roster", [profile_url], 200),
+            profile_url: FetchResult(profile_url, profile_text, [], 200),
+        },
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    agent.start_url = "https://soai.sjtu.edu.cn/"
+    await agent.graph_frontier.ensure_url_node(
+        url=roster_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="人工智能学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+
+    await asyncio.wait_for(
+        agent._extract_professors([_QueuedUrl(roster_url, 1, label="人工智能学院")]),
+        timeout=10,
+    )
+
+    assert fetcher.calls == [roster_url, profile_url]
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        nodes = {
+            node.url: (node.type, node.status)
+            for node in (await session.execute(select(CrawlGraphNode))).scalars().all()
+        }
+    assert len(professors) == 1
+    assert nodes[profile_url] == (
+        CrawlGraphNodeType.DETAIL_URL.value,
+        CrawlGraphNodeStatus.DONE.value,
+    )
+    assert nodes[roster_url][1] == CrawlGraphNodeStatus.DONE.value
+    await db.close()
+
+
 async def test_list_path_rescues_rich_profile(tmp_path):
     # Defense in depth (spec B5): even if a real profile is routed through the
     # list/followup path (e.g. future misclassification), a page that parses as a

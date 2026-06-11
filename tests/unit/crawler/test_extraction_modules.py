@@ -4,6 +4,7 @@ import pytest
 
 from agents.crawler.agent_detail import _looks_like_profile_detail_url
 from agents.crawler.text_repair import repair_mojibake_text
+from agents.crawler.professor_noise import should_skip_professor_llm
 from agents.crawler.agent import (
     _ExtractionOutcome as LegacyExtractionOutcome,
     _ExtractionTaskItem as LegacyExtractionTaskItem,
@@ -17,7 +18,7 @@ from agents.crawler.extraction_models import (
     SaveEvent,
 )
 from agents.crawler.extraction_payloads import ExtractionPayloadService
-from agents.crawler.sanitizer import normalize_name_key
+from agents.crawler.sanitizer import contains_postdoc_hint, normalize_name_key
 
 
 class _NoopLogger:
@@ -213,6 +214,106 @@ def test_faculty_section_profile_url_is_detail(url):
 )
 def test_non_profile_faculty_urls_are_not_detail(url):
     assert _looks_like_profile_detail_url(url) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # SJTU AI school publishes faculty at extensionless `…/facultydetails/<section>/<slug>`.
+        "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/zhanglinfeng",
+        "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/caoqinxiang",
+        # The "detail" marker also works with an extension and other section/detail dirs.
+        "https://example.edu.cn/cn/teacherdetails/js/lisiming.html",
+        "https://example.edu.cn/szdwdetails/szdw/wangwu",
+    ],
+)
+def test_faculty_detail_marker_profile_url_is_detail(url):
+    assert _looks_like_profile_detail_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://soai.sjtu.edu.cn/cn/faculty/zzjs",               # the roster (no detail marker)
+        "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs",        # the category dir, no person leaf
+        "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/index",  # landing leaf
+        "https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/123",    # numeric leaf
+    ],
+)
+def test_faculty_detail_marker_non_profiles_are_not_detail(url):
+    assert _looks_like_profile_detail_url(url) is False
+
+
+@pytest.mark.parametrize(
+    "url,text",
+    [
+        # Breadcrumb trail's bolded terminal is 博士后, even though the site nav lists a
+        # (non-bold) 博士后 link on every page.
+        (
+            "https://soai.sjtu.edu.cn/cn/show/433",
+            "[ 师资队伍 ](/cn/faculty/zzjs)\n[ 专职教师 __](/cn/faculty/zzjs)\n"
+            "[ 博士后 __](/cn/teacher/bsh)\n\n"
+            "[__首页](/) _/_ [师资队伍](/cn/faculty/zzjs) _/_[**博士后**](/cn/teacher/bsh)\n\n"
+            "# 张赟\n张赟博士后，2025年毕业于上海交通大学。邮箱：zhang_yun@sjtu.edu.cn",
+        ),
+        # Postdoc section is encoded in the URL path itself.
+        (
+            "https://x.edu.cn/cn/teacher/bsh/wanghaiwen",
+            "王海文 教授 邮箱 wang@x.edu.cn 研究方向 人工智能",
+        ),
+    ],
+)
+def test_professor_gate_skips_postdoc_section(url, text):
+    skip, reason = should_skip_professor_llm(url=url, text=text)
+    assert skip is True
+    assert reason == "postdoc_section"
+
+
+def test_professor_gate_keeps_full_time_faculty_breadcrumb():
+    # Same nav (with its ubiquitous 博士后 link), but the breadcrumb terminal is 专职教师,
+    # so the page is a real-faculty profile and must NOT be skipped.
+    skip, reason = should_skip_professor_llm(
+        url="https://soai.sjtu.edu.cn/cn/facultydetails/zzjs/zhanglinfeng",
+        text=(
+            "[ 师资队伍 ](/cn/faculty/zzjs)\n[ 专职教师 __](/cn/faculty/zzjs)\n"
+            "[ 博士后 __](/cn/teacher/bsh)\n\n"
+            "[__首页](/) _/_ [师资队伍](/cn/faculty/zzjs) _/_[**专职教师**](/cn/faculty/zzjs)\n\n"
+            "张林峰\n职称：助理教授\n邮箱：zhanglinfeng@sjtu.edu.cn\n研究方向：模型压缩"
+        ),
+    )
+    assert skip is False
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    "name,title,bio,source_url",
+    [
+        ("李四", "博士后", "", "https://x.edu.cn/show/1"),               # explicit postdoc title
+        ("陈某", "师资博士后", "", "https://x.edu.cn/show/2"),            # faculty-track postdoc, still excluded
+        ("张赟", "教授", "张赟博士后，2025年毕业于上海交通大学，合作导师为严骏驰教授。",
+         "https://soai.sjtu.edu.cn/cn/show/433"),                       # bio opens "X博士后…"; advisor-mislabeled title
+        ("王海文", "", "", "https://soai.sjtu.edu.cn/cn/teacher/bsh/wanghaiwen"),  # postdoc section in URL
+    ],
+)
+def test_contains_postdoc_hint_flags_postdocs(name, title, bio, source_url):
+    assert contains_postdoc_hint(name=name, title=title, bio=bio, source_url=source_url) is True
+
+
+@pytest.mark.parametrize(
+    "name,title,bio,source_url",
+    [
+        # Real professor who WON a postdoc-named funding program — must NOT be filtered.
+        ("孙元", "教授", '孙元，入选四川大学"海纳博士后"资助计划（15名），主要研究方向为多模态智能。',
+         "https://cs.scu.edu.cn/szdw/sunyuan.htm"),
+        # Career-history mention ("从事博士后研究") — kept.
+        ("张三", "教授", "张三，2015年至2017年在清华大学从事博士后研究，现为教授。",
+         "https://x.edu.cn/teacher/zhangsan"),
+        # Ordinary professor — kept.
+        ("李教授", "副教授", "主要研究方向为机器学习。", "https://x.edu.cn/faculty/li"),
+    ],
+)
+def test_contains_postdoc_hint_keeps_real_professors(name, title, bio, source_url):
+    assert contains_postdoc_hint(name=name, title=title, bio=bio, source_url=source_url) is False
 
 
 def test_repair_mojibake_recovers_utf8_misread_as_latin1():

@@ -4,7 +4,7 @@ from typing import Any
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetchers import Fetcher
-from agents.crawler.sanitizer import contains_retired_hint, sanitize_professor_payload
+from agents.crawler.sanitizer import contains_postdoc_hint, contains_retired_hint, sanitize_professor_payload
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
 
@@ -141,6 +141,7 @@ def get_crawler_tools(
         academicians_enriched = 0
         professors_deleted_as_academician_duplicates = 0
         filtered_retired = 0
+        filtered_postdoc = 0
         errors: list[str] = []
         prepared_professors: list[tuple[dict[str, Any], bool]] = []
         for professor in professors:
@@ -152,6 +153,14 @@ def get_crawler_tools(
                     source_url,
                 ):
                     filtered_retired += 1
+                    continue
+                if contains_postdoc_hint(
+                    name=professor.get("name"),
+                    title=professor.get("title"),
+                    bio=professor.get("bio"),
+                    source_url=source_url,
+                ):
+                    filtered_postdoc += 1
                     continue
                 cleaned, is_academician = sanitize_professor_payload(
                     professor,
@@ -254,6 +263,8 @@ def get_crawler_tools(
             result["professors_deleted_as_academician_duplicates"] = professors_deleted_as_academician_duplicates
         if filtered_retired:
             result["filtered_retired"] = filtered_retired
+        if filtered_postdoc:
+            result["filtered_postdoc"] = filtered_postdoc
         if errors:
             result["errors"] = errors
         return result

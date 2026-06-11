@@ -141,6 +141,23 @@ async def test_crawler_tool_handlers_save_professors_and_extract_links(tmp_path)
     assert retired_filtered["saved"] == 0
     assert retired_filtered["filtered_retired"] == 1
 
+    postdoc_filtered = await tools["save_professors"](
+        org_unit_name="AI",
+        org_unit_url="https://soai.example.edu.cn",
+        source_url="https://soai.example.edu.cn/cn/show/433",
+        professors=[
+            {
+                "name": "张赟",
+                "title": "教授",
+                "bio": "张赟博士后，2025年毕业于上海交通大学，合作导师为严骏驰教授。",
+            },
+        ],
+    )
+    assert postdoc_filtered["accepted"] == 0
+    assert postdoc_filtered["created"] == 0
+    assert postdoc_filtered["saved"] == 0
+    assert postdoc_filtered["filtered_postdoc"] == 1
+
     promoted_professor = await tools["save_professors"](
         org_unit_name="CS",
         org_unit_url="https://www.example.edu.cn/cs",
