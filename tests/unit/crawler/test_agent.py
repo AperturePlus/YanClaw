@@ -1238,6 +1238,66 @@ async def test_pipeline_marks_plain_detail_without_payload_failed(tmp_path):
     await db.close()
 
 
+async def test_namedleaf_profile_becomes_detail_node_and_saves(tmp_path):
+    # SJTU CS shape: a roster links to a `…/jiaoshiml/<name>.html` profile. After
+    # Task 1, that link is a profile-detail URL, so the driver must create a
+    # DETAIL_URL node, fetch it, extract (snapshot fallback), and save a Professor,
+    # while the roster list page is DONE (save-suppressed).
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("This is an individual professor profile; I will not call a tool.")
+
+    roster_url = "https://www.cs.sjtu.edu.cn/jiaoshiml.html"
+    profile_url = "https://www.cs.sjtu.edu.cn/jiaoshiml/duanshengxiong.html"
+    profile_text = (
+        "## 段圣雄\n"
+        "姓名：段圣雄\n"
+        "职称：教授\n"
+        "研究方向：分布式系统、计算机网络\n"
+        "电子邮箱：duan@cs.sjtu.edu.cn\n"
+        "个人简介：段圣雄，上海交通大学计算机科学与工程系教授，"
+        "长期从事分布式系统与计算机网络方向的研究工作，发表论文若干篇。\n"
+    )
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={
+            roster_url: FetchResult(roster_url, "师资队伍 faculty roster", [profile_url], 200),
+            profile_url: FetchResult(profile_url, profile_text, [], 200),
+        },
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    agent.start_url = "https://www.cs.sjtu.edu.cn/"
+    await agent.graph_frontier.ensure_url_node(
+        url=roster_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+
+    await asyncio.wait_for(
+        agent._extract_professors([_QueuedUrl(roster_url, 1, label="计算机学院")]),
+        timeout=10,
+    )
+
+    assert fetcher.calls == [roster_url, profile_url]
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        nodes = {
+            node.url: (node.type, node.status)
+            for node in (await session.execute(select(CrawlGraphNode))).scalars().all()
+        }
+    assert len(professors) == 1
+    assert nodes[profile_url] == (
+        CrawlGraphNodeType.DETAIL_URL.value,
+        CrawlGraphNodeStatus.DONE.value,
+    )
+    assert nodes[roster_url][1] == CrawlGraphNodeStatus.DONE.value
+    await db.close()
+
+
 def _live_llm_client() -> LLMClient:
     if os.getenv("YANCLAW_LLM_LIVE_TESTS") != "1":
         pytest.skip("Set YANCLAW_LLM_LIVE_TESTS=1 to run live LLM prompt validation.")
