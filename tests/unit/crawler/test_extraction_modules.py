@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agents.crawler.agent_detail import _looks_like_profile_detail_url
+from agents.crawler.text_repair import repair_mojibake_text
 from agents.crawler.agent import (
     _ExtractionOutcome as LegacyExtractionOutcome,
     _ExtractionTaskItem as LegacyExtractionTaskItem,
@@ -212,3 +213,28 @@ def test_faculty_section_profile_url_is_detail(url):
 )
 def test_non_profile_faculty_urls_are_not_detail(url):
     assert _looks_like_profile_detail_url(url) is False
+
+
+def test_repair_mojibake_recovers_utf8_misread_as_latin1():
+    # Captured corruption: a correctly-decoded UTF-8 page's bytes get reinterpreted
+    # as Latin-1 at the GM_xmlhttpRequest transport boundary. Always reversible.
+    original = "人才招聘 段圣雄 教授"
+    broken = original.encode("utf-8").decode("latin-1")
+    assert broken != original
+    assert repair_mojibake_text(broken) == original
+
+
+def test_repair_mojibake_leaves_clean_text_untouched():
+    clean = "段圣雄 教授 Professor email duan@cs.sjtu.edu.cn"
+    assert repair_mojibake_text(clean) == clean
+
+
+def test_repair_mojibake_leaves_pure_ascii_untouched():
+    clean = "Ada Professor email ada@example.edu.cn"
+    assert repair_mojibake_text(clean) == clean
+
+
+def test_repair_mojibake_leaves_latin_accents_untouched():
+    # A genuine Latin-accented name with no CJK must not be mangled into CJK.
+    clean = "José Müller"
+    assert repair_mojibake_text(clean) == clean

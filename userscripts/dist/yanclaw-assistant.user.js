@@ -59,7 +59,7 @@
       _GM_xmlhttpRequest({
         method,
         url,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json; charset=utf-8" },
         data: body,
         timeout: TIMEOUT,
         onload(res) {
@@ -76,7 +76,7 @@
     const requestPromise = _GM.xmlHttpRequest({
       method,
       url,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
       data: body
     });
     const timeoutPromise = new Promise((_, reject) => {

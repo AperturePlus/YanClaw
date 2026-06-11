@@ -20,7 +20,7 @@ function requestWithLegacyApi<T>(method: RequestMethod, url: string, body?: stri
     GM_xmlhttpRequest({
       method,
       url,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
       data: body,
       timeout: TIMEOUT,
       onload(res) {
@@ -38,7 +38,7 @@ async function requestWithModernApi<T>(method: RequestMethod, url: string, body?
   const requestPromise = GM.xmlHttpRequest({
     method,
     url,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
     data: body,
   });
   const timeoutPromise = new Promise<never>((_, reject) => {
