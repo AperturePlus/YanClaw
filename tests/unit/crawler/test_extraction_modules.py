@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+
+from agents.crawler.agent_detail import _looks_like_profile_detail_url
 from agents.crawler.agent import (
     _ExtractionOutcome as LegacyExtractionOutcome,
     _ExtractionTaskItem as LegacyExtractionTaskItem,
@@ -178,3 +181,34 @@ def test_payload_service_infers_academician_flag_from_detail_context():
     assert payload["professors"][0]["is_academician"] is True
     assert payload["professors"][0]["_self_academician_evidence"] is True
     assert harness._pipeline_stats["academician_flags_inferred_from_detail"] == 1
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.cs.sjtu.edu.cn/jiaoshiml/duanshengxiong.html",
+        "https://www.cs.sjtu.edu.cn/jiaoshiml/zhangzhuosheng.html",
+        "https://example.edu.cn/teacher/lisiming.html",
+        "https://example.edu.cn/info/1001/2002.htm",  # existing pattern still works
+    ],
+)
+def test_faculty_section_profile_url_is_detail(url):
+    assert _looks_like_profile_detail_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.cs.sjtu.edu.cn/jiaoshiml.html",   # the roster itself, not a profile
+        "https://www.cs.sjtu.edu.cn/jiaoshiml/index.html",
+        "https://www.cs.sjtu.edu.cn/jiaoshiml/list.html",
+        "https://www.cs.sjtu.edu.cn/jiaoshiml/123.html",  # numeric = pagination/category
+        "https://www.cs.sjtu.edu.cn/szdw.html",        # section landing, no name leaf
+        "https://www.cs.sjtu.edu.cn/xygk.html",        # unrelated section
+        "https://cs.scu.edu.cn/szdw/jczx.htm",         # SCU sub-department section (container dir)
+        "https://cs.scu.edu.cn/szdw/lisiming.htm",     # name-shaped leaf under a container dir stays a section
+        "https://dept3.buaa.edu.cn/szjs/zzjs/jcyzdhgcx.htm",  # BUAA sub-roster, not a person
+    ],
+)
+def test_non_profile_faculty_urls_are_not_detail(url):
+    assert _looks_like_profile_detail_url(url) is False

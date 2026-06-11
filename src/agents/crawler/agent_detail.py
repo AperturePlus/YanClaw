@@ -74,6 +74,55 @@ _FACULTY_CATEGORY_STEMS = frozenset(
     }
 )
 
+# Directory segments that hold individual faculty profile pages (leaf = person slug).
+# Deliberately excludes container dirs that hold *sub-sections* rather than people
+# (`szdw`/`jsdw`/`szll`/`team`/`staff` — already handled as section containers by
+# `_is_faculty_directory_or_category_link`) and the `_FACULTY_CATEGORY_STEMS` (those
+# are section/category stems, e.g. `zzjs`, that appear as roster directories, not
+# person leaves). Keeping only clearly person-leaf dirs avoids misclassifying real
+# faculty-section roster pages (e.g. SCU `/szdw/jczx.htm`, BUAA `/szjs/zzjs/<roster>.htm`).
+_FACULTY_SECTION_DIRS = frozenset(
+    {
+        "jiaoshiml",
+        "shizi",
+        "teacher",
+        "teachers",
+        "faculty",
+        "people",
+    }
+)
+# Leaf stems that are landing/category pages, never an individual person.
+_NON_PROFILE_LEAF_STEMS = frozenset({"index", "list", "default", "main", "more", "all"})
+
+
+def _looks_like_faculty_section_profile_url(url: str) -> bool:
+    """True for `/<faculty-dir>/<person-slug>.html` profile pages.
+
+    SJTU CS and similar sites publish each professor at e.g.
+    `…/jiaoshiml/duanshengxiong.html` — a faculty-section directory plus a
+    pinyin name leaf. These are profile-detail pages, not list/followup pages.
+    """
+    parsed = urlparse((url or "").lower())
+    path = parsed.path
+    if not path.endswith((".htm", ".html", ".shtml")):
+        return False
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) < 2:
+        return False
+    parent = segments[-2]
+    leaf = segments[-1].rsplit(".", 1)[0]
+    if parent not in _FACULTY_SECTION_DIRS:
+        return False
+    if not leaf or leaf.isdigit():
+        return False
+    if leaf in _NON_PROFILE_LEAF_STEMS or leaf in _FACULTY_CATEGORY_STEMS:
+        return False
+    if leaf.endswith(("list", "index")):
+        return False
+    # Person slug: latin/pinyin (optionally with digits/underscore), e.g. "duanshengxiong", "lisiming2".
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]*", leaf))
+
+
 _DETAIL_URL_HINTS = (
     "/info/",
     "/teacher/",
@@ -333,7 +382,11 @@ def _looks_like_profile_detail_url(url: str) -> bool:
     if any(token in lowered for token in _CLEAR_PROFILE_DETAIL_HINTS):
         return True
     path = urlparse(lowered).path
-    return bool(re.search(r"/info/\d+/\d+(\.s?html?)?$", path))
+    if re.search(r"/info/\d+/\d+(\.s?html?)?$", path):
+        return True
+    if _looks_like_faculty_section_profile_url(lowered):
+        return True
+    return False
 
 
 def extract_detail_profile_record_from_snapshot(text: str, *, page_url: str = "") -> dict[str, Any] | None:
