@@ -1298,6 +1298,55 @@ async def test_namedleaf_profile_becomes_detail_node_and_saves(tmp_path):
     await db.close()
 
 
+async def test_list_path_rescues_rich_profile(tmp_path):
+    # Defense in depth (spec B5): even if a real profile is routed through the
+    # list/followup path (e.g. future misclassification), a page that parses as a
+    # single rich profile is saved instead of silently suppressed.
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("Prose only; no tool call.")
+
+    profile_url = "https://www.cs.sjtu.edu.cn/jiaoshiml/duanshengxiong.html"
+    profile_text = (
+        "## 段圣雄\n"
+        "姓名：段圣雄\n"
+        "职称：教授\n"
+        "研究方向：分布式系统、计算机网络\n"
+        "电子邮箱：duan@cs.sjtu.edu.cn\n"
+        "个人简介：段圣雄，上海交通大学计算机科学与工程系教授，"
+        "长期从事分布式系统与计算机网络方向的研究工作，发表论文若干篇。\n"
+    )
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages={profile_url: FetchResult(profile_url, profile_text, [], 200)},
+        pipeline_queue_cap=2,
+        pipeline_llm_workers=1,
+        pipeline_db_workers=1,
+    )
+    agent.start_url = "https://www.cs.sjtu.edu.cn/"
+    # Force the traversal path: seed as a followup (list-type) node, not a detail node.
+    await agent.graph_frontier.ensure_url_node(
+        url=profile_url,
+        node_type=CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+
+    await asyncio.wait_for(agent._extract_professors([]), timeout=10)  # claim globally
+
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        node = (
+            await session.execute(select(CrawlGraphNode).where(CrawlGraphNode.url == profile_url))
+        ).scalar_one()
+    assert len(professors) == 1
+    assert int(agent._pipeline_stats.get("list_page_profile_rescued", 0)) == 1
+    assert int(agent._pipeline_stats.get("list_save_suppressed", 0)) == 0
+    assert node.status == CrawlGraphNodeStatus.DONE.value
+    await db.close()
+
+
 def _live_llm_client() -> LLMClient:
     if os.getenv("YANCLAW_LLM_LIVE_TESTS") != "1":
         pytest.skip("Set YANCLAW_LLM_LIVE_TESTS=1 to run live LLM prompt validation.")

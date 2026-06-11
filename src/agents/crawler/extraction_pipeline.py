@@ -709,9 +709,27 @@ class ExtractionPipelineService(ExtractionPayloadService):
             )
             return "skipped"
 
-        self._pipeline_stats["list_save_suppressed"] = int(
-            self._pipeline_stats.get("list_save_suppressed", 0)
-        ) + 1
+        # Safety net (spec B5): a page reached via the list/followup path may
+        # actually be a single rich profile. Rescue it instead of silently
+        # suppressing the save. Reuses the detail snapshot extractor + detail save
+        # path, so all dedup/evidence logic is shared (no duplication).
+        rescued = await self._rescue_list_page_profile(
+            current,
+            fetched,
+            row,
+            source_url=source_url,
+            final_url=final_url,
+            org_unit_name=org_unit_name,
+            page_hash=page_hash,
+        )
+        if rescued:
+            self._pipeline_stats["list_page_profile_rescued"] = int(
+                self._pipeline_stats.get("list_page_profile_rescued", 0)
+            ) + 1
+        else:
+            self._pipeline_stats["list_save_suppressed"] = int(
+                self._pipeline_stats.get("list_save_suppressed", 0)
+            ) + 1
         self._pipeline_stats["done"] = int(self._pipeline_stats.get("done", 0)) + 1
         self._pipeline_stats["processed_tasks"] = int(self._pipeline_stats.get("processed_tasks", 0)) + 1
         self._pipeline_stats["list_processed"] = int(self._pipeline_stats.get("list_processed", 0)) + 1
@@ -722,15 +740,80 @@ class ExtractionPipelineService(ExtractionPayloadService):
         await self.graph_frontier.mark_node_status(
             current.graph_node_id,
             status=CrawlGraphNodeStatus.DONE,
-            metadata={"crawl_task_id": int(row.id), "task_kind": CrawlTaskKind.LIST_PAGE.value},
+            metadata={
+                "crawl_task_id": int(row.id),
+                "task_kind": CrawlTaskKind.LIST_PAGE.value,
+                "rescued_profile": rescued,
+            },
         )
         self.logger.debug(
-            "Suppress list-page professor save and keep traversal task_id=%s org_unit=%s url=%s",
+            "List-page traversal task_id=%s org_unit=%s url=%s rescued_profile=%s",
             row.id,
             org_unit_name,
             source_url,
+            rescued,
         )
         return "done"
+
+    async def _rescue_list_page_profile(
+        self,
+        current: _QueuedUrl,
+        fetched: FetchResult,
+        row: Any,
+        *,
+        source_url: str,
+        final_url: str,
+        org_unit_name: str,
+        page_hash: str,
+    ) -> bool:
+        """Save a single rich profile that arrived via the list/followup path.
+
+        The detail snapshot extractor is conservative (requires a name plus at
+        least one of email/phone/research/bio and a profile-shaped URL) and returns
+        ``None`` for genuine multi-professor rosters, so this never over-saves a
+        list page. Presenting the work as a detail-mode task routes it through the
+        normal detail save (``save_professors`` dedups by name_key/homepage), so no
+        dedup logic is duplicated here. Returns True iff a professor was accepted.
+        """
+        detail_snapshot = self._compact_page_text(
+            fetched.text or "",
+            self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=True),
+        )
+        record = agent_detail.extract_detail_profile_record_from_snapshot(
+            detail_snapshot, page_url=final_url
+        )
+        if not record:
+            return False
+
+        rescue_task = _ExtractionTaskItem(
+            task_id=int(row.id),
+            university=self.university_name,
+            org_unit_name=org_unit_name,
+            org_unit_url=current.url,
+            source_url=source_url,
+            page_url=final_url,
+            page_hash=page_hash,
+            page_text_snapshot=detail_snapshot,
+            allowed_tools=[],
+            detail_mode=True,
+            task_kind=CrawlTaskKind.DETAIL_PAGE.value,
+            graph_node_id=current.graph_node_id,
+        )
+        raw_payload = {
+            "org_unit_name": org_unit_name,
+            "org_unit_url": current.url,
+            "source_url": source_url,
+            "professors": [record],
+        }
+        summary = await self._save_payloads_to_db([raw_payload], task=rescue_task)
+        if int(summary.get("accepted", 0)) <= 0:
+            return False
+        self.logger.info(
+            "Rescued rich profile from list/followup path url=%s name=%s",
+            final_url,
+            record.get("name"),
+        )
+        return True
 
     async def _enqueue_extraction_task(
         self,
