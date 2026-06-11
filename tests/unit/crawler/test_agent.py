@@ -1347,6 +1347,51 @@ async def test_list_path_rescues_rich_profile(tmp_path):
     await db.close()
 
 
+async def test_all_namedleaf_profiles_become_detail_nodes_not_capped_at_36(tmp_path):
+    # Bug #2: after Task 1 the profile links are detail links, so they bypass the
+    # followup page cap (_FOLLOWUP_PAGE_LIMIT = 36). A roster of 60 name-leaf
+    # profiles must create 60 detail nodes (the only remaining limiter is the
+    # per-org-unit detail hard cap, well above 60).
+    class ProseOnlyLLM:
+        async def chat(self, messages, tools=None, tool_handlers=None):
+            return LLMResult("Prose only; no tool call.")
+
+    roster_url = "https://www.cs.sjtu.edu.cn/jiaoshiml.html"
+    profiles = [f"https://www.cs.sjtu.edu.cn/jiaoshiml/p{i:03d}name.html" for i in range(60)]
+    pages = {roster_url: FetchResult(roster_url, "师资队伍 roster", profiles, 200)}
+    for i, url in enumerate(profiles):
+        pages[url] = FetchResult(url, f"P{i} Professor email p{i}@cs.sjtu.edu.cn 研究方向 x", [], 200)
+    agent, fetcher, db = await _agent(
+        tmp_path,
+        ProseOnlyLLM(),
+        pages=pages,
+        pipeline_queue_cap=8,
+        pipeline_llm_workers=4,
+        pipeline_db_workers=1,
+    )
+    agent.start_url = "https://www.cs.sjtu.edu.cn/"
+    await agent.graph_frontier.ensure_url_node(
+        url=roster_url,
+        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+        org_unit_name="计算机学院",
+        status=CrawlGraphNodeStatus.PENDING,
+    )
+
+    await asyncio.wait_for(
+        agent._extract_professors([_QueuedUrl(roster_url, 1, label="计算机学院")]),
+        timeout=20,
+    )
+
+    async with db.session() as session:
+        detail_nodes = (
+            await session.execute(
+                select(CrawlGraphNode).where(CrawlGraphNode.type == CrawlGraphNodeType.DETAIL_URL.value)
+            )
+        ).scalars().all()
+    assert len(detail_nodes) == 60  # not truncated to the followup cap of 36
+    await db.close()
+
+
 def _live_llm_client() -> LLMClient:
     if os.getenv("YANCLAW_LLM_LIVE_TESTS") != "1":
         pytest.skip("Set YANCLAW_LLM_LIVE_TESTS=1 to run live LLM prompt validation.")

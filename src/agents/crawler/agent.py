@@ -119,7 +119,7 @@ class CrawlerAgent(ExtractionPipelineService):
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
         detail_enrich_enabled: bool = True,
-        detail_profile_hard_cap_per_org_unit: int = 200,
+        detail_profile_hard_cap_per_org_unit: int = 400,
         pipeline_enabled: bool = True,
         pipeline_llm_workers: int = 1,
         pipeline_db_workers: int = 1,

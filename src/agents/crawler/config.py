@@ -43,7 +43,7 @@ class CrawlerSettings(BaseSettings):
     human_server_port: int = 21520
     human_job_timeout_seconds: float = 180.0
     detail_enrich_enabled: bool = True
-    detail_profile_hard_cap_per_org_unit: int = Field(default=200, ge=1)
+    detail_profile_hard_cap_per_org_unit: int = Field(default=400, ge=1)
     pipeline_enabled: bool = True
     pipeline_llm_workers: int = Field(default=4, ge=1)
     pipeline_db_workers: int = Field(default=1, ge=1)
