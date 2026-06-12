@@ -185,6 +185,32 @@ def test_payload_service_infers_academician_flag_from_detail_context():
     assert harness._pipeline_stats["academician_flags_inferred_from_detail"] == 1
 
 
+def test_payload_service_does_not_infer_academician_from_navigation_link():
+    # Regression: SJTU 船舶海洋与建筑工程学院. Every faculty profile page carries a
+    # navigation menu linking to the school's "两院院士" sub-page. That nav-link
+    # anchor sits close to the profile heading, so the name-context window picks it
+    # up — but a menu link is page chrome, not evidence that THIS professor is an
+    # academician. 51 regular professors were misfiled as academicians this way.
+    harness = _PayloadHarness()
+    task = _task(
+        detail_mode=True,
+        page_text_snapshot=(
+            "* [师资概况](https://naoce.sjtu.edu.cn/sz_detail.html)\n"
+            "* [两院院士](https://naoce.sjtu.edu.cn/jc_rc.html)\n"
+            "* [教师名录](https://naoce.sjtu.edu.cn/teachers.html)\n"
+            "## 范菊\n船舶与海洋工程系\n电子邮箱：fanju@sjtu.edu.cn\n"
+            "研究方向：系泊结构物在波浪上的运动响应"
+        ),
+    )
+    payload = {"professors": [{"name": "范菊", "title": "副教授"}]}
+
+    harness._infer_academician_flags_from_detail_context(payload, task=task)
+
+    assert payload["professors"][0].get("is_academician") is not True
+    assert payload["professors"][0].get("_self_academician_evidence") is not True
+    assert harness._pipeline_stats.get("academician_flags_inferred_from_detail", 0) == 0
+
+
 @pytest.mark.parametrize(
     "url",
     [

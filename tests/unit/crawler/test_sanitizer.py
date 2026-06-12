@@ -84,6 +84,29 @@ def test_contains_self_academician_hint_accepts_only_self_identity():
     assert not contains_self_academician_hint("黄晶", "参与国家自然科学基金、院士工作站项目等科研项目。")
 
 
+def test_contains_self_academician_hint_ignores_navigation_link_anchor():
+    # A faculty profile page carries a navigation menu whose "师资队伍" section
+    # links to the school's "两院院士" (academicians) sub-page. That nav-link
+    # anchor text is page chrome, not a statement that the profiled professor is
+    # themselves an academician. The name-context window the crawler builds around
+    # the profile heading reaches back into this menu, so a bare 院士 from the link
+    # must NOT count as self-academician evidence. (SJTU 船舶海洋与建筑工程学院 had
+    # 51 regular professors misfiled as academicians because of this.)
+    window = (
+        "[师资概况](https://naoce.sjtu.edu.cn/sz_detail.html)\n"
+        "* [两院院士](https://naoce.sjtu.edu.cn/jc_rc.html)\n"
+        "* [教师名录](https://naoce.sjtu.edu.cn/teachers.html)\n"
+        "* [博士后](https://naoce.sjtu.edu.cn/sz_bsh.html)\n"
+        "# 师资名录\n## 范菊\n船舶与海洋工程系\n电子邮箱：fanju@sjtu.edu.cn"
+    )
+    assert not contains_self_academician_hint("范菊", window)
+
+    # A genuine self-academician statement in prose still counts even when the same
+    # navigation chrome is present, so stripping link anchors must not over-suppress.
+    real = window + "\n范菊，中国科学院院士，长期从事船舶与海洋工程研究。"
+    assert contains_self_academician_hint("范菊", real)
+
+
 def test_sanitize_professor_payload_ignores_unverified_academician_flag():
     cleaned, is_academician = sanitize_professor_payload(
         {

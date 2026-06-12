@@ -441,11 +441,28 @@ def contains_academician_hint(*values: Any) -> bool:
     return False
 
 
+# Markdown link / image syntax: ``[anchor](url)`` and ``![alt](url)``. In a page
+# snapshot these are navigation/related-links chrome — e.g. a faculty menu's
+# ``[两院院士](…)`` ("two-academies academicians") sub-page link — not a statement
+# about the profiled person. The whole construct (anchor text included) is dropped
+# so a bare 院士 living inside a menu link is never mistaken for evidence that this
+# individual is an academician. Genuine self-academician statements appear in prose
+# (bio/title/heading text), which carries no link syntax and is left untouched.
+_MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\([^)]*\)")
+
+
+def _strip_markdown_links(text: str) -> str:
+    return _MARKDOWN_LINK_RE.sub(" ", text)
+
+
 def contains_self_academician_hint(name: Any, *values: Any) -> bool:
     normalized_name = normalize_name(name)
     for value in values:
         text = normalize_optional_text(value)
-        if not text or not contains_academician_hint(text):
+        if not text:
+            continue
+        text = _strip_markdown_links(text)
+        if not contains_academician_hint(text):
             continue
         if _looks_like_academician_title(text):
             return True
