@@ -884,6 +884,7 @@ class ExtractionPipelineService(ExtractionPayloadService):
             detail_mode=detail_mode,
         )
 
+        row = None
         async with self.db.session() as session:
             row = await crawler_db.upsert_crawl_task(
                 session,
@@ -900,66 +901,67 @@ class ExtractionPipelineService(ExtractionPayloadService):
                 priority=task_priority,
                 status=CrawlTaskStatus.PENDING,
             )
-            if row is None:
-                self._pipeline_stats["edu_cn_task_url_rejected"] = int(
-                    self._pipeline_stats.get("edu_cn_task_url_rejected", 0)
-                ) + 1
-                if detail_mode:
-                    self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
-                else:
-                    self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
-                self.logger.warning(
-                    "Skip extraction task with non-edu-cn URL source=%s page=%s org_unit_url=%s detail_mode=%s",
-                    source_url,
-                    source_url,
-                    current.url,
-                    detail_mode,
-                )
-                await self.graph_frontier.mark_node_status(
-                    current.graph_node_id,
-                    status=CrawlGraphNodeStatus.SKIPPED,
-                    last_error="non_edu_cn_task_url",
-                )
-                return "skipped"
-            if row.status != CrawlTaskStatus.PENDING.value:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                if detail_mode:
-                    self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
-                else:
-                    self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
-                self.logger.debug(
-                    "Skip existing extraction task source=%s status=%s task_id=%s",
-                    source_url,
-                    row.status,
-                    row.id,
-                )
-                await self.graph_frontier.mark_node_status(
-                    current.graph_node_id,
-                    status=CrawlGraphNodeStatus.DONE,
-                    last_error=f"existing_crawl_task:{row.status}",
-                    metadata={"crawl_task_id": int(row.id)},
-                )
-                return "existing"
-            task = _ExtractionTaskItem(
-                task_id=int(row.id),
-                university=self.university_name,
-                org_unit_name=row.org_unit_name,
-                org_unit_url=row.org_unit_url,
-                source_url=row.source_url,
-                page_url=row.page_url,
-                page_hash=row.page_hash,
-                page_text_snapshot=row.page_text_snapshot,
-                allowed_tools=allowed_tools,
-                attempt=int(row.attempt or 0),
-                priority=int(row.priority or 0),
-                strict_retry=False,
-                detail_mode=detail_mode,
-                task_kind=str(getattr(row, "task_kind", None) or task_kind),
-                name_homepage_candidates=name_homepage_candidates,
-                graph_node_id=current.graph_node_id,
+
+        if row is None:
+            self._pipeline_stats["edu_cn_task_url_rejected"] = int(
+                self._pipeline_stats.get("edu_cn_task_url_rejected", 0)
+            ) + 1
+            if detail_mode:
+                self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
+            else:
+                self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+            self.logger.warning(
+                "Skip extraction task with non-edu-cn URL source=%s page=%s org_unit_url=%s detail_mode=%s",
+                source_url,
+                source_url,
+                current.url,
+                detail_mode,
             )
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error="non_edu_cn_task_url",
+            )
+            return "skipped"
+        if row.status != CrawlTaskStatus.PENDING.value:
+            self._pipeline_stats["duplicate_tasks_skipped"] = int(
+                self._pipeline_stats.get("duplicate_tasks_skipped", 0)
+            ) + 1
+            if detail_mode:
+                self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
+            else:
+                self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
+            self.logger.debug(
+                "Skip existing extraction task source=%s status=%s task_id=%s",
+                source_url,
+                row.status,
+                row.id,
+            )
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.DONE,
+                last_error=f"existing_crawl_task:{row.status}",
+                metadata={"crawl_task_id": int(row.id)},
+            )
+            return "existing"
+        task = _ExtractionTaskItem(
+            task_id=int(row.id),
+            university=self.university_name,
+            org_unit_name=row.org_unit_name,
+            org_unit_url=row.org_unit_url,
+            source_url=row.source_url,
+            page_url=row.page_url,
+            page_hash=row.page_hash,
+            page_text_snapshot=row.page_text_snapshot,
+            allowed_tools=allowed_tools,
+            attempt=int(row.attempt or 0),
+            priority=int(row.priority or 0),
+            strict_retry=False,
+            detail_mode=detail_mode,
+            task_kind=str(getattr(row, "task_kind", None) or task_kind),
+            name_homepage_candidates=name_homepage_candidates,
+            graph_node_id=current.graph_node_id,
+        )
         await self.graph_frontier.mark_node_status(
             current.graph_node_id,
             status=CrawlGraphNodeStatus.IN_PROGRESS,

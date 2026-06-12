@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -3022,6 +3023,25 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
     text_limit = agent._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=True)
     snapshot = agent._compact_page_text(page_text, text_limit)
     incoming_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+    events: list[object] = []
+    session_active = False
+    original_session = db.session
+
+    @asynccontextmanager
+    async def tracked_session():
+        nonlocal session_active
+        events.append("session_enter")
+        session_active = True
+        try:
+            async with original_session() as session:
+                yield session
+        finally:
+            session_active = False
+            events.append("session_exit")
+
+    async def fake_mark_node_status(node_id, **kwargs):
+        events.append("mark_node_status")
+        assert not session_active
 
     async with db.session() as session:
         detail_task = await crawler_db.upsert_crawl_task(
@@ -3051,18 +3071,25 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
             status=CrawlTaskStatus.DONE,
         )
 
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(db, "session", tracked_session)
+    monkeypatch.setattr(agent.graph_frontier, "mark_node_status", fake_mark_node_status)
     llm_queue: asyncio.Queue = asyncio.Queue()
-    await agent._enqueue_extraction_task(
-        _QueuedUrl(url=source_url, depth=1, label="CS"),
-        FetchResult(source_url, page_text, [], 200),
-        llm_queue=llm_queue,
-        detail_mode=True,
-        priority=0,
-    )
+    try:
+        await agent._enqueue_extraction_task(
+            _QueuedUrl(url=source_url, depth=1, label="CS"),
+            FetchResult(source_url, page_text, [], 200),
+            llm_queue=llm_queue,
+            detail_mode=True,
+            priority=0,
+        )
+    finally:
+        monkeypatch.undo()
 
     assert llm_queue.empty()
     assert int(agent._pipeline_stats.get("duplicate_tasks_skipped", 0)) == 1
     assert int(agent._pipeline_stats.get("detail_skipped", 0)) == 1
+    assert events == ["session_enter", "session_exit", "mark_node_status"]
     async with db.session() as session:
         rows = (await session.execute(select(CrawlTask).order_by(CrawlTask.id))).scalars().all()
     assert [row.id for row in rows] == [detail_task.id, list_task.id]
@@ -3070,6 +3097,53 @@ async def test_enqueue_extraction_task_skips_existing_unique_task_conflict(tmp_p
     assert rows[0].task_kind == CrawlTaskKind.DETAIL_PAGE.value
     assert rows[1].page_hash == incoming_hash
     assert rows[1].task_kind == CrawlTaskKind.LIST_PAGE.value
+    await db.close()
+
+
+async def test_enqueue_extraction_task_rejects_non_edu_cn_after_session_exit(tmp_path):
+    source_url = "https://www.example.com/cs/faculty"
+    page_text = "faculty list current with browser overlay Ada Professor"
+    agent, _fetcher, db = await _agent(tmp_path, FakeLLM(), fetcher_cls=FakeHumanFetcher)
+    events: list[object] = []
+    session_active = False
+    original_session = db.session
+
+    @asynccontextmanager
+    async def tracked_session():
+        nonlocal session_active
+        events.append("session_enter")
+        session_active = True
+        try:
+            async with original_session() as session:
+                yield session
+        finally:
+            session_active = False
+            events.append("session_exit")
+
+    async def fake_mark_node_status(node_id, **kwargs):
+        events.append("mark_node_status")
+        assert not session_active
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(db, "session", tracked_session)
+    monkeypatch.setattr(agent.graph_frontier, "mark_node_status", fake_mark_node_status)
+    llm_queue: asyncio.Queue = asyncio.Queue()
+    try:
+        result = await agent._enqueue_extraction_task(
+            _QueuedUrl(url=source_url, depth=1, label="CS"),
+            FetchResult(source_url, page_text, [], 200),
+            llm_queue=llm_queue,
+            detail_mode=True,
+            priority=0,
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert result == "skipped"
+    assert llm_queue.empty()
+    assert int(agent._pipeline_stats.get("edu_cn_task_url_rejected", 0)) == 1
+    assert int(agent._pipeline_stats.get("detail_skipped", 0)) == 1
+    assert events == ["session_enter", "session_exit", "mark_node_status"]
     await db.close()
 
 
