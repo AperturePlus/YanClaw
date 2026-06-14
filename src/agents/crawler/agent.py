@@ -392,11 +392,24 @@ class CrawlerAgent:
                     if self._too_many_backtracks(
                         f"too few org units ({len(org_units)} < {self.min_org_units})"
                     ):
-                        break
-                    org_unit_pages = []
-                    org_units = []
-                    self._skip_cross_run_dedup = True
-                    continue
+                        # Backtracks exhausted. The min_org_units gate guards
+                        # against landing on category/listing pages, but a
+                        # single-college start URL legitimately yields fewer
+                        # than min. Rather than fail with zero professors,
+                        # proceed with whatever org units we did find; only
+                        # give up when we have none at all.
+                        if not org_units:
+                            break
+                        self.logger.info(
+                            "Proceeding with %s org unit(s) after exhausting backtracks (below min=%s)",
+                            len(org_units),
+                            self.min_org_units,
+                        )
+                    else:
+                        org_unit_pages = []
+                        org_units = []
+                        self._skip_cross_run_dedup = True
+                        continue
                 if not self.target_org_units:
                     org_units = await self._filter_existing_org_units_for_discovery(
                         org_units,

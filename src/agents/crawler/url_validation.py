@@ -42,7 +42,15 @@ def is_crawlable_url(value: Any, *, base_url: str | None = None) -> bool:
 
 
 def _contains_malformed_url_content(value: str) -> bool:
-    if any(char in value for char in "\r\n\t\x00"):
+    # Control chars and characters that are never valid in a raw URL. Literal
+    # curly braces almost always mean an unrendered front-end template
+    # placeholder leaked into an href, e.g. ".../szdw/C/{{logo2Channel}}"
+    # (Vue/Mustache), "${id}" (JSP EL / template literal), or "{%...%}"
+    # (Jinja). A real URL percent-encodes braces (%7B/%7D), so a raw "{" or
+    # "}" is a reliable junk signal — without this guard such URLs reach the
+    # human fetch queue and waste a full job timeout each before being judged
+    # a WAF/challenge page.
+    if any(char in value for char in "\r\n\t\x00{}"):
         return True
     for candidate in _decoded_variants(value):
         if "<" in candidate or ">" in candidate:

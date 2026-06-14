@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agents.crawler.agent import _is_category_name, _url_found_on_page
+from agents.crawler.url_validation import is_crawlable_url, normalize_crawlable_url
 from agents.crawler.fetchers.link_signals import LinkSignal
 from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_CATEGORY,
@@ -20,6 +21,28 @@ from agents.crawler.url_heuristics import (
     _rank_faculty_page_candidates,
     _select_balanced_faculty_candidates,
 )
+
+
+def test_normalize_rejects_unrendered_template_placeholders():
+    """Front-end template artifacts leaked into hrefs must never be queued."""
+    # Vue/Mustache double-brace placeholder (observed on amr.pku.edu.cn).
+    assert normalize_crawlable_url("https://amr.pku.edu.cn/jzyg/szdw/C/{{logo2Channel}}") == ""
+    # JSP EL / JS template-literal style.
+    assert normalize_crawlable_url("https://x.edu.cn/list/${id}.htm") == ""
+    # Jinja/Django statement tag.
+    assert normalize_crawlable_url("https://x.edu.cn/{% url 'home' %}") == ""
+    assert not is_crawlable_url("https://x.edu.cn/a/{wbtreeid}")
+
+
+def test_normalize_keeps_well_formed_urls():
+    """Ordinary faculty URLs (incl. percent-encoded braces) stay crawlable."""
+    assert normalize_crawlable_url("https://cs.scu.edu.cn/szdw/js.htm") == (
+        "https://cs.scu.edu.cn/szdw/js.htm"
+    )
+    # A genuinely percent-encoded brace is valid and must survive.
+    assert normalize_crawlable_url("https://x.edu.cn/a%7Bid%7D.htm") == (
+        "https://x.edu.cn/a%7Bid%7D.htm"
+    )
 
 
 def test_url_found_exact_match_in_links():

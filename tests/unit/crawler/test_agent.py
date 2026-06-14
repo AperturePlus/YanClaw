@@ -332,6 +332,7 @@ async def _agent(
     pages=None,
     *,
     fetcher_cls=FakeFetcher,
+    min_org_units=1,
     **agent_kwargs,
 ):
     db = DatabaseManager(sqlite_url(tmp_path / "agent.db"))
@@ -380,7 +381,7 @@ async def _agent(
         fetcher=fetcher,
         max_depth=max_depth,
         max_backtracks=max_backtracks,
-        min_org_units=1,
+        min_org_units=min_org_units,
         **agent_kwargs,
     )
     return agent, fetcher, db
@@ -1617,6 +1618,30 @@ async def test_agent_marks_failed_when_backtrack_limit_exceeded(tmp_path):
     result = await agent.run()
 
     assert result.status == CrawlStatus.FAILED.value
+    await db.close()
+
+
+async def test_agent_proceeds_with_few_org_units_after_backtracks_exhausted(tmp_path):
+    """A single-college site yields fewer than min_org_units. After backtracks
+    are exhausted the agent should crawl what it found (interactive mode has no
+    homepage fallback) instead of failing with zero professors."""
+    agent, _fetcher, db = await _agent(
+        tmp_path,
+        FakeLLM(),
+        fetcher_cls=FakeHumanFetcher,
+        min_org_units=5,
+        max_backtracks=3,
+    )
+    result = await agent.run()
+
+    assert agent.backtrack_count > agent.max_backtracks
+    assert result.status == CrawlStatus.COMPLETED.value
+    assert result.saved_professors == 1
+
+    async with db.session() as session:
+        units = (await session.execute(select(OrgUnit))).scalars().all()
+        assert [u.name for u in units] == ["CS"]
+
     await db.close()
 
 
