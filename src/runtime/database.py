@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -29,10 +30,18 @@ class DatabaseManager:
         if module_path not in cls._model_modules:
             cls._model_modules.append(module_path)
 
-    def __init__(self, database_url: str, *, echo: bool = False) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        echo: bool = False,
+        busy_timeout_ms: int = 30000,
+    ) -> None:
         self.database_url = database_url
         _ensure_sqlite_parent_dir(database_url)
         self.engine: AsyncEngine = create_async_engine(database_url, echo=echo)
+        if make_url(database_url).drivername.startswith("sqlite"):
+            _install_sqlite_pragmas(self.engine, busy_timeout_ms)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -65,6 +74,30 @@ class DatabaseManager:
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+
+def _install_sqlite_pragmas(engine: AsyncEngine, busy_timeout_ms: int) -> None:
+    """Apply concurrency-friendly PRAGMAs to every new SQLite connection.
+
+    Each university uses one SQLite file written by several async connections
+    (the extraction pipeline plus the page-cache writer). The default
+    rollback-journal mode makes readers and writers block each other, so
+    concurrent writes raise ``sqlite3.OperationalError: database is locked``
+    immediately. WAL lets one writer and many readers proceed without
+    blocking, and ``busy_timeout`` makes a writer wait for the lock instead of
+    failing outright. PRAGMAs are connection-scoped (journal_mode persists on
+    the file, the rest do not), so they must be set on every connect.
+    """
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        finally:
+            cursor.close()
 
 
 def _ensure_sqlite_parent_dir(database_url: str) -> None:
