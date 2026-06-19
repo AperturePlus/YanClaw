@@ -6,6 +6,7 @@ from pathlib import Path
 import click
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import select
 
 from agents.crawler import db as crawler_db
 from agents.crawler import cli as crawler_cli
@@ -13,7 +14,15 @@ from agents.crawler import dispatcher as dispatcher_module
 from agents.crawler.cli import cli
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError, _university_db_path
-from agents.crawler.models import CrawlStatus
+from agents.crawler.fetchers import FetchResult
+from agents.crawler.models import (
+    CrawlStatus,
+    CrawlTaskKind,
+    CrawlTaskStatus,
+    OrgUnit,
+    Professor,
+    ProfessorAffiliation,
+)
 from runtime.database import DatabaseManager
 from runtime.skills import SkillMeta
 from runtime.cli import cli as runtime_cli
@@ -21,6 +30,22 @@ from runtime.cli import cli as runtime_cli
 
 def _sqlite_url(path: Path) -> str:
     return f"sqlite+aiosqlite:///{path.as_posix()}"
+
+
+def _manual_manifest(*universities: tuple[str, str, str]) -> str:
+    lines = [
+        "record_type,name,url,location,org_unit_name,org_unit_url,faculty_url,org_unit_listing_url",
+    ]
+    for name, url, location in universities:
+        lines.append(f"university,{name},{url},{location},,,,")
+        lines.append(f"org_unit,{name},,,CS,{url.rstrip('/')}/cs,{url.rstrip('/')}/cs/faculty,")
+    return "\n".join(lines) + "\n"
+
+
+def _legacy_manifest(*universities: tuple[str, str, str]) -> str:
+    lines = ["name,url,location"]
+    lines.extend(f"{name},{url},{location}" for name, url, location in universities)
+    return "\n".join(lines) + "\n"
 
 
 class FakeAgent:
@@ -49,7 +74,10 @@ class FakeAgent:
 
 
 class NoopFetcher:
+    entered = 0
+
     async def __aenter__(self):
+        type(self).entered += 1
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -59,7 +87,10 @@ class NoopFetcher:
 async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\nB,https://b.example.edu.cn/,Y\n",
+        _manual_manifest(
+            ("A", "https://a.example.edu.cn/", "X"),
+            ("B", "https://b.example.edu.cn/", "Y"),
+        ),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -76,6 +107,38 @@ async def test_dispatcher_filters_and_limits_concurrency(tmp_path):
 
     assert summary.success == 2
     assert FakeAgent.max_active == 1
+
+
+async def test_dispatcher_missing_manual_entrance_does_not_touch_db(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _legacy_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_bytes(b"old-a")
+
+    NoopFetcher.entered = 0
+    FakeAgent.active = 0
+    FakeAgent.max_active = 0
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(universities=["A"])
+
+    assert summary.success == 0
+    assert summary.failed == 1
+    assert summary.results[0].messages == ["manual_entrance_missing"]
+    assert FakeAgent.max_active == 0
+    assert NoopFetcher.entered == 0
+    assert db_path.read_bytes() == b"old-a"
+    assert not (Path(settings.university_db_dir) / "backup").exists()
 
 
 class SlowAgent:
@@ -134,10 +197,38 @@ def test_crawler_settings_removed_human_only_fake_knobs():
         assert not hasattr(settings, name)
 
 
+def test_crawler_settings_default_llm_parallelism_has_no_rate_limit():
+    settings = CrawlerSettings(_env_file=None)
+
+    assert settings.max_org_units_per_university == 100
+    assert settings.pipeline_llm_workers == 4
+    assert settings.pipeline_db_workers == 1
+    assert settings.llm_max_concurrent == 8
+    assert settings.llm_min_interval_seconds == 0.0
+
+
+def test_dispatcher_default_llm_client_uses_concurrency_settings(tmp_path):
+    settings = CrawlerSettings(
+        _env_file=None,
+        websites_path=tmp_path / "websites.csv",
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        openai_api_key="key",
+        llm_max_concurrent=11,
+        llm_min_interval_seconds=0.25,
+    )
+
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    client = dispatcher.llm_client_factory()
+
+    assert client.max_concurrent == 11
+    assert client.min_interval == 0.25
+
+
 async def test_dispatcher_enforces_university_timeout(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -158,7 +249,15 @@ async def test_dispatcher_enforces_university_timeout(tmp_path):
 async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        "\n".join(
+            [
+                "record_type,name,url,location,org_unit_name,org_unit_url,faculty_url,org_unit_listing_url",
+                "university,A,https://a.example.edu.cn/,X,,,,",
+                "org_unit,A,,,计算机学院,https://a.example.edu.cn/cs,https://a.example.edu.cn/cs/faculty,",
+                "org_unit,A,,,软件学院,https://a.example.edu.cn/soft,https://a.example.edu.cn/soft/faculty,",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -168,6 +267,9 @@ async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
         max_concurrency=1,
         target_org_units=["计算机学院", "软件学院"],
         org_unit_match_threshold=0.7,
+        org_unit_exclude_enabled=True,
+        org_unit_exclude_keywords=["艺术学院", "体育学院"],
+        org_unit_llm_filter_enabled=False,
     )
     CaptureAgent.last_kwargs = None
     dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
@@ -176,13 +278,17 @@ async def test_dispatcher_passes_org_unit_target_settings_to_agent(tmp_path):
     assert summary.success == 1
     assert CaptureAgent.last_kwargs is not None
     assert CaptureAgent.last_kwargs.get("target_org_units") == ["计算机学院", "软件学院"]
+    assert CaptureAgent.last_kwargs.get("max_org_units_per_university") == 100
     assert CaptureAgent.last_kwargs.get("org_unit_match_threshold") == 0.7
+    assert CaptureAgent.last_kwargs.get("org_unit_exclude_enabled") is True
+    assert CaptureAgent.last_kwargs.get("org_unit_exclude_keywords") == ["艺术学院", "体育学院"]
+    assert CaptureAgent.last_kwargs.get("org_unit_llm_filter_enabled") is False
 
 
 async def test_dispatcher_passes_resume_mode_to_agent(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -224,7 +330,7 @@ def test_cli_help_outputs_commands():
 
     result = runner.invoke(cli, ["skills", "--help"])
     assert result.exit_code == 0
-    assert "rollback" in result.output
+    assert "list" in result.output
 
     result = runner.invoke(cli, ["--help"])
     assert result.exit_code == 0
@@ -233,10 +339,6 @@ def test_cli_help_outputs_commands():
 
 
 async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys):
-    class _FakeDb:
-        async def close(self):
-            return None
-
     class _FakeManager:
         def list_skills(self):
             return [
@@ -252,10 +354,12 @@ async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys)
                 )
             ]
 
-    async def _fake_manager():
-        return _FakeDb(), _FakeManager()
+    def _fake_skill_manager_for_settings(settings, agent_name):
+        _ = settings
+        assert agent_name == "crawler"
+        return _FakeManager()
 
-    monkeypatch.setattr(crawler_cli, "_manager", _fake_manager)
+    monkeypatch.setattr(crawler_cli, "_skill_manager_for_settings", _fake_skill_manager_for_settings)
 
     await crawler_cli._list_skills_async()
     output = capsys.readouterr().out
@@ -263,6 +367,20 @@ async def test_skills_list_outputs_scope_metadata(monkeypatch, tmp_path, capsys)
     assert "applies_to=FIND_FACULTY_PAGES" in output
     assert "allowed_tools=extract_links" in output
     assert "token_budget=500" in output
+
+
+def test_skills_cli_accepts_data_steward_agent(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def _fake_list(agent_name="crawler"):
+        captured["agent_name"] = agent_name
+
+    monkeypatch.setattr(crawler_cli, "_list_skills_async", _fake_list)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["skills", "--agent", "data_steward", "list"])
+    assert result.exit_code == 0, result.output
+    assert captured["agent_name"] == "data_steward"
 
 
 def test_runtime_cli_exposes_crawler_commands():
@@ -279,6 +397,9 @@ def test_crawl_cli_passes_org_unit_filters(monkeypatch):
     async def _fake_crawl_async(settings, universities, **kwargs):
         captured["settings_target_org_units"] = list(settings.target_org_units)
         captured["settings_org_unit_match_threshold"] = float(settings.org_unit_match_threshold)
+        captured["settings_org_unit_exclude_enabled"] = bool(settings.org_unit_exclude_enabled)
+        captured["settings_org_unit_exclude_keywords"] = list(settings.org_unit_exclude_keywords)
+        captured["settings_org_unit_llm_filter_enabled"] = bool(settings.org_unit_llm_filter_enabled)
         captured["universities"] = universities
         captured["kwargs"] = kwargs
 
@@ -295,6 +416,9 @@ def test_crawl_cli_passes_org_unit_filters(monkeypatch):
             "计算机学院,软件学院",
             "--org-unit-match-threshold",
             "0.7",
+            "--org-unit-exclude-keywords",
+            "艺术学院,体育学院",
+            "--no-org-unit-llm-filter",
             "--skip-llm-check",
         ],
     )
@@ -302,6 +426,32 @@ def test_crawl_cli_passes_org_unit_filters(monkeypatch):
     assert captured["universities"] == ["A"]
     assert captured["settings_target_org_units"] == ["计算机学院", "软件学院"]
     assert captured["settings_org_unit_match_threshold"] == 0.7
+    assert captured["settings_org_unit_exclude_enabled"] is True
+    assert captured["settings_org_unit_exclude_keywords"] == ["艺术学院", "体育学院"]
+    assert captured["settings_org_unit_llm_filter_enabled"] is False
+
+
+def test_crawl_cli_can_disable_org_unit_exclusion(monkeypatch):
+    captured: dict[str, object] = {}
+
+    async def _fake_crawl_async(settings, universities, **kwargs):
+        captured["settings_org_unit_exclude_enabled"] = bool(settings.org_unit_exclude_enabled)
+
+    monkeypatch.setattr(crawler_cli, "_crawl_async", _fake_crawl_async)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "crawl",
+            "--universities",
+            "A",
+            "--no-org-unit-exclude",
+            "--skip-llm-check",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["settings_org_unit_exclude_enabled"] is False
 
 
 async def test_crawl_async_wraps_import_error_as_click_exception(tmp_path, monkeypatch):
@@ -366,10 +516,12 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
         llm_enabled,
         max_context_tokens,
         include_backup_audit,
+        export,
     ):
         captured["universities"] = universities
         captured["db_roots"] = db_roots
         captured["apply"] = apply
+        captured["export"] = export
         return type(
             "Summary",
             (),
@@ -380,6 +532,8 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
                 "total_duplicates_deleted": 0,
                 "total_missing_field_audits": 2,
                 "total_recrawl_tasks_upserted": 0,
+                "total_exports": 1,
+                "total_exported_bytes": 123,
                 "unmatched_universities": [],
                 "unmatched_db_roots": [],
                 "runs": [],
@@ -397,12 +551,23 @@ def test_steward_run_cli_passes_university_selectors(monkeypatch):
             "A,B",
             "--db-roots",
             "pku.edu.cn,tsinghua.edu.cn",
+            "--apply",
+            "--export",
         ],
     )
     assert result.exit_code == 0, result.output
     assert captured["universities"] == ["A", "B"]
     assert captured["db_roots"] == ["pku.edu.cn", "tsinghua.edu.cn"]
-    assert captured["apply"] is False
+    assert captured["apply"] is True
+    assert captured["export"] is True
+    assert "exports=1" in result.output
+    assert "exported_bytes=123" in result.output
+
+
+def test_steward_llm_default_depends_on_api_key():
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key="key"), None) is True
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key=""), None) is False
+    assert crawler_cli._resolve_steward_llm_enabled(CrawlerSettings(openai_api_key="key"), False) is False
 
 
 def test_dispatcher_factory_uses_human_backend(tmp_path):
@@ -457,7 +622,10 @@ async def test_crawl_async_passes_resume_to_dispatcher(tmp_path, monkeypatch):
 async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\nB,https://b.sample.edu.cn/,Y\n",
+        _manual_manifest(
+            ("A", "https://a.example.edu.cn/", "X"),
+            ("B", "https://b.sample.edu.cn/", "Y"),
+        ),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -493,7 +661,7 @@ async def test_dispatcher_fresh_mode_backs_up_only_selected_target_db(tmp_path):
 async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -524,21 +692,47 @@ async def test_dispatcher_resume_mode_skips_completed_db_with_professors(tmp_pat
                 "source_url": "https://a.example.edu.cn/cs/faculty",
             },
         )
+        org_unit = (await session.execute(select(OrgUnit).where(OrgUnit.name == "CS"))).scalar_one()
+        polluted = Professor(
+            name="Ada（兼）",
+            name_key="Ada（兼）",
+            org_unit_name="CS",
+            homepage="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            bio="polluted row",
+        )
+        session.add(polluted)
+        await session.flush()
+        session.add(
+            ProfessorAffiliation(
+                professor_id=polluted.id,
+                org_unit_id=org_unit.id,
+                source_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            )
+        )
     await db.close()
 
     dispatcher = CrawlDispatcher(settings=settings, agent_factory=FakeAgent, fetcher_factory=NoopFetcher)
-    summary = await dispatcher.run(universities=["A"], resume=True)
+    summary = await dispatcher.run(resume=True)
 
     assert summary.success == 0
     assert summary.failed == 0
     assert summary.skipped == 1
     assert not (Path(settings.university_db_dir) / "backup").exists()
 
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        professors = (await session.execute(select(Professor))).scalars().all()
+        assert len(professors) == 1
+        assert professors[0].name == "Ada"
+        assert professors[0].bio == "polluted row"
+    await db.close()
 
-async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypatch):
+
+async def test_dispatcher_resume_cleans_excluded_org_units_before_skip(tmp_path):
     websites = tmp_path / "websites.csv"
     websites.write_text(
-        "name,url,location\nA,https://a.example.edu.cn/,X\n",
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
         encoding="utf-8",
     )
     settings = CrawlerSettings(
@@ -546,6 +740,313 @@ async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypa
         crawler_skills_dir=tmp_path / "skills",
         university_db_dir=tmp_path / "universities",
         max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Continue A",
+                "title": "Professor",
+                "org_unit_name": "继续教育学院",
+                "org_unit_url": "https://jxjy.a.example.edu.cn/",
+                "source_url": "https://jxjy.a.example.edu.cn/faculty",
+            },
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        assert [unit.name for unit in org_units] == ["CS"]
+        assert [professor.name for professor in professors] == ["Ada"]
+    await db.close()
+
+
+async def test_dispatcher_resume_merges_sub_department_org_units_before_skip(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.get_or_create_org_unit(
+            session,
+            name="自动化科学与电气工程学院",
+            url="https://auto.a.example.edu.cn/",
+            kind="college",
+        )
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Sub A",
+                "title": "Professor",
+                "org_unit_name": "工业互联网与建模仿真系",
+                "org_unit_url": "https://auto.a.example.edu.cn/szdw/gongye.htm",
+                "source_url": "https://auto.a.example.edu.cn/szdw/gongye.htm",
+            },
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        org_units = (await session.execute(select(OrgUnit).order_by(OrgUnit.name))).scalars().all()
+        professors = (await session.execute(select(Professor).order_by(Professor.name))).scalars().all()
+        affiliations = (await session.execute(select(ProfessorAffiliation))).scalars().all()
+        parent_id = int(org_units[0].id)
+        assert [unit.name for unit in org_units] == ["自动化科学与电气工程学院"]
+        assert [(professor.name, professor.org_unit_name) for professor in professors] == [
+            ("Sub A", "自动化科学与电气工程学院")
+        ]
+        assert {int(affiliation.org_unit_id) for affiliation in affiliations} == {parent_id}
+    await db.close()
+
+
+async def test_dispatcher_resume_mode_reruns_completed_db_with_retryable_fetch_failure(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_page_cache(
+            session,
+            url="https://a.example.edu.cn/cs",
+            fetched=FetchResult(
+                "https://a.example.edu.cn/cs",
+                "",
+                [],
+                0,
+                block_reason="timeout",
+            ),
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("resume_mode") is True
+    assert CaptureAgent.last_kwargs.get("resume_force_existing") is False
+
+
+async def test_dispatcher_resume_mode_reruns_completed_db_with_recoverable_crawl_task(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "homepage": "https://a.example.edu.cn/cs/info/1001/ada.htm",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+        await crawler_db.upsert_crawl_task(
+            session,
+            university="A",
+            org_unit_name="CS",
+            org_unit_url="https://a.example.edu.cn/cs",
+            source_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            page_url="https://a.example.edu.cn/cs/info/1001/ada.htm",
+            page_hash="completion-recrawl",
+            task_kind=CrawlTaskKind.DETAIL_PAGE,
+            page_text_snapshot="",
+            allowed_tools='["save_professors"]',
+            status=CrawlTaskStatus.RETRY,
+            priority=-10,
+            last_error="completion_recrawl_missing_research_areas",
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("resume_mode") is True
+    assert CaptureAgent.last_kwargs.get("resume_force_existing") is False
+
+
+async def test_dispatcher_resume_explicit_university_runs_completed_db_with_professors(tmp_path):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
+    )
+    db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
+    db = DatabaseManager(_sqlite_url(db_path))
+    await db.init_db()
+    async with db.session() as session:
+        await crawler_db.ensure_runtime_schema(session)
+        await crawler_db.ensure_university_meta(
+            session,
+            name="A",
+            start_url="https://a.example.edu.cn/",
+            location="X",
+        )
+        await crawler_db.set_university_status(session, CrawlStatus.COMPLETED)
+        await crawler_db.upsert_professor(
+            session,
+            {
+                "name": "Ada",
+                "title": "Professor",
+                "org_unit_name": "CS",
+                "org_unit_url": "https://a.example.edu.cn/cs",
+                "source_url": "https://a.example.edu.cn/cs/faculty",
+            },
+        )
+    await db.close()
+
+    CaptureAgent.last_kwargs = None
+    dispatcher = CrawlDispatcher(settings=settings, agent_factory=CaptureAgent, fetcher_factory=NoopFetcher)
+    summary = await dispatcher.run(universities=["A"], resume=True)
+
+    assert summary.success == 1
+    assert summary.failed == 0
+    assert summary.skipped == 0
+    assert CaptureAgent.last_kwargs is not None
+    assert CaptureAgent.last_kwargs.get("resume_mode") is True
+    assert CaptureAgent.last_kwargs.get("resume_force_existing") is True
+
+
+async def test_dispatcher_fresh_mode_aborts_when_backup_fails(tmp_path, monkeypatch):
+    websites = tmp_path / "websites.csv"
+    websites.write_text(
+        _manual_manifest(("A", "https://a.example.edu.cn/", "X")),
+        encoding="utf-8",
+    )
+    settings = CrawlerSettings(
+        websites_path=websites,
+        crawler_skills_dir=tmp_path / "skills",
+        university_db_dir=tmp_path / "universities",
+        max_concurrency=1,
+        org_unit_llm_filter_enabled=False,
     )
     db_path = _university_db_path(Path(settings.university_db_dir), "https://a.example.edu.cn/")
     db_path.parent.mkdir(parents=True, exist_ok=True)

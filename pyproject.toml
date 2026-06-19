@@ -17,6 +17,7 @@ dependencies = [
     "tiktoken>=0.7.0",
     "pypdf>=6.12.2",
     "python-docx>=1.2.0",
+    "pyyaml>=6.0.2",
 ]
 
 [project.scripts]
@@ -39,3 +40,6 @@ packages = ["src/runtime", "src/agents"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live_llm: live LLM prompt validation tests gated by YANCLAW_LLM_LIVE_TESTS=1",
+]

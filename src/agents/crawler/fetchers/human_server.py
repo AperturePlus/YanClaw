@@ -9,6 +9,7 @@ from typing import Any
 from aiohttp import web
 
 from agents.crawler.fetchers.human_models import FetchJobStatus, JobQueue
+from agents.crawler.text_repair import repair_mojibake_text
 from runtime.logger import get_logger
 
 logger = get_logger("crawler.human_server")
@@ -71,32 +72,50 @@ async def _handle_get_job(request: web.Request) -> web.Response:
 async def _handle_complete(request: web.Request) -> web.Response:
     queue: JobQueue = request.app[_KEY_QUEUE]
     job_id = request.match_info["id"]
+    # Force a UTF-8 body read (independent of any Content-Type charset) and repair
+    # mojibake defensively: the userscript transport can reinterpret the page's
+    # UTF-8 bytes as Latin-1, and repair_mojibake_text heals that on ingest.
     try:
-        body = await request.json()
-    except (json.JSONDecodeError, Exception):
+        raw_body = await request.read()
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, Exception):
         return _json_response({"error": "invalid json"}, status=400)
 
-    html = body.get("html", "")
+    html = repair_mojibake_text(body.get("html", ""))
     if not html:
         return _json_response({"error": "html is required"}, status=400)
+
+    title = body.get("title")
+    if isinstance(title, str):
+        title = repair_mojibake_text(title)
 
     try:
         job = queue.complete(
             job_id,
             html=html,
             url=body.get("url"),
-            title=body.get("title"),
+            title=title,
+            pagination_states=body.get("pagination_states") if isinstance(body.get("pagination_states"), list) else None,
         )
     except KeyError:
         return _json_response({"error": "not found"}, status=404)
 
-    logger.info("Job completed id=%s url=%s", job.id, job.result_url)
+    if job.completed_after_timeout:
+        response_status = "completed_after_timeout"
+        logger.info("Job completed after timeout id=%s url=%s", job.id, job.result_url)
+    elif job.status == FetchJobStatus.COMPLETED:
+        response_status = "completed"
+        logger.info("Job completed id=%s url=%s", job.id, job.result_url)
+    else:
+        response_status = f"ignored_{job.status.value}"
+        logger.info("Job completion ignored id=%s status=%s url=%s", job.id, job.status.value, job.url)
 
     # Eagerly return next job to reduce round-trips.
-    next_job = await queue.next(timeout=0.1)
-    result: dict[str, Any] = {"status": "completed"}
-    if next_job is not None:
-        result["next_job"] = next_job.to_dict()
+    result: dict[str, Any] = {"status": response_status}
+    if job.status == FetchJobStatus.COMPLETED:
+        next_job = await queue.next(timeout=0.1)
+        if next_job is not None:
+            result["next_job"] = next_job.to_dict()
     return _json_response(result)
 
 

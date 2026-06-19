@@ -34,6 +34,37 @@ async def test_fetch_returns_result_on_complete():
     assert result.link_signals[0].url == "https://example.edu.cn/page"
 
 
+async def test_fetch_preserves_reported_pagination_states():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    state = {
+        "kind": "form_submit",
+        "state_id": "form:fromWen:fromWenNOWPAGE:2",
+        "label": "fromWen 第 2 页",
+        "page_index": 2,
+        "total_pages": 19,
+        "form_name": "fromWen",
+        "fields": {"fromWenNOWPAGE": "2"},
+        "submit": True,
+        "synthetic_url": "https://example.edu.cn/xylb.jsp?__ycl_page=2",
+        "url": "https://example.edu.cn/xylb.jsp",
+    }
+
+    async def _simulate_human():
+        for _ in range(50):
+            job = await bridge.queue.next(timeout=0.05)
+            if job:
+                bridge.queue.complete(job.id, html="<html><body>ok</body></html>", pagination_states=[state])
+                return
+            await asyncio.sleep(0.02)
+
+    task = asyncio.create_task(_simulate_human())
+    result = await bridge.fetch("https://example.edu.cn/xylb.jsp")
+    await task
+
+    assert [item.page_index for item in result.pagination_states] == [2]
+    assert result.pagination_states[0].synthetic_url.endswith("__ycl_page=2")
+
+
 async def test_fetch_returns_empty_on_skip():
     bridge = HumanFetcherBridge(job_timeout_seconds=5)
 
@@ -73,11 +104,26 @@ async def test_fetch_returns_empty_on_fail():
     assert result.block_reason == "login required"
 
 
+async def test_fetch_rejects_invalid_url_without_queueing_job():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    bad_url = (
+        "https://example.edu.cn/szdw/"
+        "%3Cspan%20style='color:red;font-size:9pt'%3E"
+        "%E8%BD%AC%E6%8D%A2%E9%93%BE%E6%8E%A5%E9%94%99%E8%AF%AF%3C/span"
+    )
+
+    result = await bridge.fetch(bad_url)
+
+    assert result.status_code == 0
+    assert result.block_reason == "invalid_url"
+    assert await bridge.queue.next(timeout=0.01) is None
+
+
 async def test_fetch_timeout():
     bridge = HumanFetcherBridge(job_timeout_seconds=0.1)
     result = await bridge.fetch("https://example.edu.cn/")
     assert result.status_code == 0
-    assert "timeout" in (result.block_reason or "")
+    assert result.block_reason == "timeout"
 
 
 async def test_set_context_propagates():
@@ -122,9 +168,26 @@ async def test_queue_complete_cannot_override_failed_job():
     bridge = HumanFetcherBridge(job_timeout_seconds=5)
     job = FetchJob(url="https://example.edu.cn/", context=JobContext())
     await bridge.queue.submit(job)
-    bridge.queue.fail(job.id, "timeout")
+    bridge.queue.fail(job.id, "login required")
     bridge.queue.complete(job.id, html="<html><body>late</body></html>", url="https://example.edu.cn/late")
 
     stored = bridge.queue.get(job.id)
     assert stored is not None
     assert stored.status == FetchJobStatus.FAILED
+    assert stored.result_html is None
+
+
+async def test_queue_complete_accepts_late_timeout_result():
+    bridge = HumanFetcherBridge(job_timeout_seconds=5)
+    job = FetchJob(url="https://example.edu.cn/", context=JobContext())
+    await bridge.queue.submit(job)
+    bridge.queue.fail(job.id, "timeout")
+    bridge.queue.complete(job.id, html="<html><body>late</body></html>", url="https://example.edu.cn/late")
+
+    stored = bridge.queue.get(job.id)
+    assert stored is not None
+    assert stored.status == FetchJobStatus.COMPLETED
+    assert stored.completed_after_timeout is True
+    assert stored.result_html == "<html><body>late</body></html>"
+    assert stored.result_url == "https://example.edu.cn/late"
+    assert stored.error_message is None

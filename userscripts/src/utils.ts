@@ -5,11 +5,21 @@ export function urlMatches(a: string, b: string): boolean {
     // Ignore protocol (http vs https) — many university sites redirect.
     return (
       u1.hostname === u2.hostname &&
-      u1.pathname.replace(/\/+$/, '') === u2.pathname.replace(/\/+$/, '')
+      u1.pathname.replace(/\/+$/, '') === u2.pathname.replace(/\/+$/, '') &&
+      normalizedSearch(u1) === normalizedSearch(u2)
     );
   } catch {
     return false;
   }
+}
+
+function normalizedSearch(url: URL): string {
+  if (!url.search) return '';
+  const params = [...url.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) => {
+    const keyOrder = aKey.localeCompare(bKey);
+    return keyOrder || aValue.localeCompare(bValue);
+  });
+  return params.map(([key, value]) => `${key}=${value}`).join('&');
 }
 
 /** Match hostname only (ignoring protocol and path). Handles www prefix and http/https redirects. */
@@ -48,23 +58,6 @@ export function truncUrl(url: string, max = 40): string {
     return url.slice(0, max);
   }
 }
-
-export function timeAgo(date: Date): string {
-  const s = Math.round((Date.now() - date.getTime()) / 1000);
-  if (s < 60) return `${s}s ago`;
-  return `${Math.round(s / 60)}m ago`;
-}
-
-const STATUS_ICONS: Record<string, string> = {
-  completed: '✅',
-  skipped: '⏭',
-  failed: '❌',
-};
-
-export function statusIcon(status: string): string {
-  return STATUS_ICONS[status] ?? '❓';
-}
-
 
 const ERROR_PATTERNS = /502 bad gateway|503 service|504 gateway|500 internal|error occurred|server error|nginx/i;
 

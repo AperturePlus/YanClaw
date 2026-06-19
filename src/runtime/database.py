@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import event
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -13,26 +12,11 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase
 
 
 class Base(DeclarativeBase):
     pass
-
-
-class SkillVersion(Base):
-    __tablename__ = "skill_versions"
-    __table_args__ = (
-        UniqueConstraint("agent_name", "skill_name", "version", name="uq_skill_version"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    skill_name: Mapped[str] = mapped_column(String(255), index=True)
-    version: Mapped[int] = mapped_column(Integer)
-    content: Mapped[str] = mapped_column(Text)
-    change_summary: Mapped[str] = mapped_column(Text, default="")
-    agent_name: Mapped[str] = mapped_column(String(255), index=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class DatabaseManager:
@@ -50,6 +34,7 @@ class DatabaseManager:
         self.database_url = database_url
         _ensure_sqlite_parent_dir(database_url)
         self.engine: AsyncEngine = create_async_engine(database_url, echo=echo)
+        _configure_sqlite_engine(self.engine)
         self.session_factory = async_sessionmaker(
             self.engine,
             class_=AsyncSession,
@@ -82,6 +67,27 @@ class DatabaseManager:
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+
+def _configure_sqlite_engine(engine: AsyncEngine) -> None:
+    """Apply concurrency/durability PRAGMAs to every new SQLite connection.
+
+    journal_mode=WAL is persisted in the database header; busy_timeout and
+    synchronous are per-connection and must be re-applied on each connect.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=15000")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 def _ensure_sqlite_parent_dir(database_url: str) -> None:

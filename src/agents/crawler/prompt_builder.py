@@ -3,13 +3,57 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agents.crawler.url_heuristics import (
+from agents.crawler.heuristic_constants import (
     FACULTY_KEYWORDS,
     ORG_UNIT_PAGE_KEYWORDS,
+)
+from agents.crawler.url_heuristics import (
     _keyword_filter,
     _truncate_middle,
 )
 from runtime.context import ContextManager
+
+
+CRAWLER_SYSTEM_PROMPT = "You are a cautious university faculty crawler. Stay on the same university domain."
+
+PROFESSOR_DETAIL_INSTRUCTION_TEMPLATE = (
+    "Extract professor records from this detail page and call save_professors when records are found. "
+    "Use org_unit_name={org_unit_name}. Set source_url to the current page URL. "
+    "Prioritize fields: title, email, phone, research_areas, bio, homepage, external_link. "
+    "Only save records with a visible name and at least one concrete evidence field such as "
+    "title/email/phone/research_areas/bio/homepage/external_link/publications/enrollment_pref. "
+    "If only a name is visible, do not save a placeholder. "
+    "If this is an individual profile with a visible name, academic title, and extractable facts, "
+    "call save_professors; do not return explanatory prose only. "
+    "Official same-domain profile pages under sections such as 名师风采/院士 should be saved when "
+    "they present the person as part of the university site, even if office address or affiliations mention another institute. "
+    "Research areas may appear as text under headings like 研究方向/研究领域 or as linked anchor text; "
+    "they may also be short technical phrases in sections such as 科研项目/论文著作/代表论文/科研成果/项目题名. "
+    "Save only concise visible phrases in research_areas. "
+    "If visible body text follows headings like 个人简介/简介/个人概况/学习工作经历/工作经历/教育经历/教学情况/管理经验, "
+    "save a short factual summary in bio without inventing missing content. "
+    "If this page only contains category/list names without these fields, do not save placeholders. "
+    "Do not include retired/emeritus records. "
+    "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
+)
+
+PROFESSOR_LIST_INSTRUCTION_TEMPLATE = (
+    "This is a faculty roster/list traversal task for org_unit_name={org_unit_name}. "
+    "Do not call save_professors for roster/list pages, even when visible names or titles appear. "
+    "Professor facts are saved only from personal detail pages or strong single-person detail pages. "
+    "Use the page only to support navigation to detail pages, related faculty pages, and pagination. "
+    "Skip noise pages dominated by notices/news/policies/recruitment/personnel content."
+)
+
+PROFESSOR_STRICT_RETRY_SUFFIX = (
+    " Retry mode: call save_professors with only key fields "
+    "{name,title,email,phone,research_areas,bio}; keep response concise, max 25 records, "
+    "include a short bio when visible, escape quotes inside JSON strings, "
+    "avoid publications, long arrays, and extra keys."
+)
+
+TOOL_CALL_POLICY_TEMPLATE = "Tool call policy: {policy}"
+STRICT_JSON_TOOL_CALL_POLICY_TEMPLATE = "Tool call policy: {policy} Keep output short and strict JSON."
 
 
 class CrawlerPromptBuilder:
@@ -39,32 +83,11 @@ class CrawlerPromptBuilder:
 
     @staticmethod
     def build_professor_instruction(org_unit_name: str, *, detail_mode: bool, strict_retry: bool) -> str:
-        if detail_mode:
-            base = (
-                "Extract professor records from this detail page and call save_professors when records are found. "
-                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                + "Prioritize fields: email, phone, research_areas. "
-                + "Only save records that include at least one of email/phone/research_areas. "
-                + "If this page only contains category/list names without these fields, do not save placeholders. "
-                + "Do not include retired/emeritus records. "
-                + "If content is mainly notices/news/policies/recruitment/personnel announcements, skip saving."
-            )
-        else:
-            base = (
-                "Extract public professor records and call save_professors when records are found. "
-                + f"Use org_unit_name={org_unit_name!r}. Set source_url to the current page URL. "
-                + "For official roster/list pages, save visible names and academic titles even when email/phone/research_areas are absent; detail pages may enrich them later. "
-                + "If this is a paginated list, also return pagination links (next page, page 2, etc.). "
-                + "Do not include retired/emeritus records. "
-                + "Skip noise pages dominated by notices/news/policies/recruitment/personnel content."
-            )
+        template = PROFESSOR_DETAIL_INSTRUCTION_TEMPLATE if detail_mode else PROFESSOR_LIST_INSTRUCTION_TEMPLATE
+        base = template.format(org_unit_name=repr(org_unit_name))
         if not strict_retry:
             return base
-        return (
-            base
-            + " Retry mode: output only key fields {name,title,email,phone,research_areas}; "
-            + "keep response concise, max 25 records, avoid extra keys."
-        )
+        return f"{base}{PROFESSOR_STRICT_RETRY_SUFFIX}"
 
     @staticmethod
     def state_link_limit(state: Any) -> int:
@@ -113,6 +136,11 @@ class CrawlerPromptBuilder:
         if len(names) == 1:
             return f"Only call {names[0]}. Do not invent tool names."
         return f"Only call tools listed in allowed_tools ({', '.join(names)}). Do not invent tool names."
+
+    @staticmethod
+    def build_dynamic_system_content(allowed_tools: set[str], *, strict_json: bool = False) -> str:
+        template = STRICT_JSON_TOOL_CALL_POLICY_TEMPLATE if strict_json else TOOL_CALL_POLICY_TEMPLATE
+        return template.format(policy=CrawlerPromptBuilder.build_tool_call_policy(allowed_tools))
 
     def build_llm_payload(
         self,

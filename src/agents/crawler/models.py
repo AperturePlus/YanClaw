@@ -35,6 +35,33 @@ class CrawlTaskKind(str, Enum):
     DETAIL_PAGE = "detail_page"
 
 
+class CrawlGraphNodeType(str, Enum):
+    ORG_UNIT = "org_unit"
+    ORG_LISTING_URL = "org_listing_url"
+    FACULTY_LIST_URL = "faculty_list_url"
+    FACULTY_FOLLOWUP_URL = "faculty_followup_url"
+    PAGINATION_URL = "pagination_url"
+    DETAIL_URL = "detail_url"
+
+
+class CrawlGraphNodeStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    RETRY = "retry"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class CrawlGraphEdgeType(str, Enum):
+    SEEDED_FROM_MANIFEST = "seeded_from_manifest"
+    DISCOVERED_ON_PAGE = "discovered_on_page"
+    BELONGS_TO_ORG_UNIT = "belongs_to_org_unit"
+    PAGINATION_OF = "pagination_of"
+    DETAIL_CANDIDATE_OF = "detail_candidate_of"
+    BLOCKED_BY = "blocked_by"
+
+
 class OrgUnitStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -223,6 +250,70 @@ class CrawlExtractionFailure(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     task: Mapped[CrawlTask | None] = relationship(back_populates="failures")
+
+
+class CrawlGraphNode(Base):
+    __tablename__ = "crawl_graph_nodes"
+    __table_args__ = (
+        UniqueConstraint("node_key", name="uq_crawl_graph_node_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_key: Mapped[str] = mapped_column(String(512), index=True)
+    type: Mapped[str] = mapped_column(String(64), index=True)
+    url: Mapped[str] = mapped_column(Text, default="", index=True)
+    org_unit_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    org_unit_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default=CrawlGraphNodeStatus.PENDING.value, index=True)
+    priority_score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    base_priority: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    outgoing_edges: Mapped[list["CrawlGraphEdge"]] = relationship(
+        "CrawlGraphEdge",
+        foreign_keys="CrawlGraphEdge.from_node_id",
+        back_populates="from_node",
+        cascade="all, delete-orphan",
+    )
+    incoming_edges: Mapped[list["CrawlGraphEdge"]] = relationship(
+        "CrawlGraphEdge",
+        foreign_keys="CrawlGraphEdge.to_node_id",
+        back_populates="to_node",
+        cascade="all, delete-orphan",
+    )
+
+
+class CrawlGraphEdge(Base):
+    __tablename__ = "crawl_graph_edges"
+    __table_args__ = (
+        UniqueConstraint("from_node_id", "to_node_id", "edge_type", name="uq_crawl_graph_edge"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_node_id: Mapped[int] = mapped_column(ForeignKey("crawl_graph_nodes.id"), index=True)
+    to_node_id: Mapped[int] = mapped_column(ForeignKey("crawl_graph_nodes.id"), index=True)
+    edge_type: Mapped[str] = mapped_column(String(64), index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    from_node: Mapped[CrawlGraphNode] = relationship(
+        "CrawlGraphNode",
+        foreign_keys=[from_node_id],
+        back_populates="outgoing_edges",
+    )
+    to_node: Mapped[CrawlGraphNode] = relationship(
+        "CrawlGraphNode",
+        foreign_keys=[to_node_id],
+        back_populates="incoming_edges",
+    )
 
 
 class StewardRun(Base):

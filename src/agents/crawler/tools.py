@@ -4,7 +4,7 @@ from typing import Any
 
 from agents.crawler import db as crawler_db
 from agents.crawler.fetchers import Fetcher
-from agents.crawler.sanitizer import contains_retired_hint, sanitize_professor_payload
+from agents.crawler.sanitizer import contains_postdoc_hint, contains_retired_hint, sanitize_professor_payload
 from runtime.database import DatabaseManager
 from runtime.skills import SkillManager
 
@@ -21,7 +21,6 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
             "source_url": {"type": "string"},
             "professors": {
                 "type": "array",
-                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -37,6 +36,7 @@ SAVE_PROFESSORS_TOOL: dict[str, Any] = {
                         "phone": {"type": "string"},
                         "homepage": {"type": "string"},
                         "external_link": {"type": "string"},
+                        "is_academician": {"type": "boolean"},
                         "bio": {"type": "string"},
                         "enrollment_pref": {"type": "string"},
                         "publications": {
@@ -133,6 +133,7 @@ def get_crawler_tools(
         updated = 0
         unchanged = 0
         deduped_by_name_key = 0
+        deduped_by_homepage = 0
         academicians_saved = 0
         academicians_updated = 0
         academicians_unchanged = 0
@@ -140,7 +141,9 @@ def get_crawler_tools(
         academicians_enriched = 0
         professors_deleted_as_academician_duplicates = 0
         filtered_retired = 0
+        filtered_postdoc = 0
         errors: list[str] = []
+        prepared_professors: list[tuple[dict[str, Any], bool]] = []
         for professor in professors:
             try:
                 if contains_retired_hint(
@@ -151,12 +154,26 @@ def get_crawler_tools(
                 ):
                     filtered_retired += 1
                     continue
+                if contains_postdoc_hint(
+                    name=professor.get("name"),
+                    title=professor.get("title"),
+                    bio=professor.get("bio"),
+                    source_url=source_url,
+                ):
+                    filtered_postdoc += 1
+                    continue
                 cleaned, is_academician = sanitize_professor_payload(
                     professor,
                     org_unit_name=org_unit_name,
                 )
                 accepted += 1
-                async with db.session() as session:
+                prepared_professors.append((cleaned, is_academician))
+            except Exception as exc:
+                errors.append(f"{professor.get('name', '?')}: {exc}")
+
+        if prepared_professors:
+            async with db.session() as session:
+                for cleaned, is_academician in prepared_professors:
                     data = {
                         **cleaned,
                         "org_unit_url": org_unit_url,
@@ -173,6 +190,8 @@ def get_crawler_tools(
                             academicians_unchanged += 1
                         if upsert_result.deduped_by_name_key:
                             deduped_by_name_key += 1
+                        if upsert_result.deduped_by_homepage:
+                            deduped_by_homepage += 1
                         removed = await crawler_db.delete_professor_duplicates_for_academician(
                             session,
                             academician,
@@ -219,14 +238,15 @@ def get_crawler_tools(
                             unchanged += 1
                         if upsert_result.deduped_by_name_key:
                             deduped_by_name_key += 1
-            except Exception as exc:
-                errors.append(f"{professor.get('name', '?')}: {exc}")
+                        if upsert_result.deduped_by_homepage:
+                            deduped_by_homepage += 1
         result: dict[str, Any] = {
             "accepted": accepted,
             "created": created,
             "updated": updated,
             "unchanged": unchanged,
             "deduped_by_name_key": deduped_by_name_key,
+            "deduped_by_homepage": deduped_by_homepage,
             "saved": created,
         }
         if academicians_saved:
@@ -243,6 +263,8 @@ def get_crawler_tools(
             result["professors_deleted_as_academician_duplicates"] = professors_deleted_as_academician_duplicates
         if filtered_retired:
             result["filtered_retired"] = filtered_retired
+        if filtered_postdoc:
+            result["filtered_postdoc"] = filtered_postdoc
         if errors:
             result["errors"] = errors
         return result

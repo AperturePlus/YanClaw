@@ -151,7 +151,7 @@
   - `is_url_crawled(session, url) -> bool` — 查询 URL 是否已成功抓取（跨运行去重）
   - `get_university_status(session, name) -> CrawlStatus` — 查询大学爬取状态
   - `set_university_status(session, name, status)` — 更新大学爬取状态
-  - `load_universities_from_csv(session, path)` — 从 `assets/websites.md` 导入大学列表
+  - `load_university_targets_from_csv(path)` — 从默认 `assets/entrances.yaml` 或旧 CSV manifest 导入大学列表与人工入口
 
 **测试**:
 - 测试 upsert_professor 插入和更新（同名同学院 → 更新而非重复插入）
@@ -250,7 +250,9 @@
 
 **实现**:
 - 创建 `src/agents/crawler/dispatcher.py`：`CrawlDispatcher` 类
-  - 解析 `assets/websites.md` 获取大学列表
+  - 解析默认 `assets/entrances.yaml` 获取大学列表与人工学院列表/逐学院师资入口，兼容旧 CSV manifest
+  - YAML 直接维护正式高校名和正式学院名，不在运行时推断简称或短名
+  - 缺少人工入口的高校在 fresh run 中返回 `manual_entrance_missing`，不创建、备份或删除该高校 DB
   - `asyncio.Semaphore(max_concurrency)` 控制并发
   - 共享 Fetcher 实例（per-domain 限速跨 Agent 生效）
   - 断点续爬：跳过 `crawl_status=completed` 的大学

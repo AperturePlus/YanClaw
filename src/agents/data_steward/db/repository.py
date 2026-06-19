@@ -34,8 +34,8 @@ async def create_run(
     return int(run.id)
 
 
-async def ensure_schema(session: AsyncSession) -> None:
-    await crawler_db.ensure_runtime_schema(session)
+async def ensure_schema(session: AsyncSession, *, repair_identity: bool = True) -> None:
+    await crawler_db.ensure_runtime_schema(session, repair_identity=repair_identity)
 
 
 async def finish_run(
@@ -86,6 +86,14 @@ async def add_audit(
 
 async def list_duplicates(session: AsyncSession) -> list[tuple[Professor, Academician, str]]:
     return await crawler_db.list_professor_academician_duplicates(session)
+
+
+async def list_identity_repair_candidates(session: AsyncSession) -> list[crawler_db.ProfessorIdentityRepairCandidate]:
+    return await crawler_db.list_professor_identity_repair_candidates(session)
+
+
+async def repair_identity_data(session: AsyncSession) -> crawler_db.ProfessorIdentityRepairSummary:
+    return await crawler_db.repair_professor_identity_data(session, apply=True)
 
 
 async def merge_and_optionally_delete_professor(
@@ -176,6 +184,7 @@ async def upsert_recrawl_task(
     professor: Professor,
     source_url: str,
     last_error: str,
+    priority: int = 0,
 ) -> bool:
     source = (source_url or "").strip()
     if not source:
@@ -183,7 +192,7 @@ async def upsert_recrawl_task(
     university_meta = (await session.execute(select(UniversityMeta))).scalar_one_or_none()
     university_name = str(university_meta.name) if university_meta else ""
     page_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    await crawler_db.upsert_crawl_task(
+    task = await crawler_db.upsert_crawl_task(
         session,
         university=university_name,
         org_unit_name=professor.org_unit_name or "Unknown",
@@ -196,7 +205,7 @@ async def upsert_recrawl_task(
         allowed_tools='["save_professors"]',
         status=CrawlTaskStatus.RETRY,
         attempt=0,
-        priority=0,
+        priority=priority,
         last_error=last_error,
     )
-    return True
+    return task is not None

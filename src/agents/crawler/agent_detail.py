@@ -1,21 +1,37 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import re
 from typing import Any
 from urllib.parse import urlparse
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
-from agents.crawler.models import Professor
+from agents.crawler.graph_frontier import GraphFetchCandidate
+from agents.crawler.agent_state import _DETAIL_PRIORITY_INHERIT_BOOST
+from agents.crawler.models import (
+    CrawlGraphEdgeType,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
+    CrawlTask,
+    CrawlTaskKind,
+    OrgUnit,
+    Professor,
+    ProfessorAffiliation,
+)
+from agents.crawler.sanitizer import contains_self_academician_hint, normalize_name
 from agents.crawler.url_heuristics import (
     _is_explicit_faculty_directory_url,
     _is_faculty_platform,
     _is_non_faculty_noise_url,
     _is_pagination_link,
+    _is_query_profile_detail_url,
     _looks_like_retired_content,
     _looks_like_retired_url,
+    _same_site,
     _sanitize_url,
 )
+from agents.crawler.db.professors import normalize_professor_homepage
 
 _FACULTY_CATEGORY_STEMS = frozenset(
     {
@@ -58,6 +74,88 @@ _FACULTY_CATEGORY_STEMS = frozenset(
     }
 )
 
+# Directory segments that hold individual faculty profile pages (leaf = person slug).
+# Deliberately excludes container dirs that hold *sub-sections* rather than people
+# (`szdw`/`jsdw`/`szll`/`team`/`staff` — already handled as section containers by
+# `_is_faculty_directory_or_category_link`) and the `_FACULTY_CATEGORY_STEMS` (those
+# are section/category stems, e.g. `zzjs`, that appear as roster directories, not
+# person leaves). Keeping only clearly person-leaf dirs avoids misclassifying real
+# faculty-section roster pages (e.g. SCU `/szdw/jczx.htm`, BUAA `/szjs/zzjs/<roster>.htm`).
+_FACULTY_SECTION_DIRS = frozenset(
+    {
+        "jiaoshiml",
+        "shizi",
+        "teacher",
+        "teachers",
+        "faculty",
+        "people",
+    }
+)
+# Path segments that explicitly denote a faculty *detail* page (an individual person),
+# not a roster/section directory. Sites like the SJTU AI school publish each professor at
+# an extensionless `…/facultydetails/<section>/<slug>` URL; the literal "detail" marker is
+# what distinguishes these from section/roster dirs (e.g. SCU `/szdw/<name>.htm`, which
+# stays a section), so this set is kept narrow and keyword-anchored.
+_FACULTY_DETAIL_PATH_MARKERS = frozenset(
+    {
+        "facultydetails",
+        "facultydetail",
+        "teacherdetails",
+        "teacherdetail",
+        "teachersdetails",
+        "professordetails",
+        "professordetail",
+        "szdwdetails",
+        "szdwdetail",
+    }
+)
+# Leaf stems that are landing/category pages, never an individual person.
+_NON_PROFILE_LEAF_STEMS = frozenset({"index", "list", "default", "main", "more", "all"})
+
+
+def _is_person_slug_leaf(leaf: str) -> bool:
+    """True when a URL leaf looks like an individual person slug (pinyin/latin),
+    not a numeric id, landing page, or faculty section/category stem."""
+    if not leaf or leaf.isdigit():
+        return False
+    if leaf in _NON_PROFILE_LEAF_STEMS or leaf in _FACULTY_CATEGORY_STEMS:
+        return False
+    if leaf in _FACULTY_DETAIL_PATH_MARKERS:
+        return False
+    if leaf.endswith(("list", "index")):
+        return False
+    # Person slug: latin/pinyin (optionally with digits/underscore), e.g. "duanshengxiong", "lisiming2".
+    return bool(re.fullmatch(r"[a-z][a-z0-9_]*", leaf))
+
+
+def _looks_like_faculty_section_profile_url(url: str) -> bool:
+    """True for faculty profile-detail URLs of two shapes:
+
+    1. ``/<faculty-dir>/<person-slug>.html`` — a faculty-section directory plus a pinyin
+       name leaf (e.g. SJTU CS ``…/jiaoshiml/duanshengxiong.html``).
+    2. ``…/<facultydetails-marker>/[<section>/]<person-slug>`` — an explicit faculty-detail
+       path segment plus a person-slug leaf, **extension optional** (e.g. SJTU AI school
+       ``…/cn/facultydetails/zzjs/zhanglinfeng``).
+
+    Both are individual profile-detail pages, not list/followup pages.
+    """
+    parsed = urlparse((url or "").lower())
+    path = parsed.path
+    segments = [seg for seg in path.split("/") if seg]
+    if len(segments) < 2:
+        return False
+    leaf = segments[-1].rsplit(".", 1)[0]
+    if not _is_person_slug_leaf(leaf):
+        return False
+    # Shape 1: faculty-section dir + slug leaf; requires a page extension.
+    if path.endswith((".htm", ".html", ".shtml")) and segments[-2] in _FACULTY_SECTION_DIRS:
+        return True
+    # Shape 2: an explicit faculty-detail marker anywhere in the path; extension optional.
+    if any(segment in _FACULTY_DETAIL_PATH_MARKERS for segment in segments):
+        return True
+    return False
+
+
 _DETAIL_URL_HINTS = (
     "/info/",
     "/teacher/",
@@ -98,12 +196,86 @@ _PROFILE_EVIDENCE_TOKENS = (
     "研究领域",
     "科研方向",
     "个人简介",
+    "个人概况",
+    "学习工作经历",
+    "工作经历",
     "教育经历",
+    "教学情况",
+    "管理经验",
     "代表论文",
+    "论文著作",
     "科研项目",
+    "科研成果",
     "homepage",
     "个人主页",
 )
+
+_SNAPSHOT_BIO_HEADINGS = (
+    "个人简介",
+    "个人概况",
+    "简介",
+)
+
+_SNAPSHOT_BIO_STOP_TOKENS = (
+    "要求",
+    "招生要求",
+    "部分论文",
+    "论文著作",
+    "项目成果",
+    "获奖荣誉",
+    "代表论文",
+    "科研项目",
+    "科研成果",
+    "footLogo",
+    "版权所有",
+    "如对我研究方向感兴趣",
+    "---",
+)
+
+_SNAPSHOT_NAVIGATION_BIO_TOKENS = (
+    "校园地图",
+    "VI系统",
+    "校园图库",
+    "网上服务大厅",
+    "校友邮箱",
+    "图书馆",
+)
+
+_SNAPSHOT_FIELD_BOUNDARY_RE = re.compile(
+    r"(?:^|\s+)(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
+    r"主要研究方向|研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
+    re.IGNORECASE,
+)
+_SNAPSHOT_LEADING_FIELD_LABEL_RE = re.compile(
+    r"^\s*(?:姓名|职称|职务|所在系所|电话|办公电话|电子邮箱|邮箱|个人主页|办公地址|"
+    r"主要研究方向|研究方向|研究领域|科研方向|e-?mail|email\s+address|mail|phone|tel|telephone|homepage|home\s+page|website)\s*[：:]",
+    re.IGNORECASE,
+)
+
+_SNAPSHOT_EMAIL_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.IGNORECASE)
+_SNAPSHOT_URL_RE = re.compile(r"https?://[^\s\])>\"']+")
+_SNAPSHOT_PHONE_RE = re.compile(r"(?:\+?\d[\d\-()（） ]{5,}\d)")
+_SNAPSHOT_RESEARCH_CONTACT_LABELS = {
+    "email",
+    "e-mail",
+    "mail",
+    "emailaddress",
+    "邮箱",
+    "电子邮箱",
+    "电子邮件",
+    "联系电话",
+    "电话",
+    "办公电话",
+    "phone",
+    "tel",
+    "telephone",
+    "homepage",
+    "home page",
+    "website",
+    "个人主页",
+    "主页",
+    "网址",
+}
 
 _PERSON_ANCHOR_BLOCKLIST = (
     "师资",
@@ -128,12 +300,35 @@ _PERSON_ANCHOR_BLOCKLIST = (
     "招聘",
     "人事",
     "政策",
+    "办事",
+    "指南",
+    "流程",
+    "资料下载",
+    "申请表",
+    "审批表",
+    "办理程序",
+    "薪酬福利",
     "通知",
     "公告",
     "news",
     "notice",
     "list",
     "more",
+)
+
+_SERVICE_GUIDE_TOKENS = (
+    "办事指南",
+    "办事流程",
+    "资料下载",
+    "人事政策",
+    "薪酬福利",
+    "办理程序",
+    "申请表",
+    "审批表",
+)
+_SERVICE_GUIDE_TITLE_RE = re.compile(
+    r"(?:^|\n)\s*#{1,4}\s*(?:【[^】]{1,30}】)?[^\n#]{0,120}"
+    r"(?:办事指南|办事流程|资料下载|办理程序|申请表|审批表|人事政策|薪酬福利)"
 )
 
 
@@ -160,9 +355,6 @@ class DetailEnricher:
         reserved_urls: set[str] | None = None,
     ) -> None:
         await enrich_profiles_with_human(self.agent, current, fetched, skills, reserved_urls=reserved_urls)
-
-    async def process_detail_urls_with_human(self, urls: list[str], current: Any, skills: str) -> None:
-        await process_detail_urls_with_human(self.agent, urls, current, skills)
 
     def extract_detail_profile_links(
         self,
@@ -196,6 +388,8 @@ def _url_path_stem(url: str) -> str:
 
 def _is_faculty_directory_or_category_link(url: str) -> bool:
     lowered = (url or "").lower()
+    if _is_query_profile_detail_url(lowered):
+        return False
     parsed = urlparse(lowered)
     path = parsed.path
     stem = _url_path_stem(lowered)
@@ -216,10 +410,330 @@ def _is_faculty_directory_or_category_link(url: str) -> bool:
 
 def _looks_like_profile_detail_url(url: str) -> bool:
     lowered = (url or "").lower()
+    if _is_query_profile_detail_url(lowered):
+        return True
     if any(token in lowered for token in _CLEAR_PROFILE_DETAIL_HINTS):
         return True
     path = urlparse(lowered).path
-    return bool(re.search(r"/info/\d+/\d+(\.s?html?)?$", path))
+    if re.search(r"/info/\d+/\d+(\.s?html?)?$", path):
+        return True
+    if _looks_like_faculty_section_profile_url(lowered):
+        return True
+    return False
+
+
+def extract_detail_profile_record_from_snapshot(text: str, *, page_url: str = "") -> dict[str, Any] | None:
+    """Extract a conservative single-profile record from stored detail text."""
+    raw = str(text or "")
+    if len(raw.strip()) < 120:
+        return None
+    if page_url and not _looks_like_profile_detail_url(page_url):
+        return None
+
+    relevant = _snapshot_relevant_text(raw)
+    if _looks_like_service_guide_snapshot(relevant, page_url=page_url):
+        return None
+    name = _extract_snapshot_name(relevant)
+    if not name:
+        return None
+    if _snapshot_has_multiple_labeled_names(relevant, name):
+        return None
+
+    research_areas = _extract_snapshot_research_areas(relevant)
+    bio = _extract_snapshot_bio(relevant, name)
+    email = _extract_snapshot_email(relevant)
+    phone = _extract_snapshot_phone(relevant)
+    if not any((research_areas, bio, email, phone)):
+        return None
+
+    title = _extract_snapshot_title(relevant, name)
+    personal_homepage = _extract_snapshot_personal_homepage(relevant)
+    record: dict[str, Any] = {"name": name}
+    if title:
+        record["title"] = title
+    if research_areas:
+        record["research_areas"] = research_areas
+    if email:
+        record["email"] = email
+    if phone:
+        record["phone"] = phone
+    if page_url:
+        record["homepage"] = page_url
+    elif personal_homepage:
+        record["homepage"] = personal_homepage
+    if personal_homepage and personal_homepage != record.get("homepage"):
+        record["external_link"] = personal_homepage
+    if bio:
+        record["bio"] = bio
+
+    if _snapshot_self_academician_evidence(name, title, bio, relevant):
+        record["is_academician"] = True
+        record["_self_academician_evidence"] = True
+    return record
+
+
+def _looks_like_service_guide_snapshot(text: str, *, page_url: str = "") -> bool:
+    if page_url and _is_non_faculty_noise_url(page_url):
+        return True
+    if _SERVICE_GUIDE_TITLE_RE.search(text or ""):
+        return True
+    token_hits = sum(1 for token in _SERVICE_GUIDE_TOKENS if token in (text or ""))
+    if token_hits <= 0:
+        return False
+    if "当前位置" in text and token_hits >= 1:
+        return True
+    if "联系人" in text and token_hits >= 2:
+        return True
+    return False
+
+
+def _snapshot_relevant_text(text: str) -> str:
+    stop_positions = [
+        index
+        for token in ("footLogo", "版权所有", "四川大学计算机学院版权所有", "邮编：610")
+        if (index := text.find(token)) >= 0
+    ]
+    if stop_positions:
+        return text[: min(stop_positions)]
+    return text
+
+
+def _snapshot_has_multiple_labeled_names(text: str, expected: str) -> bool:
+    names = {
+        _clean_snapshot_name(match.group("value"))
+        for match in re.finditer(r"(?:^|\n)\s*姓名\s*[：:]\s*(?P<value>[^\n|]+)", text)
+    }
+    names.discard("")
+    return len({name for name in names if name != expected}) > 0
+
+
+def _extract_snapshot_name(text: str) -> str | None:
+    for pattern in (
+        r"(?:^|\n)\s*姓名\s*[：:]\s*(?P<value>[^\n|]+)",
+        r"(?:^|\n)\s*#{1,3}\s*(?P<value>[^\n#]+)",
+    ):
+        for match in re.finditer(pattern, text):
+            name = _clean_snapshot_name(match.group("value"))
+            if _looks_like_person_name(name):
+                return name
+    return None
+
+
+def _clean_snapshot_name(value: str) -> str:
+    text = _clean_snapshot_text(value)
+    text = re.split(r"\s+(?:职称|职务|电话|电子邮箱|个人主页)\s*[：:]", text, maxsplit=1)[0]
+    return normalize_name(text.strip("：:|,，;；。 "))
+
+
+def _looks_like_person_name(value: str) -> bool:
+    text = (value or "").strip()
+    if _SNAPSHOT_LEADING_FIELD_LABEL_RE.match(text):
+        return False
+    if not text or any(token in text for token in _PERSON_ANCHOR_BLOCKLIST):
+        return False
+    cjk_chars = re.findall(r"[\u4e00-\u9fff]", text)
+    if 2 <= len(cjk_chars) <= 4 and len(text) <= 8:
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'.-]+", text)
+    return 2 <= len(words) <= 4 and len(" ".join(words)) <= 60
+
+
+def _extract_snapshot_title(text: str, name: str) -> str | None:
+    title = _extract_snapshot_labeled_value(text, ("职称", "职务"), max_chars=80)
+    if title:
+        return title
+    name_index = text.find(name)
+    if name_index < 0:
+        return None
+    window = text[name_index : name_index + 260]
+    for token in (
+        "院士",
+        "副主任医师",
+        "主任医师",
+        "主治医师",
+        "住院医师",
+        "副研究员",
+        "研究员",
+        "副教授",
+        "教授",
+        "助理教授",
+        "讲师",
+        "高级工程师",
+        "博士后",
+    ):
+        if token in window:
+            return token
+    return None
+
+
+def _extract_snapshot_research_areas(text: str) -> list[str] | None:
+    value = _extract_snapshot_labeled_value(text, ("主要研究方向", "研究方向", "研究领域", "科研方向"), max_chars=240)
+    if not value:
+        return None
+    value = _truncate_snapshot_value_at_stop(value)
+    terms: list[str] = []
+    for part in re.split(r"[；;、，,\n]|和", value):
+        term = _clean_snapshot_text(part).strip("：:，,；;。. ")
+        if not term or len(term) > 60 or _looks_like_snapshot_research_contact(term):
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms[:8] or None
+
+
+def _looks_like_snapshot_research_contact(value: str) -> bool:
+    text = _clean_snapshot_text(value).strip("：:，,；;。. ")
+    if not text:
+        return True
+    lowered = text.lower()
+    compact = re.sub(r"[\s_\-]+", "", lowered)
+    if lowered in _SNAPSHOT_RESEARCH_CONTACT_LABELS or compact in _SNAPSHOT_RESEARCH_CONTACT_LABELS:
+        return True
+    if _SNAPSHOT_EMAIL_RE.search(text) or _SNAPSHOT_URL_RE.search(text):
+        return True
+    if re.match(r"^(?:e-?mail|mail|email\s+address|邮箱|电子邮箱|电子邮件)\s*[：:]", text, re.IGNORECASE):
+        return True
+    if re.match(r"^(?:phone|tel|telephone|电话|办公电话|联系电话)\s*[：:]", text, re.IGNORECASE):
+        return True
+    return bool(_SNAPSHOT_PHONE_RE.fullmatch(text))
+
+
+def _extract_snapshot_email(text: str) -> str | None:
+    emails: list[str] = []
+    for match in _SNAPSHOT_EMAIL_RE.finditer(text):
+        email = match.group(0).strip().lower()
+        if email not in emails:
+            emails.append(email)
+    return "；".join(emails[:3]) if emails else None
+
+
+def _extract_snapshot_phone(text: str) -> str | None:
+    line_value = _extract_snapshot_labeled_value(text, ("办公电话", "电话"), max_chars=80)
+    if not line_value:
+        return None
+    match = _SNAPSHOT_PHONE_RE.search(line_value)
+    return match.group(0).strip() if match else None
+
+
+def _extract_snapshot_personal_homepage(text: str) -> str | None:
+    value = _extract_snapshot_labeled_value(text, ("个人主页", "主页", "Homepage"), max_chars=240)
+    if not value:
+        return None
+    urls = []
+    for match in _SNAPSHOT_URL_RE.finditer(value):
+        url = match.group(0).strip()
+        if url.lower().startswith("mailto:"):
+            continue
+        if url not in urls:
+            urls.append(url)
+    return urls[0] if urls else None
+
+
+def _extract_snapshot_bio(text: str, name: str) -> str | None:
+    name_index = text.find(name)
+    searchable = text[name_index:] if name_index >= 0 else text
+    lines = searchable.splitlines()
+    for index, raw_line in enumerate(lines):
+        line = _clean_snapshot_text(raw_line)
+        if not line:
+            continue
+        heading = next((item for item in _SNAPSHOT_BIO_HEADINGS if item in line), None)
+        if not heading:
+            continue
+        fragments: list[str] = []
+        after_heading = line.split(heading, 1)[1].strip("：: 　")
+        after_heading = _truncate_snapshot_value_at_stop(after_heading)
+        if after_heading:
+            fragments.append(after_heading)
+        for next_line in lines[index + 1 :]:
+            cleaned = _clean_snapshot_text(next_line)
+            if not cleaned:
+                continue
+            cleaned = _strip_snapshot_bio_heading(cleaned)
+            truncated = _truncate_snapshot_value_at_stop(cleaned)
+            if truncated:
+                fragments.append(truncated)
+            if truncated != cleaned:
+                break
+            if any(token in cleaned for token in _SNAPSHOT_BIO_STOP_TOKENS):
+                break
+        bio = " ".join(fragments).strip()
+        bio = re.sub(r"\s+", " ", bio).strip("：:；;，,。 ")
+        if _looks_like_snapshot_navigation_bio(bio):
+            return None
+        if len(bio) > 900:
+            bio = bio[:900].rstrip("，,；;。 ") + "。"
+        if bio and name in bio:
+            return bio
+        if bio and len(bio) >= 20:
+            return bio
+    return None
+
+
+def _looks_like_snapshot_navigation_bio(value: str) -> bool:
+    text = re.sub(r"\s+", "", str(value or ""))
+    if not text or len(text) > 220:
+        return False
+    hits = sum(1 for token in _SNAPSHOT_NAVIGATION_BIO_TOKENS if token in text)
+    return hits >= 3
+
+
+def _strip_snapshot_bio_heading(value: str) -> str:
+    for heading in _SNAPSHOT_BIO_HEADINGS:
+        if value.startswith(heading):
+            return value.split(heading, 1)[1].strip("：: 　")
+    return value
+
+
+def _extract_snapshot_labeled_value(text: str, labels: tuple[str, ...], *, max_chars: int) -> str | None:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    pattern = re.compile(
+        rf"(?:^|\n|[| ])(?:{label_pattern})\s*[：:]\s*(?P<value>[^\n]+)",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        value = match.group("value")
+        value = value.split("|", 1)[0]
+        value = _SNAPSHOT_FIELD_BOUNDARY_RE.split(value, maxsplit=1)[0]
+        value = _clean_snapshot_text(value[:max_chars])
+        value = _truncate_snapshot_value_at_stop(value)
+        if value:
+            return value
+    return None
+
+
+def _truncate_snapshot_value_at_stop(value: str) -> str:
+    stop_positions = [index for token in _SNAPSHOT_BIO_STOP_TOKENS if (index := value.find(token)) >= 0]
+    if not stop_positions:
+        return value
+    return value[: min(stop_positions)].strip()
+
+
+def _clean_snapshot_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", text)
+    text = re.sub(r"\[([^\]]+)\]\((?:mailto:)?[^)]+\)", r"\1", text)
+    text = text.replace("\\.", ".")
+    text = text.replace("**", "")
+    text = text.strip().strip("|").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _snapshot_self_academician_evidence(name: str, title: str | None, bio: str | None, text: str) -> bool:
+    if contains_self_academician_hint(name, title, bio):
+        return True
+    if title and "院士" in title:
+        return True
+    window = _snapshot_name_context_window(text, name)
+    return bool(window and contains_self_academician_hint(name, window))
+
+
+def _snapshot_name_context_window(text: str, name: str, *, radius: int = 260) -> str:
+    index = text.find(name)
+    if index < 0:
+        return ""
+    return text[max(0, index - radius) : min(len(text), index + len(name) + radius)]
 
 
 async def enrich_profiles_with_detail_backend(
@@ -230,7 +744,7 @@ async def enrich_profiles_with_detail_backend(
     *,
     reserved_urls: set[str] | None = None,
 ) -> None:
-    if not self._is_interactive or not self.detail_enrich_enabled:
+    if not self.detail_enrich_enabled:
         return
     await self._enrich_profiles_with_human(current, fetched, skills, reserved_urls=reserved_urls)
 
@@ -259,6 +773,14 @@ async def enrich_profiles_with_human(
         fetched.url,
         link_signals=getattr(fetched, "link_signals", ()) or (),
     )
+    existing_detail_task_urls = await _load_existing_detail_task_urls(self, current)
+    db_candidates = await _load_homepage_backfill_detail_urls(
+        self,
+        current,
+        fetched.url,
+        existing_detail_task_urls=existing_detail_task_urls,
+    )
+    candidates = _merge_ordered_urls(db_candidates, candidates)
     if not candidates:
         return
 
@@ -270,23 +792,101 @@ async def enrich_profiles_with_human(
         if getattr(sig, "url", None)
     }
 
-    pending: list[str] = []
+    pending: list[GraphFetchCandidate] = []
+    skipped: list[tuple[str, str]] = []
     skipped_by_name = 0
     skipped_reserved = 0
-    for link in candidates:
-        if len(pending) >= remaining:
-            break
+    skipped_existing_task = 0
+    skipped_visited = 0
+    for index, link in enumerate(candidates):
         normalized = _sanitize_url(link)
+        if not normalized:
+            continue
+        if normalized in existing_detail_task_urls:
+            skipped_existing_task += 1
+            skipped.append((normalized, "existing_detail_task"))
+            continue
         if normalized in reserved:
             skipped_reserved += 1
+            skipped.append((normalized, "reserved_for_list_processing"))
             continue
-        if link in self._detail_visited_urls or link in self.visited_urls:
+        if normalized in self._detail_visited_urls or normalized in self.visited_urls:
+            skipped_visited += 1
+            skipped.append((normalized, "already_visited"))
             continue
-        if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(link), enriched_names):
+        if enriched_names and _anchor_matches_enriched_name(sig_by_url.get(normalized) or sig_by_url.get(link), enriched_names):
             skipped_by_name += 1
+            skipped.append((normalized, "already_enriched_name"))
             continue
-        self._detail_visited_urls.add(link)
-        pending.append(link)
+        if len(pending) >= remaining:
+            skipped.append((normalized, "detail_cap_deferred"))
+            continue
+        self._detail_visited_urls.add(normalized)
+        pending.append(
+            GraphFetchCandidate(
+                url=normalized,
+                depth=current.depth + 1,
+                label=current.label or "Unknown",
+                org_unit_id=getattr(current, "org_unit_id", None),
+                priority_score=max(
+                    float(getattr(current, "graph_priority_score", 0.0) or 0.0)
+                    + _DETAIL_PRIORITY_INHERIT_BOOST,
+                    self.graph_frontier.priority_for(
+                        CrawlGraphNodeType.DETAIL_URL,
+                        url=normalized,
+                        depth=current.depth + 1,
+                    ),
+                )
+                - index * 0.01,
+            )
+        )
+
+    if skipped:
+        skipped_candidates_by_reason: dict[str, list[GraphFetchCandidate]] = {}
+        for url, reason in skipped:
+            skipped_candidates_by_reason.setdefault(reason, []).append(
+                GraphFetchCandidate(
+                    url=url,
+                    depth=current.depth + 1,
+                    label=current.label or "Unknown",
+                    org_unit_id=getattr(current, "org_unit_id", None),
+                )
+            )
+        for reason, skipped_candidates in skipped_candidates_by_reason.items():
+            await self.graph_frontier.record_discovered_links(
+                source_url=fetched.url,
+                links=skipped_candidates,
+                node_type=CrawlGraphNodeType.DETAIL_URL,
+                edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+                source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                org_unit_name=current.label or "Unknown",
+                org_unit_id=getattr(current, "org_unit_id", None),
+                depth=current.depth + 1,
+                confidence=0.8,
+                metadata={"source": "detail_candidate", "skip_reason": reason},
+                node_status=CrawlGraphNodeStatus.SKIPPED,
+                last_error=reason,
+            )
+
+    if pending:
+        detail_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=fetched.url,
+            links=pending,
+            node_type=CrawlGraphNodeType.DETAIL_URL,
+            edge_type=CrawlGraphEdgeType.DETAIL_CANDIDATE_OF,
+            source_node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            org_unit_name=current.label or "Unknown",
+            org_unit_id=getattr(current, "org_unit_id", None),
+            depth=current.depth + 1,
+            confidence=0.8,
+            metadata={"source": "detail_candidate"},
+        )
+        candidate_by_url = {
+            _sanitize_url(candidate.queue_url): candidate
+            for candidate in detail_candidates
+            if _sanitize_url(candidate.queue_url)
+        }
+        pending = [candidate_by_url.get(_sanitize_url(item.queue_url)) or item for item in pending]
 
     if skipped_by_name:
         self._pipeline_stats["detail_links_dropped_already_enriched"] = int(
@@ -308,65 +908,166 @@ async def enrich_profiles_with_human(
             current.label or "Unknown",
             fetched.url,
         )
+    if skipped_existing_task:
+        self._pipeline_stats["detail_links_skipped_existing_task"] = int(
+            self._pipeline_stats.get("detail_links_skipped_existing_task", 0)
+        ) + skipped_existing_task
+        self.logger.debug(
+            "Detail enrichment skipped %s links with existing detail tasks org_unit=%s page=%s",
+            skipped_existing_task,
+            current.label or "Unknown",
+            fetched.url,
+        )
+    if skipped_visited:
+        # B5: an already-visited detail link is dropped with a recorded reason AND a
+        # counter, so the drop is never silent.
+        self._pipeline_stats["detail_links_skipped_visited"] = int(
+            self._pipeline_stats.get("detail_links_skipped_visited", 0)
+        ) + skipped_visited
 
     if not pending:
         if candidates and skipped_reserved < len(candidates):
             self._pipeline_stats["detail_pending_empty_with_candidates"] = int(
                 self._pipeline_stats.get("detail_pending_empty_with_candidates", 0)
             ) + 1
-            sample_visited = [c for c in candidates if c in self._detail_visited_urls or c in self.visited_urls][:3]
+            sample_visited = [
+                c
+                for c in candidates
+                if c in self._detail_visited_urls or c in self.visited_urls or c in existing_detail_task_urls
+            ][:3]
             self.logger.warning(
                 "Detail enrichment found %s candidates but produced 0 pending org_unit=%s page=%s "
-                "(all already visited or matched enriched names; sample=%s skipped_by_name=%s)",
+                "(all already visited, already tasked, or matched enriched names; sample=%s skipped_by_name=%s "
+                "skipped_existing_task=%s)",
                 len(candidates),
                 current.label or "Unknown",
                 fetched.url,
                 sample_visited,
                 skipped_by_name,
+                skipped_existing_task,
             )
         return
     self._detail_processed_by_org_unit[org_unit_key] = processed + len(pending)
-    await self._process_detail_urls_with_human(pending, current, skills)
-    # Refresh enriched-name cache so subsequent list pages benefit from
-    # whatever detail extraction just succeeded.
+    self._pipeline_stats["detail_nodes_discovered"] = int(
+        self._pipeline_stats.get("detail_nodes_discovered", 0)
+    ) + len(pending)
+    # PENDING detail nodes were upserted above; the claim-driver fetches them.
     self._enriched_names_by_org_unit.pop(org_unit_key, None)
 
 
-async def process_detail_urls_with_human(self: Any, urls: list[str], current: Any, skills: str) -> None:
-    next_depth = current.depth + 1
-    if not self._within_depth(next_depth):
-        return
-    for url in urls:
-        if url in self.visited_urls:
+def _merge_ordered_urls(primary: list[str], secondary: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for url in [*primary, *secondary]:
+        normalized = _sanitize_url(url)
+        if not normalized or normalized in seen:
             continue
-        fetched = await self._fetch_url(url, next_depth)
-        if fetched is None:
-            continue
-        if self._is_retired_page(fetched):
-            self.logger.info("Skip retired human detail page url=%s", fetched.url)
-            continue
-        if self._looks_like_detail_directory_page(fetched):
-            self._pipeline_stats["detail_directory_skipped"] = int(
-                self._pipeline_stats.get("detail_directory_skipped", 0)
-            ) + 1
-            self.logger.debug("Skip directory/list page from detail enrichment url=%s", fetched.url)
-            continue
-        llm_queue = getattr(self, "_active_detail_llm_queue", None)
-        if llm_queue is not None and getattr(self, "pipeline_enabled", False):
-            await self._enqueue_extraction_task(
-                current,
-                fetched,
-                llm_queue=llm_queue,
-                detail_mode=True,
-                priority=1,
+        seen.add(normalized)
+        merged.append(normalized)
+    return merged
+
+
+async def _load_existing_detail_task_urls(self: Any, current: Any) -> set[str]:
+    org_unit_name = (getattr(current, "label", "") or "").strip()
+    org_unit_id = getattr(current, "org_unit_id", None)
+    if not org_unit_name and org_unit_id is None:
+        return set()
+    async with self.db.session() as session:
+        if not org_unit_name and org_unit_id is not None:
+            org_unit = await session.get(OrgUnit, int(org_unit_id))
+            org_unit_name = (getattr(org_unit, "name", "") or "").strip()
+        if not org_unit_name:
+            return set()
+        existing_filters = [CrawlTask.task_kind == CrawlTaskKind.DETAIL_PAGE.value]
+        existing_filters.append(CrawlTask.org_unit_name == org_unit_name)
+        rows = (
+            await session.execute(select(CrawlTask.source_url).where(*existing_filters))
+        ).scalars().all()
+    return {_sanitize_url(url) for url in rows if _sanitize_url(url)}
+
+
+async def _load_homepage_backfill_detail_urls(
+    self: Any,
+    current: Any,
+    current_url: str,
+    *,
+    existing_detail_task_urls: set[str] | None = None,
+) -> list[str]:
+    org_unit_name = (getattr(current, "label", "") or "").strip()
+    org_unit_id = getattr(current, "org_unit_id", None)
+    if not org_unit_name and org_unit_id is None:
+        return []
+    async with self.db.session() as session:
+        filters = [
+            Professor.homepage.is_not(None),
+            func.trim(Professor.homepage) != "",
+            or_(
+                Professor.research_areas.is_(None),
+                func.trim(Professor.research_areas) == "",
+                Professor.bio.is_(None),
+                func.trim(Professor.bio) == "",
+            ),
+        ]
+        if org_unit_id is not None:
+            filters.append(ProfessorAffiliation.org_unit_id == int(org_unit_id))
+            statement = (
+                select(Professor.homepage)
+                .join(ProfessorAffiliation, ProfessorAffiliation.professor_id == Professor.id)
+                .where(*filters)
+                .order_by(Professor.id.asc())
             )
-            continue
-        await self._extract_professors_from_page(
-            current,
-            fetched,
-            skills,
-            detail_mode=True,
+        else:
+            filters.append(Professor.org_unit_name == org_unit_name)
+            statement = select(Professor.homepage).where(*filters).order_by(Professor.id.asc())
+        rows = (await session.execute(statement)).scalars().all()
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    existing_detail_urls = existing_detail_task_urls or set()
+    for raw_url in rows:
+        homepage = _normalize_homepage_backfill_url(
+            raw_url,
+            current_url=current_url,
+            start_url=getattr(self, "start_url", ""),
         )
+        if not homepage or homepage in seen or homepage in existing_detail_urls:
+            continue
+        seen.add(homepage)
+        urls.append(homepage)
+    if urls:
+        self._pipeline_stats["detail_backfill_homepages_found"] = int(
+            self._pipeline_stats.get("detail_backfill_homepages_found", 0)
+        ) + len(urls)
+        self.logger.debug(
+            "Detail homepage backfill found %s urls org_unit=%s page=%s sample=%s",
+            len(urls),
+            org_unit_name or org_unit_id or "Unknown",
+            current_url,
+            urls[:3],
+        )
+    return urls
+
+
+def _normalize_homepage_backfill_url(raw_url: Any, *, current_url: str, start_url: str) -> str | None:
+    homepage = normalize_professor_homepage(raw_url)
+    if not homepage:
+        return None
+    if not _is_same_site_primary_profile_url(homepage, start_url=start_url or current_url):
+        return None
+    if current_url and not _same_site(homepage, current_url):
+        return None
+    return homepage
+
+
+def _is_same_site_primary_profile_url(url: str, *, start_url: str) -> bool:
+    homepage = normalize_professor_homepage(url)
+    if not homepage:
+        return False
+    if _is_faculty_platform(homepage):
+        return False
+    if start_url and not _same_site(homepage, start_url):
+        return False
+    return _looks_like_profile_detail_url(homepage)
 
 
 def extract_detail_profile_links(
@@ -441,7 +1142,7 @@ def extract_detail_profile_links(
         if current_dir:
             prefix = current_dir.rstrip("/")
             related_by_path = bool(prefix and path.startswith(prefix + "/"))
-        related_by_hint = any(token in lowered for token in detail_hints)
+        related_by_hint = looks_like_profile_detail or any(token in lowered for token in detail_hints)
         # If current page is noise, avoid same-directory fan-out unless target is explicit faculty directory.
         if current_is_noise and related_by_path and not _is_explicit_faculty_directory_url(link):
             dropped_parent_noise += 1
@@ -479,6 +1180,8 @@ def extract_detail_profile_links(
         if current_dir and urlparse(url).path.lower().startswith(current_dir.rstrip("/") + "/"):
             score += 4
         if any(token in lowered for token in detail_hints):
+            score += 4
+        if _looks_like_profile_detail_url(url):
             score += 4
         if _link_signal_looks_like_person(signal):
             score += 3

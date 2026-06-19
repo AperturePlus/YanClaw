@@ -1,6 +1,6 @@
 import { GM, GM_xmlhttpRequest } from '$';
 import { isAssistantBlockedHost } from './hostPolicy';
-import type { CompleteResponse, FetchJob, PendingDecision, StatusResponse } from './types';
+import type { CompleteResponse, FetchJob, PaginationState, PendingDecision, StatusResponse } from './types';
 
 const API_BASE = 'http://127.0.0.1:21520/api';
 const TIMEOUT = 10_000;
@@ -20,7 +20,7 @@ function requestWithLegacyApi<T>(method: RequestMethod, url: string, body?: stri
     GM_xmlhttpRequest({
       method,
       url,
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
       data: body,
       timeout: TIMEOUT,
       onload(res) {
@@ -38,7 +38,7 @@ async function requestWithModernApi<T>(method: RequestMethod, url: string, body?
   const requestPromise = GM.xmlHttpRequest({
     method,
     url,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
     data: body,
   });
   const timeoutPromise = new Promise<never>((_, reject) => {
@@ -76,8 +76,14 @@ export async function completeJob(
   html: string,
   url: string,
   title: string,
+  paginationStates?: PaginationState[],
 ): Promise<CompleteResponse | null> {
-  return request<CompleteResponse>('POST', `/jobs/${id}/complete`, { html, url, title });
+  return request<CompleteResponse>('POST', `/jobs/${id}/complete`, {
+    html,
+    url,
+    title,
+    pagination_states: paginationStates ?? [],
+  });
 }
 
 export async function failJob(id: string, message: string): Promise<void> {

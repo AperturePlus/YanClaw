@@ -29,7 +29,7 @@
 
   const d=new Set;const importCSS = async e=>{d.has(e)||(d.add(e),(t=>{typeof GM_addStyle=="function"?GM_addStyle(t):(document.head||document.documentElement).appendChild(document.createElement("style")).append(t);})(e));};
 
-  const styleCss = '#ycl-panel{position:fixed;bottom:16px;right:16px;z-index:2147483647;width:380px;max-height:80vh;overflow-y:auto;background:#1e1e2e;color:#cdd6f4;border-radius:12px;box-shadow:0 8px 32px #00000073;font:13px/1.5 system-ui,sans-serif;-webkit-user-select:none;user-select:none;transition:all .2s}#ycl-panel.ycl-minimized{width:48px;height:48px;overflow:hidden;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center}#ycl-panel.ycl-minimized:after{content:"🦀";font-size:22px}#ycl-panel.ycl-minimized *{display:none!important}#ycl-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#313244;border-radius:12px 12px 0 0;cursor:move}#ycl-header span{font-weight:600;font-size:14px}#ycl-header button{background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px;padding:0 4px}.ycl-section{padding:8px 12px;border-top:1px solid #45475a}.ycl-label{color:#a6adc8;font-size:11px;text-transform:uppercase;letter-spacing:.5px}.ycl-url{color:#89b4fa;word-break:break-all;font-size:12px}.ycl-intent{color:#f9e2af;margin:4px 0}.ycl-hint{color:#94e2d5;font-size:12px}.ycl-btn-row{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px}.ycl-btn{padding:5px 10px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:filter .15s}.ycl-btn:hover{filter:brightness(1.15)}.ycl-btn:disabled{cursor:not-allowed;opacity:.55;filter:none}.ycl-btn-primary{background:#89b4fa;color:#1e1e2e}.ycl-btn-success{background:#a6e3a1;color:#1e1e2e}.ycl-btn-warn{background:#f9e2af;color:#1e1e2e}.ycl-btn-danger{background:#f38ba8;color:#1e1e2e}.ycl-btn-muted{background:#585b70;color:#cdd6f4}.ycl-toggle{display:flex;align-items:center;gap:6px;padding:4px 12px}.ycl-toggle input{accent-color:#89b4fa}.ycl-history{max-height:120px;overflow-y:auto}.ycl-history-item{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;color:#a6adc8}.ycl-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.ycl-dot-on{background:#a6e3a1}.ycl-dot-off{background:#f38ba8}.ycl-match-banner{background:#a6e3a1;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-standby-banner{background:#fab387;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-role-badge{display:inline-flex;align-items:center;margin-left:6px;padding:0 6px;border-radius:999px;font-size:10px;line-height:16px;vertical-align:middle}.ycl-role-owner{background:#a6e3a1;color:#1e1e2e}.ycl-role-standby{background:#f9e2af;color:#1e1e2e}#ycl-toast{position:fixed;top:16px;right:16px;z-index:2147483647;background:#f38ba8;color:#1e1e2e;padding:8px 16px;border-radius:8px;font:13px system-ui,sans-serif;display:none}';
+  const styleCss = '#ycl-panel{position:fixed;bottom:16px;right:16px;z-index:2147483647;width:380px;max-height:80vh;overflow-y:auto;background:#1e1e2e;color:#cdd6f4;border-radius:12px;box-shadow:0 8px 32px #00000073;font:13px/1.5 system-ui,sans-serif;-webkit-user-select:none;user-select:none;transition:all .2s}#ycl-panel.ycl-minimized{width:48px;height:48px;overflow:hidden;border-radius:50%;cursor:pointer;display:flex;align-items:center;justify-content:center}#ycl-panel.ycl-minimized:after{content:"🦀";font-size:22px}#ycl-panel.ycl-minimized *{display:none!important}#ycl-header{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:#313244;border-radius:12px 12px 0 0;cursor:move}#ycl-header span{font-weight:600;font-size:14px}#ycl-header button{background:none;border:none;color:#cdd6f4;cursor:pointer;font-size:16px;padding:0 4px}.ycl-section{padding:8px 12px;border-top:1px solid #45475a}.ycl-label{color:#a6adc8;font-size:11px;text-transform:uppercase;letter-spacing:.5px}.ycl-url{color:#89b4fa;word-break:break-all;font-size:12px}.ycl-intent{color:#f9e2af;margin:4px 0}.ycl-hint{color:#94e2d5;font-size:12px}.ycl-btn-row{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px}.ycl-btn{padding:5px 10px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:500;transition:filter .15s}.ycl-btn:hover{filter:brightness(1.15)}.ycl-btn:disabled{cursor:not-allowed;opacity:.55;filter:none}.ycl-btn-primary{background:#89b4fa;color:#1e1e2e}.ycl-btn-success{background:#a6e3a1;color:#1e1e2e}.ycl-btn-warn{background:#f9e2af;color:#1e1e2e}.ycl-btn-danger{background:#f38ba8;color:#1e1e2e}.ycl-btn-muted{background:#585b70;color:#cdd6f4}.ycl-toggle{display:flex;align-items:center;gap:6px;padding:4px 12px}.ycl-toggle input{accent-color:#89b4fa}.ycl-status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}.ycl-dot-on{background:#a6e3a1}.ycl-dot-off{background:#f38ba8}.ycl-match-banner{background:#a6e3a1;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-standby-banner{background:#fab387;color:#1e1e2e;text-align:center;padding:6px;font-weight:600;font-size:12px}.ycl-role-badge{display:inline-flex;align-items:center;margin-left:6px;padding:0 6px;border-radius:999px;font-size:10px;line-height:16px;vertical-align:middle}.ycl-role-owner{background:#a6e3a1;color:#1e1e2e}.ycl-role-standby{background:#f9e2af;color:#1e1e2e}#ycl-toast{position:fixed;top:16px;right:16px;z-index:2147483647;background:#f38ba8;color:#1e1e2e;padding:8px 16px;border-radius:8px;font:13px system-ui,sans-serif;display:none}';
   importCSS(styleCss);
   var _GM = (() => typeof GM != "undefined" ? GM : void 0)();
   var _GM_deleteValue = (() => typeof GM_deleteValue != "undefined" ? GM_deleteValue : void 0)();
@@ -59,7 +59,7 @@
       _GM_xmlhttpRequest({
         method,
         url,
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json; charset=utf-8" },
         data: body,
         timeout: TIMEOUT,
         onload(res) {
@@ -76,7 +76,7 @@
     const requestPromise = _GM.xmlHttpRequest({
       method,
       url,
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json; charset=utf-8" },
       data: body
     });
     const timeoutPromise = new Promise((_, reject) => {
@@ -106,8 +106,13 @@
   async function fetchNextJob() {
     return request("GET", "/jobs/next");
   }
-  async function completeJob(id, html, url, title) {
-    return request("POST", `/jobs/${id}/complete`, { html, url, title });
+  async function completeJob(id, html, url, title, paginationStates) {
+    return request("POST", `/jobs/${id}/complete`, {
+      html,
+      url,
+      title,
+      pagination_states: paginationStates ?? []
+    });
   }
   async function failJob(id, message) {
     await request("POST", `/jobs/${id}/fail`, { message });
@@ -127,10 +132,145 @@
   async function resolveDecision(id, action) {
     await request("POST", `/decision/${id}/resolve`, { action });
   }
+  const PAGE_ASSIGN_RE = /document\.forms\[['"]([^'"]+)['"]\]\.([A-Za-z0-9_]+)\.value\s*=\s*['"]?(\d+)['"]?/i;
+  const GOTO_FIELD_RE = /\b([A-Za-z0-9_]*?)GOPAGE\b/i;
+  function collectFormPaginationStates(currentUrl = window.location.href) {
+    const anchors = [...document.querySelectorAll('a[href^="javascript:"]')];
+    const byFormField = new Map();
+    for (const anchor of anchors) {
+      const parsed = parsePageAssignment(anchor.getAttribute("href") || "");
+      if (!parsed) continue;
+      const key = `${parsed.formName}\0${parsed.fieldName}`;
+      const existing = byFormField.get(key) ?? {
+        formName: parsed.formName,
+        fieldName: parsed.fieldName,
+        pages: new Set()
+      };
+      existing.pages.add(parsed.pageIndex);
+      byFormField.set(key, existing);
+    }
+    const currentPage = detectCurrentPage(currentUrl);
+    const states = [];
+    const seen = new Set();
+    for (const item of byFormField.values()) {
+      const pageIndexes = expandPageIndexes(item.formName, item.fieldName, item.pages);
+      const totalPages = Math.max(...pageIndexes, ...item.pages);
+      for (const pageIndex of pageIndexes) {
+        if (pageIndex <= 1 || pageIndex === currentPage) continue;
+        const syntheticUrl = buildSyntheticUrl(currentUrl, item.formName, item.fieldName, pageIndex);
+        if (seen.has(syntheticUrl)) continue;
+        seen.add(syntheticUrl);
+        states.push({
+          kind: "form_submit",
+          state_id: `form:${item.formName}:${item.fieldName}:${pageIndex}`,
+          label: `${item.formName} 第 ${pageIndex} 页`,
+          page_index: pageIndex,
+          total_pages: totalPages,
+          form_name: item.formName,
+          fields: { [item.fieldName]: String(pageIndex) },
+          submit: true,
+          synthetic_url: syntheticUrl,
+          url: currentUrl
+        });
+      }
+    }
+    return states.sort((a, b) => a.page_index - b.page_index || a.synthetic_url.localeCompare(b.synthetic_url));
+  }
+  function actionMatchesCurrentPage(action, currentUrl, targetUrl) {
+    if (!action || action.kind !== "form_submit") return true;
+    const desired = Number(action.page_index || firstFieldValue(action.fields));
+    const current = detectCurrentPage(currentUrl);
+    if (!desired || !current) return false;
+    return desired === current && sameBaseUrl(currentUrl, targetUrl);
+  }
+  function performFetchAction(action) {
+    if (!action || action.kind !== "form_submit") return false;
+    const formName = action.form_name || "";
+    const form = document.forms.namedItem(formName);
+    if (!form) return false;
+    for (const [name, value] of Object.entries(action.fields ?? {})) {
+      const control = form.elements.namedItem(name);
+      if (!control) continue;
+      setControlValue(control, value);
+    }
+    if (action.submit !== false) {
+      form.submit();
+    }
+    return true;
+  }
+  function parsePageAssignment(href) {
+    const match = PAGE_ASSIGN_RE.exec(href);
+    if (!match) return null;
+    const pageIndex = Number(match[3]);
+    if (!Number.isFinite(pageIndex) || pageIndex <= 0) return null;
+    return { formName: match[1], fieldName: match[2], pageIndex };
+  }
+  function expandPageIndexes(formName, fieldName, pages) {
+    const hasGoto = [...document.querySelectorAll("input[name]")].some((input) => {
+      const name = input.name || "";
+      const match = GOTO_FIELD_RE.exec(name);
+      if (!match) return false;
+      const prefix = match[1] || "";
+      const form = input.form;
+      return (!form || form.name === formName) && (!prefix || fieldName.toLowerCase().startsWith(prefix.toLowerCase()));
+    });
+    if (!hasGoto) return [...pages].sort((a, b) => a - b);
+    const maxPage = Math.max(...pages);
+    return Array.from({ length: maxPage }, (_unused, index) => index + 1);
+  }
+  function detectCurrentPage(currentUrl) {
+    var _a, _b;
+    const current = Number(((_b = (_a = document.querySelector(".this-page")) == null ? void 0 : _a.textContent) == null ? void 0 : _b.trim()) || "0");
+    if (Number.isFinite(current) && current > 0) return current;
+    try {
+      const url = new URL(currentUrl);
+      for (const key of ["PAGENUM", "page", "p", "pn", "fromWenNOWPAGE"]) {
+        const value = Number(url.searchParams.get(key) || "0");
+        if (Number.isFinite(value) && value > 0) return value;
+      }
+    } catch {
+    }
+    return 1;
+  }
+  function buildSyntheticUrl(url, formName, fieldName, pageIndex) {
+    const parsed = new URL(url);
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (key.startsWith("__ycl_")) parsed.searchParams.delete(key);
+    }
+    parsed.searchParams.set("__ycl_kind", "form");
+    parsed.searchParams.set("__ycl_form", formName);
+    parsed.searchParams.set("__ycl_field", fieldName);
+    parsed.searchParams.set("__ycl_page", String(pageIndex));
+    parsed.hash = "";
+    return parsed.toString();
+  }
+  function setControlValue(control, value) {
+    if (control instanceof RadioNodeList) {
+      control.value = value;
+      return;
+    }
+    if ("value" in control) {
+      control.value = value;
+    }
+  }
+  function firstFieldValue(fields) {
+    return Object.values(fields ?? {})[0] ?? "";
+  }
+  function sameBaseUrl(a, b) {
+    try {
+      const aUrl = new URL(a);
+      const bUrl = new URL(b);
+      return aUrl.hostname === bUrl.hostname && stripSlash(aUrl.pathname) === stripSlash(bUrl.pathname);
+    } catch {
+      return false;
+    }
+  }
+  function stripSlash(value) {
+    return value.replace(/\/+$/, "");
+  }
   const YCL_PREFIX = "ycl_";
   const UI_PREFS_KEY = "ycl_ui_prefs_v2";
   const INSTANCE_LOCK_KEY = "ycl_instance_lock_v1";
-  const MAX_HISTORY = 20;
   const LEGACY_LOCAL_FALLBACK_KEY = "ycl_state_fallback";
   const listeners = [];
   const prefsFallbackKey = `${UI_PREFS_KEY}_fallback`;
@@ -147,7 +287,6 @@
     connected: false,
     minimized: false,
     pendingDecision: null,
-    history: [],
     instanceRole: "standby"
   };
   function isCleanupTarget(key) {
@@ -331,10 +470,6 @@
     state.currentJob = null;
     notify();
   }
-  function addHistory(job, status) {
-    state.history.unshift({ id: job.id, url: job.url, status, time: new Date() });
-    if (state.history.length > MAX_HISTORY) state.history.pop();
-  }
   let toastEl = null;
   let hideTimer = null;
   function mountToast() {
@@ -355,19 +490,32 @@
     try {
       const u1 = new URL(a);
       const u2 = new URL(b);
-      return u1.hostname === u2.hostname && u1.pathname.replace(/\/+$/, "") === u2.pathname.replace(/\/+$/, "");
+      return u1.hostname === u2.hostname && u1.pathname.replace(/\/+$/, "") === u2.pathname.replace(/\/+$/, "") && normalizedSearch(u1) === normalizedSearch(u2);
     } catch {
       return false;
     }
   }
-  function sameHost(a, b) {
+  function normalizedSearch(url) {
+    if (!url.search) return "";
+    const params = [...url.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) => {
+      const keyOrder = aKey.localeCompare(bKey);
+      return keyOrder || aValue.localeCompare(bValue);
+    });
+    return params.map(([key, value]) => `${key}=${value}`).join("&");
+  }
+  function sameSite(a, b) {
     try {
-      const h1 = new URL(a).hostname.replace(/^www\./, "");
-      const h2 = new URL(b).hostname.replace(/^www\./, "");
-      return h1 === h2;
+      return siteRoot(new URL(a).hostname) === siteRoot(new URL(b).hostname);
     } catch {
       return false;
     }
+  }
+  function siteRoot(host) {
+    const parts = host.split(".");
+    if (parts.length >= 3 && parts.at(-1) === "cn" && ["edu", "ac", "com"].includes(parts.at(-2))) {
+      return parts.slice(-3).join(".");
+    }
+    return parts.slice(-2).join(".");
   }
   function truncUrl(url, max = 40) {
     try {
@@ -375,19 +523,6 @@
     } catch {
       return url.slice(0, max);
     }
-  }
-  function timeAgo(date) {
-    const s = Math.round((Date.now() - date.getTime()) / 1e3);
-    if (s < 60) return `${s}s ago`;
-    return `${Math.round(s / 60)}m ago`;
-  }
-  const STATUS_ICONS = {
-    completed: "✅",
-    skipped: "⏭",
-    failed: "❌"
-  };
-  function statusIcon(status) {
-    return STATUS_ICONS[status] ?? "❓";
   }
   const ERROR_PATTERNS = /502 bad gateway|503 service|504 gateway|500 internal|error occurred|server error|nginx/i;
   function isErrorPage() {
@@ -397,15 +532,20 @@
     if (bodyText.length < 2e3 && ERROR_PATTERNS.test(title + " " + bodyText)) return true;
     return false;
   }
-  const POLL_INTERVAL = 2500;
-  const FAST_POLL_INTERVAL = 600;
+  const POLL_INTERVAL = 1500;
+  const FAST_POLL_INTERVAL = 500;
   const FAST_POLL_ROUNDS = 4;
-  const AUTO_CHECK_INTERVAL = 1500;
-  const AUTO_SUBMIT_DELAY = 2e3;
+  const AUTO_CHECK_INTERVAL = 1e3;
+  const AUTO_SUBMIT_DELAY = 1e3;
+  const CAPTURE_STABLE_INTERVAL = 200;
+  const CAPTURE_STABLE_ROUNDS = 3;
+  const CAPTURE_MAX_WAIT = 8e3;
   const DECISION_POLL_INTERVAL = 5e3;
   const ERROR_RETRY_DELAY = 5e3;
   const MAX_ERROR_RETRIES = 3;
   const DEFAULT_DECISION_ACTION = "switch_failed_to_human";
+  const NAVIGATION_ATTEMPT_KEY = "ycl_navigation_attempt_v1";
+  const DOCUMENT_ID = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   let pollTimer = null;
   let autoCheckTimer = null;
   let submitting = false;
@@ -413,18 +553,28 @@
   let decisionPromptedId = null;
   let resolvingDecision = false;
   let lastDecisionCheckAt = 0;
+  let actionSubmittedForJobId = null;
   async function recoverState() {
+    const sync = await syncBackendStatus();
+    if (sync.assignedJobChanged && state.currentJob && state.autoMode && !urlMatches(window.location.href, state.currentJob.url) && !isSameSiteRedirectReady(state.currentJob)) {
+      navigateToJob(state.currentJob);
+    }
+  }
+  async function syncBackendStatus() {
     var _a, _b, _c;
     let changed = false;
+    let localJobCleared = false;
+    let assignedJobChanged = false;
+    let status = null;
     try {
-      const status = await fetchStatus();
+      status = await fetchStatus();
       if (!status) {
         if (state.connected) {
           state.connected = false;
           changed = true;
         }
         if (changed) notify();
-        return;
+        return { status: null, changed, localJobCleared, assignedJobChanged };
       }
       if (!state.connected) {
         state.connected = true;
@@ -437,11 +587,17 @@
       state.pendingDecision = status.pending_decision ?? null;
       if (status.current_job) {
         if ((((_c = state.currentJob) == null ? void 0 : _c.id) ?? null) !== status.current_job.id) {
+          if (state.currentJob) {
+            clearNavigationAttempt(state.currentJob.id);
+          }
           state.currentJob = status.current_job;
+          assignedJobChanged = true;
           changed = true;
         }
       } else if (state.currentJob !== null) {
+        clearNavigationAttempt(state.currentJob.id);
         state.currentJob = null;
+        localJobCleared = true;
         changed = true;
       }
     } catch {
@@ -453,6 +609,7 @@
     if (changed) {
       notify();
     }
+    return { status, changed, localJobCleared, assignedJobChanged };
   }
   function startPolling() {
     if (pollTimer !== null) return;
@@ -479,6 +636,65 @@
   }
   let matchedSince = null;
   let errorRetries = 0;
+  function resetAutoMatchState() {
+    matchedSince = null;
+    errorRetries = 0;
+  }
+  function readNavigationAttempt() {
+    try {
+      const raw = sessionStorage.getItem(NAVIGATION_ATTEMPT_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed.jobId || !parsed.fromUrl || !parsed.targetUrl) return null;
+      return {
+        jobId: parsed.jobId,
+        fromUrl: parsed.fromUrl,
+        targetUrl: parsed.targetUrl,
+        createdAt: Number(parsed.createdAt || 0),
+        documentId: String(parsed.documentId || "")
+      };
+    } catch {
+      return null;
+    }
+  }
+  function recordNavigationAttempt(job) {
+    try {
+      sessionStorage.setItem(
+        NAVIGATION_ATTEMPT_KEY,
+        JSON.stringify({
+          jobId: job.id,
+          fromUrl: window.location.href,
+          targetUrl: job.url,
+          createdAt: Date.now(),
+          documentId: DOCUMENT_ID
+        })
+      );
+    } catch {
+    }
+  }
+  function clearNavigationAttempt(jobId) {
+    try {
+      const attempt = readNavigationAttempt();
+      if (!jobId || !attempt || attempt.jobId === jobId) {
+        sessionStorage.removeItem(NAVIGATION_ATTEMPT_KEY);
+      }
+    } catch {
+    }
+  }
+  function navigateToJob(job) {
+    recordNavigationAttempt(job);
+    window.location.href = job.url;
+  }
+  function isSameSiteRedirectReady(job) {
+    if (job.action) return false;
+    if (urlMatches(window.location.href, job.url)) return false;
+    const attempt = readNavigationAttempt();
+    if (!attempt || attempt.jobId !== job.id || !urlMatches(attempt.targetUrl, job.url)) {
+      return false;
+    }
+    if (attempt.documentId === DOCUMENT_ID) return false;
+    return sameSite(window.location.href, job.url) && !isErrorPage();
+  }
   function autoCheck() {
     if (state.instanceRole !== "owner") return;
     const job = state.currentJob;
@@ -492,7 +708,7 @@
         errorRetries++;
         showToast(`错误页面，${ERROR_RETRY_DELAY / 1e3}s 后重试 (${errorRetries}/${MAX_ERROR_RETRIES})`);
         setTimeout(() => {
-          window.location.href = job.url;
+          navigateToJob(job);
         }, ERROR_RETRY_DELAY);
       } else {
         showToast("重试次数已用完，请手动处理");
@@ -500,11 +716,23 @@
       return;
     }
     errorRetries = 0;
-    if (sameHost(window.location.href, job.url)) {
+    const exactMatch = urlMatches(window.location.href, job.url);
+    const redirectMatch = !exactMatch && isSameSiteRedirectReady(job);
+    if (exactMatch || redirectMatch) {
+      if (job.action && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+        if (actionSubmittedForJobId !== job.id && performFetchAction(job.action)) {
+          actionSubmittedForJobId = job.id;
+          matchedSince = null;
+        }
+        return;
+      }
       if (matchedSince === null) {
         matchedSince = Date.now();
       } else if (Date.now() - matchedSince >= AUTO_SUBMIT_DELAY) {
         matchedSince = null;
+        if (redirectMatch) {
+          showToast("检测到同站点重定向，提交当前页");
+        }
         void submitCurrent();
       }
     } else {
@@ -519,11 +747,26 @@
       await checkPendingDecision();
     }
     if (document.visibilityState === "hidden" && !state.currentJob) return;
-    if (state.paused || state.currentJob || polling) return;
+    if (state.paused || polling) return;
     const connectedBefore = state.connected;
     let jobAssigned = false;
     polling = true;
     try {
+      const hadLocalJob = state.currentJob !== null;
+      const sync = await syncBackendStatus();
+      if (sync.localJobCleared) {
+        resetAutoMatchState();
+        showToast("后端已释放当前任务，继续领取下一个任务");
+      }
+      if (sync.assignedJobChanged && state.currentJob) {
+        resetAutoMatchState();
+        if (state.autoMode && !urlMatches(window.location.href, state.currentJob.url) && !isSameSiteRedirectReady(state.currentJob)) {
+          navigateToJob(state.currentJob);
+        }
+        return;
+      }
+      if (document.visibilityState === "hidden" && !state.currentJob) return;
+      if (hadLocalJob && state.currentJob) return;
       const job = await fetchNextJob();
       state.connected = true;
       if (job) {
@@ -540,10 +783,12 @@
     }
   }
   function assignJob(job) {
-    errorRetries = 0;
+    resetAutoMatchState();
+    actionSubmittedForJobId = null;
+    clearNavigationAttempt();
     setJob(job);
     if (state.autoMode) {
-      window.location.href = job.url;
+      navigateToJob(job);
     }
   }
   function triggerFastPollBurst() {
@@ -606,6 +851,13 @@
     if (!decision) return;
     await resolvePendingDecision(decision, DEFAULT_DECISION_ACTION);
   }
+  function openCurrent() {
+    if (state.instanceRole !== "owner") return;
+    const job = state.currentJob;
+    if (!job) return;
+    if (urlMatches(window.location.href, job.url) && job.action && performFetchAction(job.action)) return;
+    navigateToJob(job);
+  }
   async function submitCurrent() {
     if (state.instanceRole !== "owner") return;
     const job = state.currentJob;
@@ -614,11 +866,21 @@
       showToast("当前是错误页面，无法提交");
       return;
     }
+    if (job.action && urlMatches(window.location.href, job.url) && !actionMatchesCurrentPage(job.action, window.location.href, job.url)) {
+      if (performFetchAction(job.action)) {
+        actionSubmittedForJobId = job.id;
+        showToast("已执行分页动作，等待页面更新后再提交");
+      } else {
+        showToast("分页动作执行失败，请手动处理");
+      }
+      return;
+    }
     submitting = true;
-    const html = document.documentElement.outerHTML;
     try {
-      const res = await completeJob(job.id, html, window.location.href, document.title);
-      addHistory(job, "completed");
+      const html = await captureCurrentHtml();
+      const paginationStates = collectFormPaginationStates(window.location.href);
+      const res = await completeJob(job.id, html, window.location.href, document.title, paginationStates);
+      clearNavigationAttempt(job.id);
       clearJob();
       if (res == null ? void 0 : res.next_job) {
         setTimeout(() => assignJob(res.next_job), 100);
@@ -631,15 +893,60 @@
     submitting = false;
     notify();
   }
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  async function captureCurrentHtml() {
+    await waitForCaptureReady();
+    return serializePageWithoutOverlay();
+  }
+  async function waitForCaptureReady() {
+    var _a;
+    const started2 = Date.now();
+    let lastSignature = "";
+    let stableRounds = 0;
+    let scrolled = false;
+    while (Date.now() - started2 < CAPTURE_MAX_WAIT) {
+      if (document.readyState === "complete") {
+        if (!scrolled && Date.now() - started2 >= Math.floor(AUTO_SUBMIT_DELAY / 2)) {
+          scrolled = true;
+          window.scrollTo({ top: ((_a = document.body) == null ? void 0 : _a.scrollHeight) ?? 0, behavior: "auto" });
+        }
+        const signature = captureSignature();
+        if (signature === lastSignature) {
+          stableRounds += 1;
+        } else {
+          lastSignature = signature;
+          stableRounds = 0;
+        }
+        if (Date.now() - started2 >= AUTO_SUBMIT_DELAY && stableRounds >= CAPTURE_STABLE_ROUNDS) {
+          return;
+        }
+      }
+      await sleep(CAPTURE_STABLE_INTERVAL);
+    }
+  }
+  function captureSignature() {
+    var _a, _b;
+    const textLength = ((_b = (_a = document.body) == null ? void 0 : _a.innerText) == null ? void 0 : _b.length) ?? 0;
+    const nodeCount = document.getElementsByTagName("*").length;
+    const imageCount = document.images.length;
+    return `${textLength}:${nodeCount}:${imageCount}`;
+  }
+  function serializePageWithoutOverlay() {
+    const clone = document.documentElement.cloneNode(true);
+    clone.querySelectorAll("#ycl-panel,#ycl-toast,[data-yanclaw-overlay]").forEach((node) => node.remove());
+    return clone.outerHTML;
+  }
   async function skipCurrent() {
     if (state.instanceRole !== "owner") return;
     const job = state.currentJob;
     if (!job) return;
     try {
       await skipJob(job.id);
-      addHistory(job, "skipped");
     } catch {
     }
+    clearNavigationAttempt(job.id);
     clearJob();
     triggerFastPollBurst();
   }
@@ -649,9 +956,9 @@
     if (!job) return;
     try {
       await failJob(job.id, msg || "手动标记失败");
-      addHistory(job, "failed");
     } catch {
     }
+    clearNavigationAttempt(job.id);
     clearJob();
     triggerFastPollBurst();
   }
@@ -765,6 +1072,80 @@
     onRoleChange$1 = null;
     currentRole = "standby";
   }
+  function disabledAttr(disabled) {
+    return disabled ? "disabled" : "";
+  }
+  function renderHeader() {
+    const dot = state.connected ? "ycl-dot-on" : "ycl-dot-off";
+    const roleLabel = state.instanceRole === "owner" ? "主实例" : "待机";
+    const roleClass = state.instanceRole === "owner" ? "ycl-role-owner" : "ycl-role-standby";
+    return `<div id="ycl-header">
+    <span><span class="ycl-status-dot ${dot}"></span> Yanclaw Assistant <span class="ycl-role-badge ${roleClass}">${roleLabel}</span></span>
+    <button id="ycl-min" title="最小化">─</button>
+  </div>`;
+  }
+  function renderStandbyBanner() {
+    return `<div class="ycl-standby-banner">当前 Tab 为待机实例，由其他 Tab 执行轮询与操作</div>`;
+  }
+  function renderMatchBanner() {
+    return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
+  }
+  function renderDecision(disabled) {
+    var _a;
+    const decision = state.pendingDecision;
+    if (!decision) return "";
+    const sample = ((_a = decision.sample_urls) == null ? void 0 : _a[0]) || "-";
+    return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
+    <div class="ycl-label">待决策</div>
+    <div>院系: <b>${decision.org_unit_name || "-"}</b></div>
+    <div>连续失败: ${decision.failure_count}</div>
+    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch" ${disabledAttr(disabled)}>失败链接切人工</button>
+  </div>`;
+  }
+  function renderJobDetail(job) {
+    var _a, _b;
+    const c = job.context;
+    return `<div class="ycl-section">
+    <div class="ycl-label">当前任务 #${job.id}</div>
+    <div>大学: <b>${c.university_name || "-"}</b></div>
+    <div>阶段: ${c.agent_state || "-"}</div>
+    ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ""}
+    ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ""}
+    ${((_a = job.action) == null ? void 0 : _a.label) ? `<div class="ycl-hint">动作: ${job.action.label}</div>` : ""}
+    <div class="ycl-label" style="margin-top:4px">目标 URL</div>
+    <div class="ycl-url">${job.url}</div>
+    ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ""}
+    ${c.depth != null ? `<div>深度: ${c.depth}</div>` : ""}
+    ${((_b = c.hints) == null ? void 0 : _b.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
+  </div>`;
+  }
+  function renderEmpty(isStandby) {
+    const msg = isStandby ? "📡 待机中，等待主实例接管任务" : state.connected ? "⏳ 等待新任务..." : "🔴 未连接到后端";
+    return `<div class="ycl-section" style="text-align:center;padding:16px 12px;">${msg}</div>`;
+  }
+  function renderActions(disabled) {
+    const disabledValue = disabledAttr(disabled);
+    return `<div class="ycl-btn-row">
+    <button class="ycl-btn ycl-btn-primary" id="ycl-copy" ${disabledValue}>📋 复制URL</button>
+    <button class="ycl-btn ycl-btn-primary" id="ycl-open" ${disabledValue}>🔗 打开URL</button>
+    <button class="ycl-btn ycl-btn-success" id="ycl-submit" ${disabledValue}>✅ 提交当前页</button>
+    <button class="ycl-btn ycl-btn-warn" id="ycl-skip" ${disabledValue}>⏭ 跳过</button>
+    <button class="ycl-btn ycl-btn-muted" id="ycl-override" ${disabledValue}>✏️ 修改URL</button>
+    <button class="ycl-btn ycl-btn-danger" id="ycl-fail" ${disabledValue}>❌ 失败</button>
+  </div>`;
+  }
+  function renderToggles(disabled) {
+    const disabledValue = disabledAttr(disabled);
+    return `<div class="ycl-toggle">
+    <input type="checkbox" id="ycl-auto" ${state.autoMode ? "checked" : ""} ${disabledValue}>
+    <label for="ycl-auto">自动模式 (自动导航+提交)</label>
+  </div>
+  <div class="ycl-toggle">
+    <input type="checkbox" id="ycl-pause" ${state.paused ? "checked" : ""} ${disabledValue}>
+    <label for="ycl-pause">暂停轮询</label>
+  </div>`;
+  }
   let panelEl = null;
   function mountPanel() {
     panelEl = document.createElement("div");
@@ -794,91 +1175,9 @@
       matched ? renderMatchBanner() : "",
       job ? renderJobDetail(job) : renderEmpty(isStandby),
       job ? renderActions(isStandby) : "",
-      renderToggles(isStandby),
-      renderHistory()
+      renderToggles(isStandby)
     ].join("");
     bindEvents();
-  }
-  function renderHeader() {
-    const dot = state.connected ? "ycl-dot-on" : "ycl-dot-off";
-    const roleLabel = state.instanceRole === "owner" ? "主实例" : "待机";
-    const roleClass = state.instanceRole === "owner" ? "ycl-role-owner" : "ycl-role-standby";
-    return `<div id="ycl-header">
-    <span><span class="ycl-status-dot ${dot}"></span> Yanclaw Assistant <span class="ycl-role-badge ${roleClass}">${roleLabel}</span></span>
-    <button id="ycl-min" title="最小化">─</button>
-  </div>`;
-  }
-  function renderStandbyBanner() {
-    return `<div class="ycl-standby-banner">当前 Tab 为待机实例，由其他 Tab 执行轮询与操作</div>`;
-  }
-  function renderMatchBanner() {
-    return `<div class="ycl-match-banner">✅ 检测到目标页面 — 点击提交或等待自动提交</div>`;
-  }
-  function renderDecision(disabled) {
-    var _a;
-    const decision = state.pendingDecision;
-    if (!decision) return "";
-    const sample = ((_a = decision.sample_urls) == null ? void 0 : _a[0]) || "-";
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-section" style="border-left:3px solid #f9e2af;">
-    <div class="ycl-label">待决策</div>
-    <div>院系: <b>${decision.org_unit_name || "-"}</b></div>
-    <div>连续失败: ${decision.failure_count}</div>
-    <div class="ycl-url" style="margin:4px 0">${truncUrl(sample, 60)}</div>
-    <button class="ycl-btn ycl-btn-warn" id="ycl-decision-switch" ${disableAttr}>失败链接切人工</button>
-  </div>`;
-  }
-  function renderJobDetail(job) {
-    var _a;
-    const c = job.context;
-    return `<div class="ycl-section">
-    <div class="ycl-label">当前任务 #${job.id}</div>
-    <div>大学: <b>${c.university_name || "-"}</b></div>
-    <div>阶段: ${c.agent_state || "-"}</div>
-    ${c.org_unit_name ? `<div>学院: ${c.org_unit_name}</div>` : ""}
-    ${c.intent ? `<div class="ycl-intent">💡 ${c.intent}</div>` : ""}
-    <div class="ycl-label" style="margin-top:4px">目标 URL</div>
-    <div class="ycl-url">${job.url}</div>
-    ${c.parent_url ? `<div style="margin-top:2px"><span class="ycl-label">来源</span> <span class="ycl-url">${truncUrl(c.parent_url, 60)}</span></div>` : ""}
-    ${c.depth != null ? `<div>深度: ${c.depth}</div>` : ""}
-    ${((_a = c.hints) == null ? void 0 : _a.length) ? `<div class="ycl-hint">💡 ${c.hints.join(" | ")}</div>` : ""}
-  </div>`;
-  }
-  function renderEmpty(isStandby) {
-    const msg = isStandby ? "📡 待机中，等待主实例接管任务" : state.connected ? "⏳ 等待新任务..." : "🔴 未连接到后端";
-    return `<div class="ycl-section" style="text-align:center;padding:16px 12px;">${msg}</div>`;
-  }
-  function renderActions(disabled) {
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-btn-row">
-    <button class="ycl-btn ycl-btn-primary" id="ycl-copy" ${disableAttr}>📋 复制URL</button>
-    <button class="ycl-btn ycl-btn-primary" id="ycl-open" ${disableAttr}>🔗 打开URL</button>
-    <button class="ycl-btn ycl-btn-success" id="ycl-submit" ${disableAttr}>✅ 提交当前页</button>
-    <button class="ycl-btn ycl-btn-warn" id="ycl-skip" ${disableAttr}>⏭ 跳过</button>
-    <button class="ycl-btn ycl-btn-muted" id="ycl-override" ${disableAttr}>✏️ 修改URL</button>
-    <button class="ycl-btn ycl-btn-danger" id="ycl-fail" ${disableAttr}>❌ 失败</button>
-  </div>`;
-  }
-  function renderToggles(disabled) {
-    const disableAttr = disabled ? "disabled" : "";
-    return `<div class="ycl-toggle">
-    <input type="checkbox" id="ycl-auto" ${state.autoMode ? "checked" : ""} ${disableAttr}>
-    <label for="ycl-auto">自动模式 (自动导航+提交)</label>
-  </div>
-  <div class="ycl-toggle">
-    <input type="checkbox" id="ycl-pause" ${state.paused ? "checked" : ""} ${disableAttr}>
-    <label for="ycl-pause">暂停轮询</label>
-  </div>`;
-  }
-  function renderHistory() {
-    if (!state.history.length) return "";
-    const items = state.history.map(
-      (h) => `<div class="ycl-history-item"><span>${statusIcon(h.status)} ${truncUrl(h.url, 35)}</span><span>${timeAgo(h.time)}</span></div>`
-    ).join("");
-    return `<div class="ycl-section">
-    <div class="ycl-label">历史 (${state.history.length})</div>
-    <div class="ycl-history">${items}</div>
-  </div>`;
   }
   function bindEvents() {
     var _a;
@@ -895,7 +1194,7 @@
       if (job) void navigator.clipboard.writeText(job.url);
     });
     bind("ycl-open", "click", () => {
-      if (job) window.location.href = job.url;
+      openCurrent();
     });
     bind("ycl-submit", "click", submitCurrent);
     bind("ycl-skip", "click", skipCurrent);

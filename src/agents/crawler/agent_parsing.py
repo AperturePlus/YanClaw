@@ -26,9 +26,19 @@ from agents.crawler.url_heuristics import (
 
 def extract_pagination_links(self: Any, links: list[str], current_url: str) -> list[str]:
     same_domain = self.fetcher.filter_same_domain(links, self.start_url)
+    current_host = (urlparse(current_url).hostname or "").lower()
     pagination: list[str] = []
     for link in same_domain:
         if link == current_url or link in self.visited_urls:
+            continue
+        # Pagination is "more of the same list" and must live on the same host as
+        # the page being paginated. filter_same_domain only matches the registrable
+        # root (e.g. sjtu.edu.cn), so without this guard a pagination-shaped URL on a
+        # sibling subdomain (e.g. the mem.seiee.* news microsite linked from the
+        # www.seiee.* faculty list) would be accepted and hijack the crawl. Mirrors
+        # the same-host check in extract_followup_faculty_links.
+        host = (urlparse(link).hostname or "").lower()
+        if current_host and host != current_host:
             continue
         if _is_pagination_link(link):
             pagination.append(link)
@@ -159,10 +169,25 @@ def org_units_from_result(self: Any, content: str) -> list[dict[str, Any]]:
     payload = self._parse_json_from_text(content)
     if payload is None or not isinstance(payload, dict):
         return []
-    units = payload.get("org_units")
-    if isinstance(units, list):
-        return [item for item in units if isinstance(item, dict)]
+    units = _dict_items(payload.get("org_units"))
+    if units:
+        return units
+    included_units = _dict_items(payload.get("included_org_units"))
+    if included_units:
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.warning(
+                "Org-unit extraction result used included_org_units fallback count=%s",
+                len(included_units),
+            )
+        return included_units
     return []
+
+
+def _dict_items(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
 
 
 def parse_json_from_text(self: Any, content: str) -> Any | None:

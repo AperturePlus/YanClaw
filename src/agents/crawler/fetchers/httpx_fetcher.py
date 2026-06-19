@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Iterable, Mapping
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import urlparse
 
 import html2text
+
+from agents.crawler.url_validation import normalize_crawlable_url
 
 
 @dataclass(frozen=True)
@@ -16,6 +18,7 @@ class FetchResult:
     status_code: int
     block_reason: str | None = None
     link_signals: tuple[Any, ...] = ()
+    pagination_states: tuple[Any, ...] = ()
 
 
 class _LinkParser(HTMLParser):
@@ -45,6 +48,9 @@ class Fetcher:
             link = _coerce_link(raw_link)
             if not link:
                 continue
+            link = normalize_crawlable_url(link)
+            if not link:
+                continue
             parsed = urlparse(link)
             host = (parsed.hostname or "").lower()
             if not host:
@@ -52,11 +58,10 @@ class Fetcher:
             root = _site_root(host)
             if root != base_root:
                 continue
-            normalized = urldefrag(link)[0]
-            if normalized in seen:
+            if link in seen:
                 continue
-            seen.add(normalized)
-            filtered.append(normalized)
+            seen.add(link)
+            filtered.append(link)
         return filtered
 
     @staticmethod
@@ -73,9 +78,8 @@ class Fetcher:
         links: list[str] = []
         seen: set[str] = set()
         for href in parser.links:
-            absolute = urldefrag(urljoin(base_url, href))[0]
-            scheme = urlparse(absolute).scheme.lower()
-            if scheme not in {"http", "https"}:
+            absolute = normalize_crawlable_url(href, base_url=base_url)
+            if not absolute:
                 continue
             if absolute in seen:
                 continue

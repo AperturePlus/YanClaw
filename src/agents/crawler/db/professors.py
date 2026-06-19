@@ -18,6 +18,7 @@ from agents.crawler.sanitizer import (
     normalize_org_unit_name,
     normalize_title,
 )
+from agents.crawler.url_heuristics import _is_faculty_platform, _is_query_profile_detail_url
 from agents.crawler.db.university import get_or_create_org_unit
 from agents.crawler.db.utils import (
     _merge_org_unit_names,
@@ -35,6 +36,8 @@ class UpsertEntityResult:
     entity: Professor | Academician
     status: str
     deduped_by_name_key: bool = False
+    deduped_by_homepage: bool = False
+    dedupe_reason: str = ""
 
 
 async def upsert_professor(session: AsyncSession, data: dict[str, Any]) -> Professor:
@@ -104,9 +107,11 @@ async def upsert_professor_with_status(session: AsyncSession, data: dict[str, An
         name_key,
         int(org_unit_id),
         email,
+        homepage,
         external_link,
     )
     deduped_by_name_key = False
+    deduped_by_homepage = False
     if professor is None:
         professor = Professor(
             **values,
@@ -119,6 +124,7 @@ async def upsert_professor_with_status(session: AsyncSession, data: dict[str, An
     else:
         changed = _merge_professor(professor, values, overwrite=same_org_unit)
         deduped_by_name_key = match_reason == "same_org_name_key"
+        deduped_by_homepage = match_reason == "homepage_exact"
         await session.flush()
         status = "updated" if changed else "unchanged"
 
@@ -131,7 +137,13 @@ async def upsert_professor_with_status(session: AsyncSession, data: dict[str, An
     if status == "unchanged" and affiliation_changed:
         status = "updated"
     await session.flush()
-    return UpsertEntityResult(professor, status=status, deduped_by_name_key=deduped_by_name_key)
+    return UpsertEntityResult(
+        professor,
+        status=status,
+        deduped_by_name_key=deduped_by_name_key,
+        deduped_by_homepage=deduped_by_homepage,
+        dedupe_reason=match_reason,
+    )
 
 
 async def upsert_academician(session: AsyncSession, data: dict[str, Any]) -> Academician:
@@ -202,6 +214,35 @@ async def upsert_academician_with_status(session: AsyncSession, data: dict[str, 
             .limit(1)
         )
     ).scalars().first()
+    match_reason = "same_org_name_key" if existing is not None else ""
+    if existing is None and homepage:
+        existing = (
+            await session.execute(
+                select(Academician)
+                .where(
+                    Academician.org_unit_id == int(org_unit_id),
+                    Academician.homepage == homepage,
+                )
+                .order_by(Academician.id.asc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if existing is not None:
+            match_reason = "same_org_homepage"
+    if existing is None and external_link:
+        existing = (
+            await session.execute(
+                select(Academician)
+                .where(
+                    Academician.org_unit_id == int(org_unit_id),
+                    Academician.external_link == external_link,
+                )
+                .order_by(Academician.id.asc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if existing is not None:
+            match_reason = "same_org_external_link"
     if existing is None:
         existing = Academician(
             **values,
@@ -214,7 +255,8 @@ async def upsert_academician_with_status(session: AsyncSession, data: dict[str, 
         return UpsertEntityResult(existing, status="created")
 
     changed = _merge_academician(existing, values)
-    deduped_by_name_key = True
+    deduped_by_name_key = match_reason == "same_org_name_key"
+    deduped_by_homepage = match_reason == "same_org_homepage"
     if changed:
         existing.updated_at = _now_utc()
     await session.flush()
@@ -222,6 +264,8 @@ async def upsert_academician_with_status(session: AsyncSession, data: dict[str, 
         existing,
         status="updated" if changed else "unchanged",
         deduped_by_name_key=deduped_by_name_key,
+        deduped_by_homepage=deduped_by_homepage,
+        dedupe_reason=match_reason,
     )
 
 
@@ -278,6 +322,7 @@ async def _find_existing_professor(
     name_key: str,
     org_unit_id: int,
     email: str | None,
+    homepage: str | None,
     external_link: str | None,
 ) -> tuple[Professor | None, bool, str]:
     same_org_unit = (
@@ -303,6 +348,15 @@ async def _find_existing_professor(
         ).scalars().first()
         if by_email:
             return by_email, False, "email_exact"
+
+    if homepage:
+        by_homepage = (
+            await session.execute(
+                select(Professor).where(Professor.homepage == homepage).order_by(Professor.id.asc()).limit(1)
+            )
+        ).scalars().first()
+        if by_homepage:
+            return by_homepage, False, "homepage_exact"
 
     if external_link:
         by_external_link = (
@@ -336,6 +390,12 @@ def _merge_professor(professor: Professor, values: dict[str, Any], *, overwrite:
             continue
         if key == "homepage":
             best = _choose_better_profile_url(current, value)
+            if best and best != current:
+                setattr(professor, key, best)
+                changed = True
+            continue
+        if key == "title":
+            best = _choose_better_title(current, value)
             if best and best != current:
                 setattr(professor, key, best)
                 changed = True
@@ -402,6 +462,38 @@ def _choose_better_name(current: Any, incoming: Any) -> str:
     return current_name
 
 
+_TITLE_QUALITY: dict[str, int] = {
+    "院士": 100,
+    "教授": 80,
+    "研究员": 78,
+    "主任医师": 76,
+    "副教授": 70,
+    "副研究员": 68,
+    "副主任医师": 66,
+    "助理教授": 55,
+    "助理研究员": 53,
+    "主治医师": 50,
+    "讲师": 40,
+    "工程师": 35,
+    "住院医师": 30,
+    "博士后": 25,
+}
+
+
+def _choose_better_title(current: Any, incoming: Any) -> str | None:
+    current_title = normalize_title(current)
+    incoming_title = normalize_title(incoming)
+    if not current_title:
+        return incoming_title
+    if not incoming_title:
+        return current_title
+    current_quality = _TITLE_QUALITY.get(current_title, 0)
+    incoming_quality = _TITLE_QUALITY.get(incoming_title, 0)
+    if incoming_quality > current_quality:
+        return incoming_title
+    return current_title
+
+
 def _split_profile_and_external_urls(
     *,
     source_url: str,
@@ -426,10 +518,19 @@ def _split_profile_and_external_urls(
             if not external_link:
                 external_link = candidate
             continue
-        homepage = _choose_better_profile_url(homepage, candidate)
+        if _is_faculty_platform(candidate):
+            if not external_link:
+                external_link = candidate
+            continue
+        homepage = _choose_better_profile_url(homepage, normalize_professor_homepage(candidate))
 
-    if source_url and _is_profile_detail_url(source_url):
-        homepage = _choose_better_profile_url(homepage, source_url)
+    source_homepage = normalize_professor_homepage(source_url)
+    if source_homepage:
+        if _is_faculty_platform(source_homepage):
+            if not external_link:
+                external_link = source_homepage
+        else:
+            homepage = _choose_better_profile_url(homepage, source_homepage)
 
     return homepage, external_link
 
@@ -464,6 +565,52 @@ def _choose_better_profile_url(current: str | None, candidate: str | None) -> st
     return current
 
 
+def normalize_professor_homepage(value: Any) -> str | None:
+    normalized = _normalize_homepage(value)
+    if not normalized:
+        return None
+    if not _is_usable_profile_homepage(normalized):
+        return None
+    return normalized
+
+
+def _is_usable_profile_homepage(url: str) -> bool:
+    normalized = _normalize_url(url)
+    if not normalized or normalized.startswith("about:"):
+        return False
+    parsed = urlparse(normalized)
+    if not parsed.scheme or not parsed.netloc:
+        return False
+    path = (parsed.path or "").lower().rstrip("/")
+    if not path or path == "/":
+        return False
+    tail = path.rsplit("/", 1)[-1]
+    stem = tail.rsplit(".", 1)[0]
+    if _is_query_profile_detail_url(normalized):
+        return True
+    directory_stems = {
+        "faculty",
+        "teacher",
+        "teachers",
+        "staff",
+        "directory",
+        "team",
+        "szdw",
+        "jsdw",
+        "szll",
+        "jzg",
+        "jsml",
+        "list",
+        "teamlist",
+        "teacherlist",
+        "facultylist",
+        "tu-list",
+    }
+    if stem in directory_stems:
+        return False
+    return _profile_url_quality(normalized) >= 0
+
+
 def _is_profile_detail_url(url: str) -> bool:
     return _profile_url_quality(url) >= 40
 
@@ -482,6 +629,8 @@ def _profile_url_quality(url: str | None) -> int:
     detail_hints = ("/info/", "/profile", "/detail", "/show", "/mentor")
     list_hints = ("/szdw", "/szll", "/jsdw", "/team", "/staff", "/directory")
 
+    if _is_query_profile_detail_url(normalized):
+        score += 95
     if any(token in path for token in detail_hints):
         score += 70
     if re.search(r"/info/\d+/\d+(\.s?html?)?$", path):
@@ -499,6 +648,7 @@ def _profile_url_quality(url: str | None) -> int:
 __all__ = [
     "UpsertEntityResult",
     "ensure_professor_affiliation",
+    "normalize_professor_homepage",
     "upsert_academician",
     "upsert_academician_with_status",
     "upsert_professor",

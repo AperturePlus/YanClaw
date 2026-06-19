@@ -28,3 +28,5 @@ pytest_foo/
 node_modules/
 
 .claude/
+
+.serena/

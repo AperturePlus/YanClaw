@@ -12,6 +12,9 @@ from agents.crawler.url_heuristics import (
     _allow_faculty_candidate_for_org_unit,
     _is_non_faculty_noise_url,
     _is_faculty_platform,
+    _is_query_profile_detail_url,
+    _org_unit_exclusion_match,
+    _should_exclude_org_unit,
     _looks_like_org_unit_listing_url,
     _looks_like_retired_content,
     _rank_faculty_page_candidates,
@@ -79,6 +82,60 @@ def test_real_college_name_accepted():
     assert not _is_category_name("信息与通信工程学院")
 
 
+def test_org_unit_exclusion_hard_rules_match_blacklisted_units():
+    assert _should_exclude_org_unit(name="艺术学院", url="https://art.example.edu.cn/")
+    assert _should_exclude_org_unit(name="体育学院", url="https://sports.example.edu.cn/")
+    assert _should_exclude_org_unit(name="中外合作办学学院", url="https://joint.example.edu.cn/")
+    assert _should_exclude_org_unit(name="国际联合学院", url="https://joint.example.edu.cn/")
+    assert _should_exclude_org_unit(name="基教中心", url="https://basic.example.edu.cn/")
+    assert _should_exclude_org_unit(name="基础教学部", url="https://basic.example.edu.cn/")
+    assert _should_exclude_org_unit(name="教学实验中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实验中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实验教学中心", url="https://lab-teach.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实践教学中心", url="https://practice.example.edu.cn/")
+    assert _should_exclude_org_unit(name="实训中心", url="https://training.example.edu.cn/")
+    assert _should_exclude_org_unit(name="继续教育学院", url="https://jxjy.example.edu.cn/")
+    assert _should_exclude_org_unit(name="成人教育学院", url="https://adult.example.edu.cn/")
+    assert _should_exclude_org_unit(name="网络教育学院", url="https://online.example.edu.cn/")
+    assert _should_exclude_org_unit(name="吴玉章书院", url="https://wyz.example.edu.cn/")
+    assert _should_exclude_org_unit(name="北航学院", url="https://bhxy.buaa.edu.cn/")
+    assert _should_exclude_org_unit(name="卓越工程师学院", url="https://engineer.example.edu.cn/")
+    assert _should_exclude_org_unit(name="卓工学院", url="https://elite.example.edu.cn/")
+    assert _org_unit_exclusion_match(name="格拉斯哥学院", url="https://glasgow.example.edu.cn/").category == "joint_program"
+    assert (
+        _org_unit_exclusion_match(name="继续教育学院", url="https://jxjy.example.edu.cn/").category
+        == "continuing_education"
+    )
+    assert (
+        _org_unit_exclusion_match(name="吴玉章书院", url="https://wyz.example.edu.cn/").category
+        == "undergraduate_teaching_unit"
+    )
+    assert (
+        _org_unit_exclusion_match(name="卓越工程师学院", url="https://engineer.example.edu.cn/").category
+        == "excellent_engineer_program"
+    )
+    assert (
+        _org_unit_exclusion_match(name="教学实验中心", url="https://lab-teach.example.edu.cn/").category
+        == "teaching_experiment_center"
+    )
+
+
+def test_org_unit_exclusion_hard_rules_avoid_false_positives():
+    assert not _should_exclude_org_unit(name="人工智能学院", url="https://ai.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="工业设计学院", url="https://design.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="经济管理学院", url="https://sem.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="医学院", url="https://med.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="农学院", url="https://agri.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="外国语学院", url="https://foreign.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="教育学院", url="https://edu.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="高等教育研究院", url="https://ihe.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="航空学院", url="https://aviation.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="软件学院", url="https://software.example.edu.cn/")
+    assert not _should_exclude_org_unit(name="智能科学研究中心", url="https://ai.example.edu.cn/research-center")
+    assert not _should_exclude_org_unit(name="工程研究中心", url="https://engineering.example.edu.cn/research")
+    assert not _should_exclude_org_unit(name="国家重点实验室", url="https://lab.example.edu.cn/")
+
+
 def test_retired_content_not_triggered_on_mixed_faculty_tabs():
     text = (
         "\u5e08\u8d44\u961f\u4f0d\n"
@@ -110,6 +167,11 @@ def test_non_faculty_noise_url_matches_rszc_variants():
     assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/rszc2.htm")
 
 
+def test_non_faculty_noise_url_matches_rules_and_regulations_pages():
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/规章制度/")
+    assert _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/规章制度.htm")
+
+
 def test_non_faculty_noise_url_does_not_block_regular_faculty_paths():
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/szdw/jsdw.htm")
     assert not _is_non_faculty_noise_url("https://www.example.edu.cn/faculty/teacher_list.htm")
@@ -125,6 +187,17 @@ def test_non_faculty_noise_url_ignores_news_token_in_query_string():
     # Path-based news pages must still be flagged.
     assert _is_non_faculty_noise_url(
         "https://soft.buaa.edu.cn/news_list.jsp?urltype=tree.TreeTempUrl&wbtreeid=1078"
+    )
+
+
+def test_query_profile_detail_url_detects_scu_teamlist_detail_only():
+    assert _is_query_profile_detail_url(
+        "https://saa.scu.edu.cn/teamlist.htm?action=detailTeam&uuinId=661618903336854"
+    )
+    assert not _is_query_profile_detail_url("https://saa.scu.edu.cn/teamlist.htm")
+    assert not _is_query_profile_detail_url("https://saa.scu.edu.cn/teamlist.htm?uuinUuteId=1761503632748933")
+    assert not _is_query_profile_detail_url(
+        "https://saa.scu.edu.cn/list.htm?m=1351479452361353&c=661618903336591&currentPage=1"
     )
 
 
@@ -176,6 +249,74 @@ def test_assess_faculty_candidate_classifies_noise_or_login_hard_reject():
     assert item.page_type == FACULTY_PAGE_TYPE_NOISE
     assert item.hard_reject is True
     assert item.score < 0
+
+
+def test_assess_faculty_candidate_classifies_rules_and_regulations_as_noise():
+    item = _assess_faculty_candidate(
+        "https://www.example.edu.cn/szdw/规章制度.htm",
+        anchor_text="规章制度",
+        heading_text="师资队伍",
+    )
+
+    assert item.page_type == FACULTY_PAGE_TYPE_NOISE
+    assert item.score <= 0
+
+
+def test_assess_faculty_candidate_classifies_banner_as_noise_even_with_professor_text():
+    item = _assess_faculty_candidate(
+        "https://icisee.sjtu.edu.cn/banner/2727.html",
+        anchor_text="热烈祝贺张文军教授当选中国工程院院士",
+        heading_text="师资队伍",
+        parent_tags_or_classes=("div.g-nav2", "a.nava"),
+    )
+
+    assert _is_non_faculty_noise_url(item.url)
+    assert item.page_type == FACULTY_PAGE_TYPE_NOISE
+    assert item.score < 0
+
+
+def test_structural_selection_excludes_banner_category_noise_but_keeps_real_rosters():
+    roster = "https://icisee.sjtu.edu.cn/jiaoshiml.html"
+    roster_alt = "https://icisee.sjtu.edu.cn/szdw.html"
+    banner = "https://icisee.sjtu.edu.cn/banner/2947.html"
+    assessed = _assess_structural_faculty_candidates(
+        [roster, roster_alt, banner],
+        link_signals=(
+            LinkSignal(
+                url=roster,
+                anchor_text="教师名录",
+                heading_text="师资队伍",
+                parent_tags_or_classes=("div.g-nav",),
+                link_order=1,
+            ),
+            LinkSignal(
+                url=roster_alt,
+                anchor_text="师资队伍",
+                heading_text="教师名录",
+                parent_tags_or_classes=("div.g-nav",),
+                link_order=2,
+            ),
+            LinkSignal(
+                url=banner,
+                anchor_text="热烈祝贺张文军教授当选中国工程院院士",
+                heading_text="师资队伍",
+                parent_tags_or_classes=("div.g-nav2",),
+                link_order=3,
+            ),
+        ),
+    )
+
+    selected_urls = [item.url for item in _select_balanced_faculty_candidates(assessed, limit=4)]
+
+    assert roster in selected_urls
+    assert roster_alt in selected_urls
+    assert banner not in selected_urls
+
+
+def test_promotional_token_inside_explicit_faculty_path_is_not_noise():
+    url = "https://www.example.edu.cn/faculty/banner-lab/teacher_list.htm"
+
+    assert not _is_non_faculty_noise_url(url)
 
 
 def test_assess_faculty_candidate_classifies_full_category_and_elite():
@@ -235,6 +376,45 @@ def test_select_balanced_candidates_drops_elite_when_full_exists():
     assert "https://scse.buaa.edu.cn/szdw/jsdw.htm" in selected_urls
     assert "https://scse.buaa.edu.cn/szdw/js.htm" in selected_urls
     assert "https://scse.buaa.edu.cn/szdw/jcrc.htm" not in selected_urls
+
+
+def test_buaa_active_teacher_roster_is_selected_before_elite_talent_page():
+    roster_url = "https://dept3.buaa.edu.cn/szjs/zzjs/znxtykzgcx.htm"
+    elite_url = "https://dept3.buaa.edu.cn/szjs/jcrc.htm"
+    mentor_url = "https://dept3.buaa.edu.cn/szjs/yjsds.htm"
+    assessed = _assess_structural_faculty_candidates(
+        [elite_url, mentor_url, roster_url],
+        link_signals=(
+            LinkSignal(
+                url=elite_url,
+                anchor_text="杰出人才",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=1,
+            ),
+            LinkSignal(
+                url=mentor_url,
+                anchor_text="研究生导师",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=2,
+            ),
+            LinkSignal(
+                url=roster_url,
+                anchor_text="在职教师",
+                heading_text="师资建设",
+                parent_tags_or_classes=("nav.menu",),
+                link_order=3,
+            ),
+        ),
+    )
+
+    roster = next(item for item in assessed if item.url == roster_url)
+    selected_urls = [item.url for item in _select_balanced_faculty_candidates(assessed, limit=4)]
+
+    assert roster.page_type == FACULTY_PAGE_TYPE_FULL
+    assert roster_url in selected_urls
+    assert elite_url not in selected_urls
 
 
 def test_assess_structural_candidates_tie_break_is_stable_without_signals():

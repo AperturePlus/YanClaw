@@ -150,19 +150,6 @@
   accent-color: #89b4fa;
 }
 
-.ycl-history {
-  max-height: 120px;
-  overflow-y: auto;
-}
-
-.ycl-history-item {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  padding: 2px 0;
-  color: #a6adc8;
-}
-
 .ycl-status-dot {
   display: inline-block;
   width: 8px;

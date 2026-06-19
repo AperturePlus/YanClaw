@@ -8,6 +8,7 @@ from agents.crawler.fetchers.httpx_fetcher import (
     _is_html_content,
     _is_ssl_error,
 )
+from agents.crawler.fetchers.link_signals import extract_links_with_signals
 
 
 def test_fetcher_utils_convert_html_and_extract_links():
@@ -37,6 +38,47 @@ def test_fetcher_utils_extract_links_dedup_and_filter_non_http():
         "https://www.example.edu.cn/a",
         "https://www.example.edu.cn/b",
     ]
+
+
+def test_extract_links_rejects_cms_html_error_href_but_keeps_chinese_paths():
+    helper = Fetcher()
+    bad_href = "<span style='color:red;font-size:9pt'>\u8f6c\u6362\u94fe\u63a5\u9519\u8bef</span"
+    valid_path = "/\u5e08\u8d44/\u6559\u5e08.htm"
+    html = f'<html><body><a href="{bad_href}">bad</a><a href="{valid_path}">ok</a></body></html>'
+
+    links = helper._extract_links(html, "https://www.example.edu.cn/szdw/")
+
+    assert links == ["https://www.example.edu.cn/\u5e08\u8d44/\u6559\u5e08.htm"]
+
+
+def test_filter_same_domain_rejects_encoded_cms_html_error_url_and_keeps_valid_urls():
+    bad_url = (
+        "https://sesu.scu.edu.cn/szdw/zzjs1/"
+        "%3Cspan%20style='color:red;font-size:9pt'%3E"
+        "%E8%BD%AC%E6%8D%A2%E9%93%BE%E6%8E%A5%E9%94%99%E8%AF%AF%3C/span"
+    )
+    valid_url = "https://sesu.scu.edu.cn/szdw/wkjxjs.htm"
+
+    assert Fetcher.filter_same_domain([bad_url, valid_url], "https://www.scu.edu.cn/") == [valid_url]
+
+
+def test_structural_link_signals_reject_cms_html_error_href():
+    bad_href = "<span style='color:red;font-size:9pt'>\u8f6c\u6362\u94fe\u63a5\u9519\u8bef</span"
+    html = (
+        f'<html><body><nav><a href="{bad_href}">bad</a>'
+        '<a href="/szdw/jsdw.htm">teachers</a></nav></body></html>'
+    )
+
+    links, signals = extract_links_with_signals(html, "https://sesu.scu.edu.cn/szdw/")
+
+    assert links == ["https://sesu.scu.edu.cn/szdw/jsdw.htm"]
+    assert [signal.url for signal in signals] == links
+
+
+def test_buaa_teachershouw_news_query_remains_crawlable():
+    url = "https://soft.buaa.edu.cn/teachershouw.jsp?urltype=news.NewsContentUrl&wbtreeid=1262&wbnewsid=9633"
+
+    assert Fetcher.filter_same_domain([url], "https://www.buaa.edu.cn/") == [url]
 
 
 def test_filter_same_domain_allows_subdomains_and_rejects_external():

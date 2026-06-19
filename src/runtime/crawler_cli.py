@@ -8,7 +8,6 @@ import click
 
 from agents.crawler.config import CrawlerSettings
 from agents.crawler.dispatcher import CrawlDispatcher, FreshRunPreparationError
-from runtime.database import DatabaseManager
 from runtime.llm import LLMClient
 from runtime.logger import get_logger, setup_logging
 from runtime.skills import SkillManager
@@ -27,6 +26,21 @@ def cli() -> None:
     default=None,
     type=float,
     help="Fuzzy-match threshold in [0,1] for --org-units.",
+)
+@click.option(
+    "--no-org-unit-exclude",
+    is_flag=True,
+    help="Disable default org-unit exclusion for arts/sports/joint programs/basic teaching units.",
+)
+@click.option(
+    "--org-unit-exclude-keywords",
+    default="",
+    help="Comma-separated org-unit exclusion keywords overriding the defaults.",
+)
+@click.option(
+    "--no-org-unit-llm-filter",
+    is_flag=True,
+    help="Disable LLM second-pass org-unit exclusion filtering.",
 )
 @click.option("--concurrency", default=None, type=int, help="Override max concurrency.")
 @click.option("--log-dir", default=None, type=click.Path(path_type=Path), help="Log directory.")
@@ -63,6 +77,9 @@ def crawl(
     universities: str,
     org_units: str,
     org_unit_match_threshold: float | None,
+    no_org_unit_exclude: bool,
+    org_unit_exclude_keywords: str,
+    no_org_unit_llm_filter: bool,
     concurrency: int | None,
     log_dir: Path | None,
     university_timeout_seconds: float | None,
@@ -80,6 +97,13 @@ def crawl(
         overrides["target_org_units"] = target_org_units
     if org_unit_match_threshold is not None:
         overrides["org_unit_match_threshold"] = org_unit_match_threshold
+    if no_org_unit_exclude:
+        overrides["org_unit_exclude_enabled"] = False
+    exclude_keywords = [item.strip() for item in org_unit_exclude_keywords.split(",") if item.strip()]
+    if exclude_keywords:
+        overrides["org_unit_exclude_keywords"] = exclude_keywords
+    if no_org_unit_llm_filter:
+        overrides["org_unit_llm_filter_enabled"] = False
     if concurrency is not None:
         overrides["max_concurrency"] = concurrency
     if log_dir is not None:
@@ -91,17 +115,23 @@ def crawl(
     logger = get_logger("crawler.cli")
     selected = [item.strip() for item in universities.split(",") if item.strip()] or None
     logger.info(
-        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s",
+        "Crawler config concurrency=%s human_bridge=%s:%s human_job_timeout_seconds=%s university_timeout_seconds=%s llm_timeout_seconds=%s llm_max_concurrent=%s llm_min_interval_seconds=%s pipeline_llm_workers=%s max_org_units_per_university=%s resume=%s selected=%s target_org_units=%s org_unit_match_threshold=%s org_unit_exclude_enabled=%s org_unit_llm_filter_enabled=%s",
         settings.max_concurrency,
         settings.human_server_host,
         settings.human_server_port,
         settings.human_job_timeout_seconds,
         settings.university_timeout_seconds,
         settings.llm_timeout_seconds,
+        settings.llm_max_concurrent,
+        settings.llm_min_interval_seconds,
+        settings.pipeline_llm_workers,
+        settings.max_org_units_per_university,
         resume,
         ",".join(selected) if selected else "*",
         ",".join(settings.target_org_units) if settings.target_org_units else "*",
         settings.org_unit_match_threshold,
+        settings.org_unit_exclude_enabled,
+        settings.org_unit_llm_filter_enabled,
     )
     asyncio.run(
         _crawl_async(
@@ -152,15 +182,20 @@ async def _crawl_async(
             universities_file=None,
             db_roots=None,
             apply=steward_after_crawl_mode.strip().lower() == "apply",
-            llm_enabled=False,
+            llm_enabled=_resolve_steward_llm_enabled(settings, None),
             max_context_tokens=256000,
             include_backup_audit=False,
+            export=False,
         )
         click.echo(
             "steward "
             + f"targets={len(steward_summary.targets)} "
             + f"duplicates={steward_summary.total_duplicates_detected} "
             + f"deleted={steward_summary.total_duplicates_deleted} "
+            + f"excluded_org_units={getattr(steward_summary, 'total_excluded_org_units_detected', 0)} "
+            + f"excluded_org_units_deleted={getattr(steward_summary, 'total_excluded_org_units_deleted', 0)} "
+            + f"sub_department_sections={getattr(steward_summary, 'total_sub_department_sections_detected', 0)} "
+            + f"sub_department_sections_merged={getattr(steward_summary, 'total_sub_department_sections_merged', 0)} "
             + f"missing_audits={steward_summary.total_missing_field_audits}"
         )
 
@@ -176,6 +211,8 @@ async def _check_llm(settings: CrawlerSettings) -> None:
         settings.openai_api_key,
         settings.openai_model,
         max_rounds=1,
+        max_concurrent=settings.llm_max_concurrent,
+        min_interval=settings.llm_min_interval_seconds,
         timeout_seconds=settings.llm_timeout_seconds,
         temperature=settings.llm_temperature,
         top_p=settings.llm_top_p,
@@ -209,6 +246,8 @@ def llm_check() -> None:
     click.echo(f"model={settings.openai_model}")
     click.echo(f"api_key_set={bool(settings.openai_api_key)}")
     click.echo(f"timeout_seconds={settings.llm_timeout_seconds}")
+    click.echo(f"max_concurrent={settings.llm_max_concurrent}")
+    click.echo(f"min_interval_seconds={settings.llm_min_interval_seconds}")
     click.echo(f"temperature={settings.llm_temperature}")
     click.echo(f"top_p={settings.llm_top_p}")
     click.echo(f"seed={settings.llm_seed}")
@@ -267,42 +306,26 @@ def cookie_clear(url: str) -> None:
 
 
 @cli.group()
-def skills() -> None:
-    """Manage crawler skills."""
+@click.option(
+    "--agent",
+    "skills_agent",
+    default="crawler",
+    type=click.Choice(["crawler", "data_steward"], case_sensitive=False),
+    help="Skill owner to manage. Defaults to crawler.",
+)
+@click.pass_context
+def skills(ctx: click.Context, skills_agent: str) -> None:
+    """Manage agent skills."""
+
+    ctx.obj = {**(ctx.obj or {}), "skills_agent": skills_agent.strip().lower()}
 
 
 @skills.command("list")
-def list_skills() -> None:
+@click.pass_context
+def list_skills(ctx: click.Context) -> None:
     """List skills."""
 
-    asyncio.run(_list_skills_async())
-
-
-@skills.command("history")
-@click.argument("name")
-def skill_history(name: str) -> None:
-    """Show skill version history."""
-
-    asyncio.run(_history_async(name))
-
-
-@skills.command("diff")
-@click.argument("name")
-@click.argument("v1", type=int)
-@click.argument("v2", type=int)
-def skill_diff(name: str, v1: int, v2: int) -> None:
-    """Show unified diff between two skill versions."""
-
-    asyncio.run(_diff_async(name, v1, v2))
-
-
-@skills.command("rollback")
-@click.argument("name")
-@click.argument("version", type=int)
-def skill_rollback(name: str, version: int) -> None:
-    """Rollback a skill to a stored version."""
-
-    asyncio.run(_rollback_async(name, version))
+    asyncio.run(_list_skills_async(_skills_agent_from_context(ctx)))
 
 
 @cli.group()
@@ -394,17 +417,23 @@ def recommend(
 @click.option("--universities-file", default=None, type=click.Path(exists=True, path_type=Path), help="File with one university name per line.")
 @click.option("--db-roots", default="", help="Comma-separated DB roots (e.g. pku.edu.cn,tsinghua.edu.cn).")
 @click.option("--apply", is_flag=True, help="Apply mutations (delete/update/enqueue). Default is dry-run.")
-@click.option("--llm-enabled", is_flag=True, help="Enable LLM classification for uncertain missing-field reasons.")
+@click.option(
+    "--llm-enabled/--no-llm",
+    default=None,
+    help="Enable or disable DataSteward LLM cleanup. Default: enabled when API key is set.",
+)
 @click.option("--max-context-tokens", default=128000, type=int, help="LLM context cap (hard-limited to <=256000).")
 @click.option("--include-backup-audit", is_flag=True, help="Read-only compare with latest backup DB snapshot.")
+@click.option("--export", is_flag=True, help="Export compact clean DBs after stewardship completes.")
 def steward_run(
     universities: str,
     universities_file: Path | None,
     db_roots: str,
     apply: bool,
-    llm_enabled: bool,
+    llm_enabled: bool | None,
     max_context_tokens: int,
     include_backup_audit: bool,
+    export: bool,
 ) -> None:
     if apply and include_backup_audit:
         raise click.ClickException("`--include-backup-audit` is read-only and cannot be combined with `--apply`.")
@@ -413,6 +442,7 @@ def steward_run(
     setup_logging(settings.log_dir)
     university_items = _split_csv(universities)
     root_items = _split_csv(db_roots)
+    resolved_llm_enabled = _resolve_steward_llm_enabled(settings, llm_enabled)
     summary = asyncio.run(
         _steward_run_async(
             settings=settings,
@@ -420,9 +450,10 @@ def steward_run(
             universities_file=universities_file,
             db_roots=root_items or None,
             apply=apply,
-            llm_enabled=llm_enabled,
+            llm_enabled=resolved_llm_enabled,
             max_context_tokens=max_context_tokens,
             include_backup_audit=include_backup_audit,
+            export=export,
         )
     )
     click.echo(
@@ -431,8 +462,14 @@ def steward_run(
         + f" targets={len(summary.targets)} "
         + f"duplicates={summary.total_duplicates_detected} "
         + f"deleted={summary.total_duplicates_deleted} "
+        + f"excluded_org_units={getattr(summary, 'total_excluded_org_units_detected', 0)} "
+        + f"excluded_org_units_deleted={getattr(summary, 'total_excluded_org_units_deleted', 0)} "
+        + f"sub_department_sections={getattr(summary, 'total_sub_department_sections_detected', 0)} "
+        + f"sub_department_sections_merged={getattr(summary, 'total_sub_department_sections_merged', 0)} "
         + f"missing_audits={summary.total_missing_field_audits} "
-        + f"recrawl_tasks={summary.total_recrawl_tasks_upserted}"
+        + f"recrawl_tasks={summary.total_recrawl_tasks_upserted} "
+        + f"exports={getattr(summary, 'total_exports', 0)} "
+        + f"exported_bytes={getattr(summary, 'total_exported_bytes', 0)}"
     )
     if summary.unmatched_universities:
         click.echo("unmatched_universities=" + ",".join(summary.unmatched_universities))
@@ -441,54 +478,35 @@ def steward_run(
     click.echo(json.dumps([run.__dict__ for run in summary.runs], ensure_ascii=False))
 
 
-async def _manager() -> tuple[DatabaseManager, SkillManager]:
-    settings = CrawlerSettings()
-    db = DatabaseManager(settings.database_url)
-    await db.init_db()
-    return db, SkillManager(settings.crawler_skills_dir, db, "crawler")
+def _skills_agent_from_context(ctx: click.Context) -> str:
+    current: click.Context | None = ctx
+    obj: dict[str, object] = {}
+    while current is not None:
+        if isinstance(current.obj, dict) and "skills_agent" in current.obj:
+            obj = current.obj
+            break
+        current = current.parent
+    value = str(obj.get("skills_agent") or "crawler").strip().lower()
+    return value if value in {"crawler", "data_steward"} else "crawler"
 
 
-async def _list_skills_async() -> None:
-    db, manager = await _manager()
-    try:
-        for meta in manager.list_skills():
-            applies_to = ",".join(meta.applies_to) if meta.applies_to else "*"
-            allowed_tools = ",".join(meta.allowed_tools) if meta.allowed_tools else "-"
-            token_budget = str(meta.token_budget) if meta.token_budget is not None else "-"
-            click.echo(
-                f"{meta.name}\tv{meta.version}\tpriority={meta.priority}\t"
-                f"applies_to={applies_to}\tallowed_tools={allowed_tools}\t"
-                f"token_budget={token_budget}\t{meta.description}"
-            )
-    finally:
-        await db.close()
+def _skill_manager_for_settings(settings: CrawlerSettings, agent_name: str) -> SkillManager:
+    if agent_name == "data_steward":
+        return SkillManager(settings.data_steward_skills_dir)
+    return SkillManager(settings.crawler_skills_dir)
 
 
-async def _history_async(name: str) -> None:
-    db, manager = await _manager()
-    try:
-        for item in await manager.get_history(name):
-            marker = " current" if item.is_current else ""
-            click.echo(f"v{item.version}\t{item.created_at.isoformat(timespec='seconds')}\t{item.change_summary}{marker}")
-    finally:
-        await db.close()
-
-
-async def _diff_async(name: str, v1: int, v2: int) -> None:
-    db, manager = await _manager()
-    try:
-        click.echo(await manager.diff_skill(name, v1, v2))
-    finally:
-        await db.close()
-
-
-async def _rollback_async(name: str, version: int) -> None:
-    db, manager = await _manager()
-    try:
-        await manager.rollback_skill(name, version)
-        click.echo(f"Rolled back {name} to v{version}")
-    finally:
-        await db.close()
+async def _list_skills_async(agent_name: str = "crawler") -> None:
+    manager = _skill_manager_for_settings(CrawlerSettings(), agent_name)
+    for meta in manager.list_skills():
+        applies_to = ",".join(meta.applies_to) if meta.applies_to else "*"
+        allowed_tools = ",".join(meta.allowed_tools) if meta.allowed_tools else "-"
+        token_budget = str(meta.token_budget) if meta.token_budget is not None else "-"
+        click.echo(
+            f"{meta.name}\tv{meta.version}\tpriority={meta.priority}\t"
+            f"applies_to={applies_to}\tallowed_tools={allowed_tools}\t"
+            f"token_budget={token_budget}\t{meta.description}"
+        )
 
 
 async def _steward_run_async(
@@ -501,6 +519,7 @@ async def _steward_run_async(
     llm_enabled: bool,
     max_context_tokens: int,
     include_backup_audit: bool,
+    export: bool,
 ):
     from agents.data_steward.agent import DataStewardAgent
 
@@ -513,6 +532,7 @@ async def _steward_run_async(
         llm_enabled=llm_enabled,
         max_context_tokens=max_context_tokens,
         include_backup_audit=include_backup_audit,
+        export=export,
     )
 
 
@@ -591,3 +611,9 @@ def _format_recommendation_text(result) -> str:
 
 def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _resolve_steward_llm_enabled(settings: CrawlerSettings, override: bool | None) -> bool:
+    if override is not None:
+        return bool(override)
+    return bool((settings.openai_api_key or "").strip())

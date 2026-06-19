@@ -56,6 +56,30 @@ async def test_complete_job(client: TestClient):
     assert job.done_event.is_set()
 
 
+async def test_complete_accepts_pagination_states(client: TestClient):
+    job = await _enqueue(client)
+    await client.get("/api/jobs/next")
+    state = {
+        "kind": "form_submit",
+        "state_id": "form:fromWen:fromWenNOWPAGE:2",
+        "label": "fromWen 第 2 页",
+        "page_index": 2,
+        "form_name": "fromWen",
+        "fields": {"fromWenNOWPAGE": "2"},
+        "submit": True,
+        "synthetic_url": "https://example.edu.cn/xylb.jsp?__ycl_page=2",
+        "url": "https://example.edu.cn/xylb.jsp",
+    }
+
+    resp = await client.post(
+        f"/api/jobs/{job.id}/complete",
+        json={"html": "<html/>", "pagination_states": [state]},
+    )
+
+    assert resp.status == 200
+    assert job.result_pagination_states == (state,)
+
+
 async def test_complete_requires_html(client: TestClient):
     job = await _enqueue(client)
     await client.get("/api/jobs/next")

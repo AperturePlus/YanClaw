@@ -1,0 +1,1 @@
+"""SQLite knowledge graph repository."""

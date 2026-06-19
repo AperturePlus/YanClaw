@@ -18,6 +18,32 @@ export interface FetchJob {
   context: JobContext;
   created_at: string;
   timeout_seconds: number;
+  action?: FetchAction | null;
+  identity_url?: string | null;
+}
+
+export interface FetchAction {
+  kind: string;
+  form_name?: string;
+  fields?: Record<string, string>;
+  submit?: boolean;
+  synthetic_url?: string;
+  label?: string;
+  page_index?: number;
+  state_id?: string;
+}
+
+export interface PaginationState {
+  kind: 'form_submit';
+  state_id: string;
+  label: string;
+  page_index: number;
+  total_pages?: number;
+  form_name: string;
+  fields: Record<string, string>;
+  submit: boolean;
+  synthetic_url: string;
+  url: string;
 }
 
 export interface CompleteResponse {
@@ -52,11 +78,4 @@ export interface StatusResponse {
   pending_decision?: PendingDecision;
   agent?: Record<string, unknown>;
   server_uptime_seconds: number;
-}
-
-export interface HistoryEntry {
-  id: string;
-  url: string;
-  status: 'completed' | 'skipped' | 'failed';
-  time: Date;
 }

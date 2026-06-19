@@ -4,20 +4,29 @@ import asyncio
 import difflib
 import hashlib
 import json
-import re
-import time
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 
 from agents.crawler import db as crawler_db
 from agents.crawler import agent_detail, agent_parsing
-from agents.crawler.extraction_pipeline import ExtractionPipeline
+from agents.crawler.entrances import ManualOrgUnitEntrance
+from agents.crawler.agent_state import CrawlerState
+from agents.crawler.extraction_models import (
+    ExtractionOutcome as _ExtractionOutcome,
+    ExtractionTaskItem as _ExtractionTaskItem,
+    QueuedUrl as _QueuedUrl,
+    SaveEvent as _SaveEvent,
+)
+from agents.crawler.extraction_pipeline import ExtractionPipeline, ExtractionPipelineService
 from agents.crawler.faculty_discovery import FacultyDiscoveryService
+from agents.crawler.fetch_failures import is_retryable_fetch_failure
 from agents.crawler.fetchers import FetchResult, Fetcher
 from agents.crawler.fetch_scheduler import FetchScheduler
 from agents.crawler.models import (
+    CrawlGraphEdgeType,
+    CrawlGraphNodeStatus,
+    CrawlGraphNodeType,
     CrawlStatus,
     CrawlTaskKind,
     CrawlTaskStatus,
@@ -25,13 +34,24 @@ from agents.crawler.models import (
     OrgUnitStatus,
     UniversityMeta,
 )
-from agents.crawler.prompt_builder import CrawlerPromptBuilder
+from agents.crawler.graph_frontier import GraphFetchCandidate, GraphFrontier
+from agents.crawler.org_unit_filter import (
+    ORG_UNIT_FILTER_STATE,
+    hard_filter_org_unit_payloads,
+    llm_filter_org_unit_payloads,
+    normalize_org_unit_match_text,
+    org_unit_filter_item_keys,
+)
+from agents.crawler.professor_noise import should_skip_professor_llm
+from agents.crawler.prompt_builder import CRAWLER_SYSTEM_PROMPT, CrawlerPromptBuilder
+from agents.crawler.sanitizer import normalize_org_unit_name
 from agents.crawler.session_state import CrawlSessionState
 from agents.crawler.tools import get_crawler_tool_definitions, get_crawler_tools
 from agents.crawler.url_heuristics import (
     FACULTY_PAGE_TYPE_NOISE,
     FacultyCandidateAssessment,
     FACULTY_KEYWORDS,
+    DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS,
     ORG_UNIT_PAGE_KEYWORDS,
     _COMMON_FACULTY_PATHS,
     _INTERMEDIATE_ORG_PATHS,
@@ -69,17 +89,6 @@ from runtime.logger import get_logger
 from runtime.skills import SkillManager
 
 
-class CrawlerState(str, Enum):
-    DISCOVER_ORG_UNIT_PAGES = "DISCOVER_ORG_UNIT_PAGES"
-    EXTRACT_ORG_UNITS = "EXTRACT_ORG_UNITS"
-    FIND_FACULTY_PAGES = "FIND_FACULTY_PAGES"
-    EXTRACT_PROFESSORS = "EXTRACT_PROFESSORS"
-    DONE = "DONE"
-
-
-_FOLLOWUP_PAGE_LIMIT = 36
-
-
 @dataclass(frozen=True)
 class AgentResult:
     university_name: str
@@ -89,46 +98,7 @@ class AgentResult:
     messages: list[str] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class _QueuedUrl:
-    url: str
-    depth: int
-    label: str = ""
-    org_unit_id: int | None = None
-
-
-@dataclass
-class _ExtractionTaskItem:
-    task_id: int
-    university: str
-    org_unit_name: str
-    org_unit_url: str | None
-    source_url: str
-    page_url: str
-    page_hash: str
-    page_text_snapshot: str
-    allowed_tools: list[str]
-    attempt: int = 0
-    priority: int = 0
-    strict_retry: bool = False
-    detail_mode: bool = False
-    task_kind: str = CrawlTaskKind.LIST_PAGE.value
-
-
-@dataclass
-class _SaveEvent:
-    task: _ExtractionTaskItem
-    payloads: list[dict[str, Any]]
-
-
-@dataclass
-class _ExtractionOutcome:
-    payloads: list[dict[str, Any]]
-    invalid_json_events: list[dict[str, Any]]
-    content_fallback_used: bool = False
-
-
-class CrawlerAgent:
+class CrawlerAgent(ExtractionPipelineService):
     """Single-university crawler state machine (per-university DB)."""
 
     def __init__(
@@ -145,11 +115,11 @@ class CrawlerAgent:
         logger_name: str | None = None,
         max_depth: int = 4,
         max_backtracks: int = 3,
-        max_org_units_per_university: int = 50,
+        max_org_units_per_university: int = 100,
         min_org_units: int = 5,
         model_max_tokens: int = 16000,
         detail_enrich_enabled: bool = True,
-        detail_profile_hard_cap_per_org_unit: int = 200,
+        detail_profile_hard_cap_per_org_unit: int = 400,
         pipeline_enabled: bool = True,
         pipeline_llm_workers: int = 1,
         pipeline_db_workers: int = 1,
@@ -157,8 +127,14 @@ class CrawlerAgent:
         invalid_json_max_retry: int = 1,
         task_recovery_enabled: bool = True,
         resume_mode: bool = False,
+        resume_force_existing: bool = False,
         target_org_units: list[str] | None = None,
         org_unit_match_threshold: float = 0.60,
+        org_unit_exclude_enabled: bool = True,
+        org_unit_exclude_keywords: list[str] | None = None,
+        org_unit_llm_filter_enabled: bool = True,
+        org_unit_listing_urls: list[str] | None = None,
+        manual_org_units: list[ManualOrgUnitEntrance | dict[str, Any]] | None = None,
     ) -> None:
         self.university_name = university_name
         self.start_url = start_url
@@ -183,8 +159,32 @@ class CrawlerAgent:
         self.invalid_json_max_retry = max(0, int(invalid_json_max_retry))
         self.task_recovery_enabled = bool(task_recovery_enabled)
         self.resume_mode = bool(resume_mode)
+        self.resume_force_existing = bool(resume_force_existing)
         self.target_org_units = [str(item).strip() for item in (target_org_units or []) if str(item).strip()]
         self.org_unit_match_threshold = min(1.0, max(0.0, float(org_unit_match_threshold)))
+        self.org_unit_exclude_enabled = bool(org_unit_exclude_enabled)
+        configured_exclude_keywords = (
+            list(DEFAULT_ORG_UNIT_EXCLUDE_KEYWORDS)
+            if org_unit_exclude_keywords is None
+            else list(org_unit_exclude_keywords)
+        )
+        self.org_unit_exclude_keywords = [
+            str(item).strip() for item in configured_exclude_keywords if str(item).strip()
+        ]
+        self.org_unit_llm_filter_enabled = bool(org_unit_llm_filter_enabled)
+        self.org_unit_listing_urls: list[str] = []
+        for item in org_unit_listing_urls or []:
+            url = _sanitize_url(str(item or ""))
+            if url:
+                self.org_unit_listing_urls.append(url)
+        self.manual_org_units: list[ManualOrgUnitEntrance] = []
+        for item in manual_org_units or []:
+            coerced = self._coerce_manual_org_unit(item)
+            if coerced is not None:
+                self.manual_org_units.append(coerced)
+        self._manual_org_unit_aliases_by_name = self._build_manual_org_unit_alias_index(
+            self.manual_org_units
+        )
         self.session_state = CrawlSessionState.create(pipeline_enabled=self.pipeline_enabled)
         self.visited_urls = self.session_state.visited_urls
         self._fetch_cache = self.session_state.fetch_cache
@@ -202,10 +202,13 @@ class CrawlerAgent:
         self._target_org_unit_ids = self.session_state.target_org_unit_ids
         self._org_units_marked_no_faculty = self.session_state.org_units_marked_no_faculty
         self._pipeline_stats = self.session_state.pipeline_stats
+        self._last_org_unit_validated_count = 0
+        self._resume_force_refetch_urls: set[str] = set()
         self.extraction_pipeline = ExtractionPipeline(self._pipeline_stats)
         self.fetch_scheduler = FetchScheduler(self)
         self.faculty_discovery = FacultyDiscoveryService(self)
         self.detail_enricher = agent_detail.DetailEnricher(self)
+        self.graph_frontier = GraphFrontier(self)
         self.prompt_builder = CrawlerPromptBuilder(
             context_manager=self.context_manager,
             fetcher=self.fetcher,
@@ -214,6 +217,48 @@ class CrawlerAgent:
             location=self.location,
             visited_urls=self.visited_urls,
         )
+
+    @staticmethod
+    def _coerce_manual_org_unit(item: ManualOrgUnitEntrance | dict[str, Any]) -> ManualOrgUnitEntrance | None:
+        if isinstance(item, ManualOrgUnitEntrance):
+            return item
+        if not isinstance(item, dict):
+            return None
+        name = str(item.get("name") or item.get("org_unit_name") or "").strip()
+        if not name:
+            return None
+        raw_aliases = item.get("aliases", [])
+        if isinstance(raw_aliases, str):
+            aliases = (raw_aliases.strip(),) if raw_aliases.strip() else ()
+        elif isinstance(raw_aliases, (list, tuple)):
+            aliases = tuple(str(alias).strip() for alias in raw_aliases if str(alias).strip())
+        else:
+            aliases = ()
+        return ManualOrgUnitEntrance(
+            name=name,
+            url=str(item.get("url") or item.get("org_unit_url") or "").strip(),
+            faculty_url=str(item.get("faculty_url") or item.get("faculty_entrance") or "").strip(),
+            kind=str(item.get("kind") or item.get("org_unit_kind") or "").strip(),
+            raw_name=str(item.get("raw_name") or item.get("alias") or "").strip(),
+            aliases=aliases,
+        )
+
+    @classmethod
+    def _build_manual_org_unit_alias_index(
+        cls,
+        items: list[ManualOrgUnitEntrance],
+    ) -> dict[str, set[str]]:
+        result: dict[str, set[str]] = {}
+        for item in items:
+            canonical_key = cls._normalize_org_unit_match_text(item.name)
+            if not canonical_key:
+                continue
+            aliases = result.setdefault(canonical_key, set())
+            for value in (item.name, item.raw_name, *item.aliases):
+                key = cls._normalize_org_unit_match_text(str(value or ""))
+                if key:
+                    aliases.add(key)
+        return result
 
     @property
     def _is_interactive(self) -> bool:
@@ -240,7 +285,17 @@ class CrawlerAgent:
                 self.university_name,
                 self.resume_mode,
             )
+            resume_seed_org_units: list[OrgUnit] = []
+            if self.resume_mode:
+                resume_seed_org_units = await self._prepare_resume_start()
+
             initial_professor_count = await self._professor_count()
+            if self.manual_org_units or self.org_unit_listing_urls:
+                early_result = await self._run_manual_entrance_flow(resume_seed_org_units)
+                if early_result is not None:
+                    return early_result
+                return await self._finalize_run(initial_professor_count)
+
             home = await self._fetch_url(self.start_url, 0)
             if home is None:
                 if self.resume_mode:
@@ -250,8 +305,10 @@ class CrawlerAgent:
                 return self._result(CrawlStatus.FAILED, ["Failed to fetch start URL"])
 
             # Retry loop: re-attempt the pipeline when a phase fails.
-            org_unit_pages: list[_QueuedUrl] = []
-            org_units: list[OrgUnit] = []
+            org_unit_pages: list[_QueuedUrl] = (
+                [_QueuedUrl(home.url, 0, label="resume_seed")] if resume_seed_org_units else []
+            )
+            org_units: list[OrgUnit] = list(resume_seed_org_units)
             faculty_links: list[_QueuedUrl] = []
 
             while self.backtrack_count <= self.max_backtracks:
@@ -313,7 +370,8 @@ class CrawlerAgent:
                         [unit.name for unit in org_units],
                         self.org_unit_match_threshold,
                     )
-                if (not self.target_org_units) and len(org_units) < self.min_org_units:
+                org_unit_count_for_minimum = max(len(org_units), self._last_org_unit_validated_count)
+                if (not self.target_org_units) and org_unit_count_for_minimum < self.min_org_units:
                     self.logger.info(
                         "Only %s org units found (min=%s), likely category pages; retrying",
                         len(org_units),
@@ -327,6 +385,18 @@ class CrawlerAgent:
                     org_units = []
                     self._skip_cross_run_dedup = True
                     continue
+                if not self.target_org_units:
+                    org_units = await self._filter_existing_org_units_for_discovery(
+                        org_units,
+                        source="crawl",
+                    )
+                    if not org_units:
+                        if self._too_many_backtracks("all org units excluded by scope filter"):
+                            break
+                        org_unit_pages = []
+                        org_units = []
+                        self._skip_cross_run_dedup = True
+                        continue
 
                 if self._is_interactive:
                     # Interactive (human) mode: find faculty + extract professors
@@ -362,61 +432,97 @@ class CrawlerAgent:
                     await self._extract_professors(faculty_links)
 
 
-            total_professor_count = await self._professor_count()
-            newly_saved_count = max(0, total_professor_count - initial_professor_count)
-            if total_professor_count <= 0:
-                if (
-                    self._all_target_org_units_marked_no_faculty()
-                ):
-                    message = "No professors saved: all targeted org units are marked no_faculty_page"
-                    await self._set_status(CrawlStatus.COMPLETED)
-                    self.logger.warning(
-                        "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
-                        self.university_name,
-                        sorted(self._target_org_unit_ids),
-                    )
-                    return self._result(CrawlStatus.COMPLETED, [message])
-                await self._set_status(CrawlStatus.FAILED)
-                self.logger.warning(
-                    "Crawler did not save any professors for %s; marking failed",
-                    self.university_name,
-                )
-                return self._result(CrawlStatus.FAILED, ["No professors saved"])
-            if newly_saved_count <= 0:
-                self.logger.warning(
-                    "Crawl finished with no new professors this run university=%s existing_total=%s tool_saved=%s",
-                    self.university_name,
-                    total_professor_count,
-                    self.saved_professors,
-                )
-
-            await self._set_status(CrawlStatus.COMPLETED)
-            self.logger.info(
-                "Completed crawl for %s professors_total=%s professors_new=%s",
-                self.university_name,
-                total_professor_count,
-                newly_saved_count,
-            )
-            return self._result(CrawlStatus.COMPLETED, [])
+            return await self._finalize_run(initial_professor_count)
         except Exception as error:
             self.logger.exception("Crawler failed for %s", self.university_name)
             await self._set_status(CrawlStatus.FAILED)
             return self._result(CrawlStatus.FAILED, [str(error)])
+
+    def _has_traversal_only_extraction_progress(self) -> bool:
+        return int(self._pipeline_stats.get("list_known_org_unit_processed", 0) or 0) > 0
+
+    async def _finalize_run(self, initial_professor_count: int) -> AgentResult:
+        recoverable_task_result = await self._fail_if_recoverable_tasks_remain(context="crawl_completion")
+        if recoverable_task_result is not None:
+            return recoverable_task_result
+
+        total_professor_count = await self._professor_count()
+        newly_saved_count = max(0, total_professor_count - initial_professor_count)
+        if total_professor_count <= 0:
+            if self._all_target_org_units_marked_no_faculty():
+                message = "No professors saved: all targeted org units are marked no_faculty_page"
+                retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                    context="target_no_faculty_completion",
+                )
+                if retryable_failure_result is not None:
+                    return retryable_failure_result
+                await self._set_status(CrawlStatus.COMPLETED)
+                self.logger.warning(
+                    "Crawler completed with no professors because all targeted org units were marked no_faculty_page university=%s targets=%s",
+                    self.university_name,
+                    sorted(self._target_org_unit_ids),
+                )
+                return self._result(CrawlStatus.COMPLETED, [message])
+            if self._has_traversal_only_extraction_progress():
+                retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                    context="traversal_only_completion",
+                )
+                if retryable_failure_result is not None:
+                    return retryable_failure_result
+                await self._set_status(CrawlStatus.COMPLETED)
+                self.logger.info(
+                    "Crawler completed traversal-only run for %s list_processed=%s list_save_suppressed=%s",
+                    self.university_name,
+                    self._pipeline_stats.get("list_processed", 0),
+                    self._pipeline_stats.get("list_save_suppressed", 0),
+                )
+                return self._result(CrawlStatus.COMPLETED, ["No professors saved; list pages were traversal-only"])
+            await self._set_status(CrawlStatus.FAILED)
+            self.logger.warning(
+                "Crawler did not save any professors for %s; marking failed",
+                self.university_name,
+            )
+            return self._result(CrawlStatus.FAILED, ["No professors saved"])
+        if newly_saved_count <= 0:
+            self.logger.warning(
+                "Crawl finished with no new professors this run university=%s existing_total=%s tool_saved=%s",
+                self.university_name,
+                total_professor_count,
+                self.saved_professors,
+            )
+
+        retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+            context="crawl_completion",
+        )
+        if retryable_failure_result is not None:
+            return retryable_failure_result
+        await self._set_status(CrawlStatus.COMPLETED)
+        self.logger.info(
+            "Completed crawl for %s professors_total=%s professors_new=%s",
+            self.university_name,
+            total_professor_count,
+            newly_saved_count,
+        )
+        return self._result(CrawlStatus.COMPLETED, [])
 
     async def _resume_without_start_page(self, initial_professor_count: int) -> AgentResult:
         async with self.db.session() as session:
             org_units = await crawler_db.list_org_units(session, limit=self.max_org_units_per_university)
             task_summary = await crawler_db.summarize_crawl_task_status(session)
 
-        recoverable_tasks = (
-            int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
-            + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
-            + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
+        recoverable_tasks = self._recoverable_task_count(task_summary)
+        ready_graph_candidates = await self.graph_frontier.next_fetch_candidates(
+            limit=self.pipeline_queue_cap,
+            node_types=[
+                CrawlGraphNodeType.FACULTY_LIST_URL,
+                CrawlGraphNodeType.PAGINATION_URL,
+                CrawlGraphNodeType.FACULTY_FOLLOWUP_URL,
+            ],
         )
-        if not org_units and recoverable_tasks <= 0:
+        if not org_units and recoverable_tasks <= 0 and not ready_graph_candidates:
             message = (
                 "resume_blocked_missing_cache: start URL was already crawled but no page cache, "
-                "org units, or recoverable crawl tasks were available"
+                "org units, recoverable crawl tasks, or graph frontier URLs were available"
             )
             self.logger.warning(
                 "Strict resume blocked university=%s reason=missing_cache_no_seed start_url=%s",
@@ -432,7 +538,44 @@ class CrawlerAgent:
                 self.university_name,
                 recoverable_tasks,
             )
+            await self._extract_professors([], recovery_limit=recoverable_tasks)
+            async with self.db.session() as session:
+                task_summary = await crawler_db.summarize_crawl_task_status(session)
+            remaining_recoverable = self._recoverable_task_count(task_summary)
+            self.logger.info(
+                "Strict resume recovery progress university=%s before=%s remaining=%s done=%s failed=%s",
+                self.university_name,
+                recoverable_tasks,
+                remaining_recoverable,
+                task_summary.get(CrawlTaskStatus.DONE.value, 0),
+                task_summary.get(CrawlTaskStatus.FAILED.value, 0),
+            )
+
+        if ready_graph_candidates:
+            self.logger.info(
+                "Strict resume recovering graph frontier university=%s ready_urls=%s",
+                self.university_name,
+                len(ready_graph_candidates),
+            )
             await self._extract_professors([])
+
+        if org_units:
+            if self.target_org_units:
+                org_units, unmatched = self._filter_target_org_units(org_units)
+                if unmatched:
+                    self.logger.warning(
+                        "Strict resume target org units unmatched university=%s requested=%s unmatched=%s threshold=%.2f",
+                        self.university_name,
+                        self.target_org_units,
+                        unmatched,
+                        self.org_unit_match_threshold,
+                    )
+                    org_units = []
+            else:
+                org_units = await self._filter_existing_org_units_for_discovery(
+                    org_units,
+                    source="strict_resume",
+                )
 
         if org_units:
             self.logger.info(
@@ -447,15 +590,53 @@ class CrawlerAgent:
                 if faculty_links:
                     await self._extract_professors(faculty_links)
 
+        async with self.db.session() as session:
+            final_task_summary = await crawler_db.summarize_crawl_task_status(session)
+        final_recoverable_tasks = self._recoverable_task_count(final_task_summary)
+        if final_recoverable_tasks > 0:
+            message = (
+                "resume_incomplete_recoverable_tasks: strict resume still has "
+                f"{final_recoverable_tasks} pending/retry/in_progress crawl tasks"
+            )
+            self.logger.warning(
+                "Strict resume incomplete university=%s recoverable_remaining=%s pending=%s retry=%s in_progress=%s",
+                self.university_name,
+                final_recoverable_tasks,
+                final_task_summary.get(CrawlTaskStatus.PENDING.value, 0),
+                final_task_summary.get(CrawlTaskStatus.RETRY.value, 0),
+                final_task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0),
+            )
+            await self._set_status(CrawlStatus.FAILED)
+            return self._result(CrawlStatus.FAILED, [message])
+
         total_professor_count = await self._professor_count()
         newly_saved_count = max(0, total_professor_count - initial_professor_count)
         if total_professor_count > 0:
+            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                context="strict_resume_completion",
+            )
+            if retryable_failure_result is not None:
+                return retryable_failure_result
             await self._set_status(CrawlStatus.COMPLETED)
             self.logger.info(
                 "Strict resume completed university=%s professors_total=%s professors_new=%s",
                 self.university_name,
                 total_professor_count,
                 newly_saved_count,
+            )
+            return self._result(CrawlStatus.COMPLETED, [])
+
+        if self._has_traversal_only_extraction_progress():
+            retryable_failure_result = await self._fail_if_retryable_fetch_failures_remain(
+                context="strict_resume_completion",
+            )
+            if retryable_failure_result is not None:
+                return retryable_failure_result
+            await self._set_status(CrawlStatus.COMPLETED)
+            self.logger.info(
+                "Strict resume completed traversal-only recovery university=%s recovered_list_tasks=%s",
+                self.university_name,
+                self._pipeline_stats.get("recovery_list_suppressed", 0),
             )
             return self._result(CrawlStatus.COMPLETED, [])
 
@@ -471,6 +652,311 @@ class CrawlerAgent:
         )
         await self._set_status(CrawlStatus.FAILED)
         return self._result(CrawlStatus.FAILED, [message])
+
+    async def _run_manual_entrance_flow(self, resume_seed_org_units: list[OrgUnit]) -> AgentResult | None:
+        self.logger.info(
+            "Manual entrance flow university=%s manual_org_units=%s org_listing_urls=%s resume_seed_org_units=%s",
+            self.university_name,
+            len(self.manual_org_units),
+            len(self.org_unit_listing_urls),
+            len(resume_seed_org_units),
+        )
+
+        manual_org_units = await self._seed_manual_org_units()
+        if manual_org_units or self.org_unit_listing_urls:
+            await self.graph_frontier.seed_manual_entrances(
+                org_units=manual_org_units,
+                manual_org_units=self.manual_org_units,
+                org_unit_listing_urls=self.org_unit_listing_urls,
+            )
+        org_units = manual_org_units or list(resume_seed_org_units)
+        if not org_units and self.org_unit_listing_urls:
+            graph_candidates = await self.graph_frontier.next_fetch_candidates(
+                limit=max(1, len(self.org_unit_listing_urls)),
+                node_types=[CrawlGraphNodeType.ORG_LISTING_URL],
+            )
+            listing_url_keys = {_sanitize_url(url) for url in self.org_unit_listing_urls if _sanitize_url(url)}
+            org_unit_pages = [
+                self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                for candidate in graph_candidates
+                if _sanitize_url(candidate.url) in listing_url_keys
+            ] or [
+                _QueuedUrl(url=url, depth=1, label="manual_org_listing")
+                for url in self.org_unit_listing_urls
+            ]
+            org_units = await self._extract_org_units(org_unit_pages)
+
+        if not org_units:
+            await self._set_status(CrawlStatus.FAILED)
+            return self._result(CrawlStatus.FAILED, ["No org units from manual entrances"])
+
+        if self.target_org_units:
+            org_units, unmatched = self._filter_target_org_units(org_units)
+            if unmatched:
+                await self._set_status(CrawlStatus.FAILED)
+                self.logger.warning(
+                    "Target org units unmatched university=%s requested=%s unmatched=%s threshold=%.2f",
+                    self.university_name,
+                    self.target_org_units,
+                    unmatched,
+                    self.org_unit_match_threshold,
+                )
+                return self._result(
+                    CrawlStatus.FAILED,
+                    [f"Target org units unmatched: {', '.join(unmatched)}"],
+                )
+        elif not manual_org_units:
+            org_units = await self._filter_existing_org_units_for_discovery(
+                org_units,
+                source="manual_org_listing",
+            )
+            if not org_units:
+                await self._set_status(CrawlStatus.FAILED)
+                return self._result(CrawlStatus.FAILED, ["all org units excluded by scope filter"])
+
+        self._target_org_unit_ids = {int(unit.id) for unit in org_units if unit.id is not None}
+        if manual_org_units:
+            manual_faculty_links = await self._manual_faculty_links_for_org_units(org_units)
+            if manual_faculty_links:
+                self.logger.info(
+                    "Manual faculty entrances university=%s links=%s",
+                    self.university_name,
+                    len(manual_faculty_links),
+                )
+                await self._extract_professors(manual_faculty_links)
+
+            remaining_org_units = self._org_units_without_manual_faculty(org_units)
+            if remaining_org_units:
+                self.logger.info(
+                    "Manual org units without faculty entrance university=%s org_units=%s mode=%s",
+                    self.university_name,
+                    len(remaining_org_units),
+                    "streaming" if self._is_interactive else "batch",
+                )
+                if self._is_interactive:
+                    await self._find_and_extract_streaming(remaining_org_units)
+                else:
+                    faculty_links = await self._find_faculty_pages(remaining_org_units)
+                    if faculty_links:
+                        await self._extract_professors(faculty_links)
+            return None
+
+        if self._is_interactive:
+            await self._find_and_extract_streaming(org_units)
+            return None
+
+        faculty_links = await self._find_faculty_pages(org_units)
+        if faculty_links:
+            await self._extract_professors(faculty_links)
+        return None
+
+    async def _seed_manual_org_units(self) -> list[OrgUnit]:
+        if not self.manual_org_units:
+            return []
+        seeded: list[OrgUnit] = []
+        async with self.db.session() as session:
+            for item in self.manual_org_units[: self.max_org_units_per_university]:
+                name = normalize_org_unit_name(item.name, default="")
+                if not name:
+                    continue
+                org_unit_url = _sanitize_url(item.url or item.faculty_url or "")
+                if not org_unit_url:
+                    continue
+                row = await crawler_db.get_or_create_org_unit(
+                    session,
+                    name=name,
+                    url=org_unit_url,
+                    kind=item.kind or "college",
+                    discovered_from_url=self.start_url,
+                )
+                seeded.append(row)
+        return seeded
+
+    async def _manual_faculty_links_for_org_units(self, org_units: list[OrgUnit]) -> list[_QueuedUrl]:
+        if not self.manual_org_units or not org_units:
+            return []
+        units_by_name: dict[str, OrgUnit] = {}
+        for unit in org_units:
+            canonical_key = self._normalize_org_unit_match_text(unit.name)
+            if not canonical_key:
+                continue
+            units_by_name[canonical_key] = unit
+            for alias in self._manual_org_unit_aliases_by_name.get(canonical_key, set()):
+                units_by_name.setdefault(alias, unit)
+        result: list[_QueuedUrl] = []
+        for item in self.manual_org_units:
+            faculty_url = _sanitize_url(item.faculty_url)
+            if not faculty_url:
+                continue
+            unit = None
+            for value in (item.name, item.raw_name, *item.aliases):
+                key = self._normalize_org_unit_match_text(str(value or ""))
+                if key:
+                    unit = units_by_name.get(key)
+                if unit is not None:
+                    break
+            if unit is None:
+                continue
+            result.append(
+                _QueuedUrl(
+                    url=faculty_url,
+                    depth=1,
+                    label=unit.name,
+                    org_unit_id=unit.id,
+                )
+            )
+        result = _dedupe_queue(result)
+        if not result:
+            return []
+        graph_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=self.start_url,
+            links=result,
+            node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+            edge_type=CrawlGraphEdgeType.SEEDED_FROM_MANIFEST,
+            source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            depth=1,
+            confidence=1.0,
+            metadata={"source": "manifest"},
+            source_status=CrawlGraphNodeStatus.DONE,
+        )
+        if not graph_candidates:
+            return result
+        return [
+            self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+            for candidate in graph_candidates
+        ]
+
+    def _org_units_without_manual_faculty(self, org_units: list[OrgUnit]) -> list[OrgUnit]:
+        with_faculty = {
+            self._normalize_org_unit_match_text(item.name)
+            for item in self.manual_org_units
+            if _sanitize_url(item.faculty_url)
+        }
+        if not with_faculty:
+            return org_units
+        return [
+            unit
+            for unit in org_units
+            if self._normalize_org_unit_match_text(unit.name) not in with_faculty
+        ]
+
+    async def _prepare_resume_start(self) -> list[OrgUnit]:
+        async with self.db.session() as session:
+            org_units = await crawler_db.list_org_units(session)
+            retryable_failure_urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+            if retryable_failure_urls:
+                self._add_resume_force_refetch_urls(retryable_failure_urls)
+                self.logger.info(
+                    "Strict resume will retry fetch failures university=%s urls=%s sample=%s",
+                    self.university_name,
+                    len(retryable_failure_urls),
+                    retryable_failure_urls[:5],
+                )
+            if self.org_unit_exclude_enabled and not self.target_org_units:
+                excluded_units, excluded_preview = self._hard_excluded_org_units(org_units)
+                cleanup_summary: dict[str, int] = {}
+                if excluded_units:
+                    cleanup_summary = await crawler_db.cleanup_excluded_org_units(session, excluded_units)
+                    self.logger.info(
+                        "Strict resume cleaned excluded org units university=%s excluded=%s sample=%s summary=%s",
+                        self.university_name,
+                        len(excluded_units),
+                        excluded_preview[:5],
+                        cleanup_summary,
+                    )
+                sub_cleanup_summary = await crawler_db.merge_sub_department_sections(session)
+                if int(sub_cleanup_summary.get("sub_org_units_merged", 0) or 0):
+                    cleanup_summary.update(sub_cleanup_summary)
+                    self.logger.info(
+                        "Strict resume merged sub-department org units university=%s summary=%s",
+                        self.university_name,
+                        sub_cleanup_summary,
+                    )
+                if cleanup_summary:
+                    org_units = await crawler_db.list_org_units(session)
+
+            if self.resume_force_existing:
+                reset_count = 0
+                forced_urls: list[str] = []
+                for unit in org_units:
+                    if unit.status != OrgUnitStatus.NO_FACULTY_PAGE.value:
+                        continue
+                    if self.target_org_units and not self._matches_target_org_unit_name(unit.name):
+                        continue
+                    await crawler_db.set_org_unit_status(session, int(unit.id), OrgUnitStatus.PENDING)
+                    reset_count += 1
+                    url = _sanitize_url(unit.url or "")
+                    if url:
+                        self._resume_force_refetch_urls.add(url)
+                        self._resume_force_refetch_urls.add(url.rstrip("/"))
+                        forced_urls.append(url)
+                if reset_count:
+                    self.logger.info(
+                        "Strict resume reset no_faculty org units university=%s reset=%s forced_refetch_sample=%s",
+                        self.university_name,
+                        reset_count,
+                        forced_urls[:5],
+                    )
+                    org_units = await crawler_db.list_org_units(session)
+
+            if self.resume_force_existing:
+                return org_units[: self.max_org_units_per_university]
+            return []
+
+    def _add_resume_force_refetch_urls(self, urls: list[str]) -> None:
+        for raw_url in urls:
+            url = _sanitize_url(str(raw_url or ""))
+            if not url:
+                continue
+            self._resume_force_refetch_urls.add(url)
+            self._resume_force_refetch_urls.add(url.rstrip("/"))
+
+    async def _fail_if_retryable_fetch_failures_remain(self, *, context: str) -> AgentResult | None:
+        async with self.db.session() as session:
+            urls = await crawler_db.list_retryable_fetch_failure_urls(session)
+        if not urls:
+            return None
+
+        message = f"retryable_fetch_failures_remaining: {len(urls)} fetch failures still need retry"
+        await self._set_status(CrawlStatus.FAILED)
+        self.logger.warning(
+            "Crawler finished with retryable fetch failures university=%s context=%s count=%s sample=%s",
+            self.university_name,
+            context,
+            len(urls),
+            urls[:5],
+        )
+        return self._result(CrawlStatus.FAILED, [message])
+
+    async def _fail_if_recoverable_tasks_remain(self, *, context: str) -> AgentResult | None:
+        async with self.db.session() as session:
+            task_summary = await crawler_db.summarize_crawl_task_status(session)
+        recoverable_tasks = self._recoverable_task_count(task_summary)
+        if recoverable_tasks <= 0:
+            return None
+
+        message = (
+            "recoverable_extraction_tasks_remaining: "
+            f"{recoverable_tasks} pending/retry/in_progress crawl tasks still need resume"
+        )
+        await self._set_status(CrawlStatus.FAILED)
+        self.logger.warning(
+            "Crawler finished with recoverable extraction tasks university=%s context=%s pending=%s retry=%s in_progress=%s",
+            self.university_name,
+            context,
+            task_summary.get(CrawlTaskStatus.PENDING.value, 0),
+            task_summary.get(CrawlTaskStatus.RETRY.value, 0),
+            task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0),
+        )
+        return self._result(CrawlStatus.FAILED, [message])
+
+    @staticmethod
+    def _recoverable_task_count(task_summary: dict[str, int]) -> int:
+        return (
+            int(task_summary.get(CrawlTaskStatus.PENDING.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.RETRY.value, 0) or 0)
+            + int(task_summary.get(CrawlTaskStatus.IN_PROGRESS.value, 0) or 0)
+        )
 
     async def _discover_org_unit_pages(self, home: FetchResult) -> list[_QueuedUrl]:
         self._log_state(CrawlerState.DISCOVER_ORG_UNIT_PAGES)
@@ -527,14 +1013,33 @@ class CrawlerAgent:
                 )
             links = [home.url]
 
-        return [
+        org_page_items = [
             _QueuedUrl(url=link, depth=1, label="org_unit_page")
             for link in links[:20]
             if self._within_depth(1)
         ]
+        graph_candidates = await self.graph_frontier.record_discovered_links(
+            source_url=home.url,
+            links=org_page_items,
+            node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+            source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+            depth=1,
+            confidence=1.0,
+            metadata={"source": "org_page_discovery"},
+            source_status=CrawlGraphNodeStatus.DONE,
+        )
+        if graph_candidates:
+            return [
+                self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                for candidate in graph_candidates
+            ]
+        return org_page_items
+
     async def _extract_org_units(self, org_unit_pages: list[_QueuedUrl]) -> list[OrgUnit]:
         self._log_state(CrawlerState.EXTRACT_ORG_UNITS)
         skills = await self._select_skills(CrawlerState.EXTRACT_ORG_UNITS)
+        self._last_org_unit_validated_count = 0
 
         max_pages = min(max(8, len(org_unit_pages)), 20)
         pending = list(org_unit_pages[:max_pages])
@@ -565,7 +1070,9 @@ class CrawlerAgent:
             result = await self._ask_llm(
                 CrawlerState.EXTRACT_ORG_UNITS,
                 "Extract academic org units (colleges/schools/departments/research institutes). "
-                "Exclude admin offices. Return JSON: {\"org_units\": [{\"name\": ..., \"url\": ..., \"kind\": ...}]}",
+                "Exclude admin offices. Return only JSON with top-level key "
+                "{\"org_units\": [{\"name\": ..., \"url\": ..., \"kind\": ...}]}. "
+                "Do not return included_org_units or excluded_org_units for this extraction task.",
                 fetched,
                 skills,
             )
@@ -579,6 +1086,7 @@ class CrawlerAgent:
                 else:
                     followups = ranked_followups
                 added_followups: list[str] = []
+                followup_items: list[_QueuedUrl] = []
                 for link in followups:
                     if link in seen_pages:
                         continue
@@ -588,9 +1096,21 @@ class CrawlerAgent:
                     if not self._within_depth(next_depth):
                         continue
                     seen_pages.add(link)
-                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    followup_item = _QueuedUrl(url=link, depth=next_depth, label=page.label)
+                    pending.append(followup_item)
+                    followup_items.append(followup_item)
                     added_followups.append(link)
                 if added_followups:
+                    await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=followup_items,
+                        node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        depth=page.depth + 1,
+                        confidence=0.8,
+                        metadata={"source": "org_unit_llm_followup"},
+                    )
                     self.logger.debug(
                         "Org-unit extraction followups from LLM hint page=%s added=%s sample=%s",
                         fetched.url,
@@ -606,34 +1126,57 @@ class CrawlerAgent:
             extracted_any = True
             validated = 0
             hallucinated = 0
+            validated_units: list[dict[str, Any]] = []
+            for unit in units:
+                name = str(unit.get("name") or "").strip()
+                raw_url = _sanitize_url(str(unit.get("url") or "").strip())
+                url = urljoin(fetched.url, raw_url) if raw_url and not urlparse(raw_url).scheme else raw_url
+                kind = str(unit.get("kind") or "").strip() or None
+                if not name or not url:
+                    continue
+                if _is_category_name(name):
+                    continue
+                if not _same_site(url, self.start_url):
+                    continue
+                if _is_faculty_platform(url):
+                    continue
+                # Validate: URL must appear in page links or page text.
+                if not _url_found_on_page(url, page_urls, page_text_lower):
+                    hallucinated += 1
+                    continue
+                validated += 1
+                validated_units.append(
+                    {
+                        "name": name,
+                        "url": url,
+                        "kind": kind,
+                        "discovered_from_url": fetched.url,
+                    }
+                )
+
+            self._last_org_unit_validated_count += len(validated_units)
+            filtered_units = await self._filter_org_unit_payloads_for_discovery(
+                validated_units,
+                source_url=fetched.url,
+                source="extract_org_units",
+            )
+
+            stored_units: list[OrgUnit] = []
             async with self.db.session() as session:
-                for unit in units:
-                    name = str(unit.get("name") or "").strip()
-                    raw_url = _sanitize_url(str(unit.get("url") or "").strip())
-                    url = urljoin(fetched.url, raw_url) if raw_url and not urlparse(raw_url).scheme else raw_url
+                for unit in filtered_units:
                     kind = str(unit.get("kind") or "").strip() or None
-                    if not name or not url:
-                        continue
-                    if _is_category_name(name):
-                        continue
-                    if not _same_site(url, self.start_url):
-                        continue
-                    if _is_faculty_platform(url):
-                        continue
-                    # Validate: URL must appear in page links or page text.
-                    if not _url_found_on_page(url, page_urls, page_text_lower):
-                        hallucinated += 1
-                        continue
-                    validated += 1
                     if _is_core_academic_kind(kind):
                         core_validated_total += 1
-                    await crawler_db.get_or_create_org_unit(
+                    row = await crawler_db.get_or_create_org_unit(
                         session,
-                        name=name,
-                        url=url,
+                        name=str(unit.get("name") or ""),
+                        url=str(unit.get("url") or ""),
                         kind=kind,
-                        discovered_from_url=fetched.url,
+                        discovered_from_url=str(unit.get("discovered_from_url") or fetched.url),
                     )
+                    stored_units.append(row)
+            if stored_units:
+                await self.graph_frontier.record_org_units(stored_units, source_url=fetched.url)
 
             if hallucinated:
                 self.logger.info(
@@ -652,6 +1195,7 @@ class CrawlerAgent:
                 if preferred_followups:
                     followups = preferred_followups
                 added_followups: list[str] = []
+                followup_items: list[_QueuedUrl] = []
                 for link in followups[:8]:
                     if link in seen_pages:
                         continue
@@ -659,9 +1203,21 @@ class CrawlerAgent:
                     if not self._within_depth(next_depth):
                         continue
                     seen_pages.add(link)
-                    pending.append(_QueuedUrl(url=link, depth=next_depth, label=page.label))
+                    followup_item = _QueuedUrl(url=link, depth=next_depth, label=page.label)
+                    pending.append(followup_item)
+                    followup_items.append(followup_item)
                     added_followups.append(link)
                 if added_followups:
+                    await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=followup_items,
+                        node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_LISTING_URL,
+                        depth=page.depth + 1,
+                        confidence=0.7,
+                        metadata={"source": "org_unit_zero_validated_followup"},
+                    )
                     self.logger.debug(
                         "Org-unit validation produced 0 accepted; queued followups page=%s added=%s sample=%s",
                         fetched.url,
@@ -690,10 +1246,7 @@ class CrawlerAgent:
 
     @staticmethod
     def _normalize_org_unit_match_text(value: str) -> str:
-        text = str(value or "").strip().lower()
-        if not text:
-            return ""
-        return re.sub(r"[\s\-_·,，、/\\|:：;；\(\)（）\[\]【】{}<>《》]+", "", text)
+        return normalize_org_unit_match_text(value)
 
     @classmethod
     def _org_unit_match_score(cls, query: str, candidate: str) -> float:
@@ -711,6 +1264,13 @@ class CrawlerAgent:
             return min(0.89, max(0.75, 0.68 + coverage * 0.21))
         return float(difflib.SequenceMatcher(None, q, c).ratio())
 
+    def _org_unit_match_score_with_aliases(self, query: str, candidate: str) -> float:
+        score = self._org_unit_match_score(query, candidate)
+        candidate_key = self._normalize_org_unit_match_text(candidate)
+        for alias in self._manual_org_unit_aliases_by_name.get(candidate_key, set()):
+            score = max(score, self._org_unit_match_score(query, alias))
+        return score
+
     def _filter_target_org_units(
         self,
         org_units: list[OrgUnit],
@@ -726,7 +1286,7 @@ class CrawlerAgent:
             best_unit: OrgUnit | None = None
             best_score = 0.0
             for unit in org_units:
-                score = self._org_unit_match_score(target, unit.name)
+                score = self._org_unit_match_score_with_aliases(target, unit.name)
                 if score > best_score:
                     best_unit = unit
                     best_score = score
@@ -740,6 +1300,165 @@ class CrawlerAgent:
             )
             selected[key] = best_unit
         return list(selected.values()), unmatched
+
+    def _matches_target_org_unit_name(self, name: str) -> bool:
+        if not self.target_org_units:
+            return False
+        return any(
+            self._org_unit_match_score_with_aliases(target, name) >= self.org_unit_match_threshold
+            for target in self.target_org_units
+        )
+
+    def _hard_excluded_org_units(self, org_units: list[OrgUnit]) -> tuple[list[OrgUnit], list[dict[str, str]]]:
+        if not self.org_unit_exclude_enabled:
+            return [], []
+        payloads = [
+            {
+                "id": int(unit.id) if unit.id is not None else None,
+                "name": unit.name,
+                "url": unit.url,
+                "kind": unit.kind,
+            }
+            for unit in org_units
+        ]
+        result = hard_filter_org_unit_payloads(
+            payloads,
+            exclude_enabled=True,
+            keywords=self.org_unit_exclude_keywords,
+            target_name_matcher=self._matches_target_org_unit_name,
+        )
+        excluded_keys = set()
+        for item in result.hard_excluded:
+            excluded_keys.update(org_unit_filter_item_keys(item.to_evidence()))
+        excluded = [
+            unit
+            for unit in org_units
+            if org_unit_filter_item_keys(
+                {
+                    "id": int(unit.id) if unit.id is not None else None,
+                    "name": unit.name,
+                    "url": unit.url,
+                }
+            )
+            & excluded_keys
+        ]
+        preview = [
+            {
+                "name": item.name,
+                "url": item.url,
+                "reason": item.reason,
+            }
+            for item in result.hard_excluded[:10]
+        ]
+        return excluded, preview
+
+    async def _filter_existing_org_units_for_discovery(
+        self,
+        org_units: list[OrgUnit],
+        *,
+        source: str,
+    ) -> list[OrgUnit]:
+        if not org_units or self.target_org_units or not self.org_unit_exclude_enabled:
+            return org_units
+
+        payloads = [
+            {
+                "id": int(unit.id) if unit.id is not None else None,
+                "name": unit.name,
+                "url": unit.url,
+                "kind": unit.kind,
+            }
+            for unit in org_units
+        ]
+        filtered_payloads = await self._filter_org_unit_payloads_for_discovery(
+            payloads,
+            source_url=self.start_url,
+            source=source,
+        )
+        kept_keys: set[str] = set()
+        for payload in filtered_payloads:
+            kept_keys.update(self._org_unit_filter_item_keys(payload))
+        return [
+            unit
+            for unit in org_units
+            if self._org_unit_filter_item_keys(
+                {
+                    "id": int(unit.id) if unit.id is not None else None,
+                    "name": unit.name,
+                    "url": unit.url,
+                }
+            )
+            & kept_keys
+        ]
+
+    async def _filter_org_unit_payloads_for_discovery(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        source_url: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        if not units or self.target_org_units or not self.org_unit_exclude_enabled:
+            return units
+
+        hard_result = hard_filter_org_unit_payloads(
+            units,
+            exclude_enabled=True,
+            keywords=self.org_unit_exclude_keywords,
+            target_name_matcher=self._matches_target_org_unit_name,
+        )
+        if hard_result.hard_excluded:
+            self.logger.info(
+                "Org-unit hard exclusion university=%s source=%s page=%s excluded=%s sample=%s",
+                self.university_name,
+                source,
+                source_url,
+                len(hard_result.hard_excluded),
+                [item.to_evidence() for item in hard_result.hard_excluded[:5]],
+            )
+
+        return await self._filter_org_unit_payloads_with_llm(
+            hard_result.kept,
+            source_url=source_url,
+            source=source,
+        )
+
+    async def _filter_org_unit_payloads_with_llm(
+        self,
+        units: list[dict[str, Any]],
+        *,
+        source_url: str,
+        source: str,
+    ) -> list[dict[str, Any]]:
+        if not units or not self.org_unit_llm_filter_enabled:
+            return units
+
+        skills_text = self.skill_manager.select_for_state(ORG_UNIT_FILTER_STATE, set()).rendered_text
+        result = await llm_filter_org_unit_payloads(
+            units,
+            llm_client=self.llm_client,
+            context_manager=self.context_manager,
+            skills_text=skills_text,
+            university=self.university_name,
+            source_url=source_url,
+            source=source,
+            model_max_tokens=self.model_max_tokens,
+            logger=self.logger,
+        )
+        dropped = len(units) - len(result.kept)
+        if dropped:
+            self.logger.info(
+                "Org-unit LLM exclusion university=%s source=%s page=%s excluded=%s sample=%s",
+                self.university_name,
+                source,
+                source_url,
+                dropped,
+                [item.to_evidence() for item in result.llm_excluded[:5]],
+            )
+        return result.kept
+
+    def _org_unit_filter_item_keys(self, item: Any) -> set[str]:
+        return org_unit_filter_item_keys(item)
 
     async def _set_org_unit_status(self, org_unit_id: int | None, status: OrgUnitStatus) -> None:
         if org_unit_id is None:
@@ -879,6 +1598,23 @@ class CrawlerAgent:
                     faculty_for_unit.append(_QueuedUrl(url=link, depth=depth, label=item.label, org_unit_id=item.org_unit_id))
 
             if faculty_for_unit:
+                graph_candidates = await self.graph_frontier.record_discovered_links(
+                    source_url=fetched.url,
+                    links=faculty_for_unit,
+                    node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                    edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                    source_node_type=CrawlGraphNodeType.ORG_UNIT,
+                    org_unit_name=org_unit.name,
+                    org_unit_id=org_unit.id,
+                    depth=item.depth + 1,
+                    confidence=1.0,
+                    metadata={"source": "streaming_faculty_discovery"},
+                )
+                if graph_candidates:
+                    faculty_for_unit = [
+                        self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                        for candidate in graph_candidates
+                    ]
                 self.logger.info(
                     "Streaming: extracting professors for %s (%d faculty pages)",
                     org_unit.name, len(faculty_for_unit),
@@ -1011,14 +1747,33 @@ class CrawlerAgent:
             for link in links[:max_links_per_org_unit]:
                 depth = item.depth + (0 if link == fetched.url else 1)
                 if self._within_depth(depth):
-                    faculty_links.append(
+                    faculty_for_unit = [
                         _QueuedUrl(
                             url=link,
                             depth=depth,
                             label=item.label,
                             org_unit_id=item.org_unit_id,
                         )
+                    ]
+                    graph_candidates = await self.graph_frontier.record_discovered_links(
+                        source_url=fetched.url,
+                        links=faculty_for_unit,
+                        node_type=CrawlGraphNodeType.FACULTY_LIST_URL,
+                        edge_type=CrawlGraphEdgeType.DISCOVERED_ON_PAGE,
+                        source_node_type=CrawlGraphNodeType.ORG_UNIT,
+                        org_unit_name=org_unit.name,
+                        org_unit_id=org_unit.id,
+                        depth=depth,
+                        confidence=1.0,
+                        metadata={"source": "batch_faculty_discovery"},
                     )
+                    if graph_candidates:
+                        faculty_links.extend(
+                            self.graph_frontier.to_queued_url(candidate, _QueuedUrl)
+                            for candidate in graph_candidates
+                        )
+                    else:
+                        faculty_links.extend(faculty_for_unit)
 
         if not faculty_links:
             self.logger.info("No faculty links from org units, trying search engine fallback")
@@ -1126,774 +1881,6 @@ class CrawlerAgent:
                 len(result.links),
             )
         return found
-    async def _extract_professors(self, faculty_links: list[_QueuedUrl]) -> None:
-        self._log_state(CrawlerState.EXTRACT_PROFESSORS)
-        skills = await self._select_skills(CrawlerState.EXTRACT_PROFESSORS)
-        max_pages = min(max(40, len(faculty_links)), 120)
-        self.logger.info(
-            "Extraction pipeline enabled=%s llm_workers=%s db_workers=%s queue_cap=%s retry=%s",
-            self.pipeline_enabled,
-            self.pipeline_llm_workers,
-            self.pipeline_db_workers,
-            self.pipeline_queue_cap,
-            self.invalid_json_max_retry,
-        )
-
-        scheduled_urls: set[str] = set()
-        processed_urls: set[str] = set()
-
-        def _queue_key(url: str) -> str:
-            return _sanitize_url(url) or (url or "").strip()
-
-        def _mark_scheduled(url: str) -> bool:
-            key = _queue_key(url)
-            if not key:
-                return False
-            if key in scheduled_urls or key in processed_urls:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                return False
-            scheduled_urls.add(key)
-            return True
-
-        def _mark_processing(url: str) -> bool:
-            key = _queue_key(url)
-            if not key:
-                return False
-            if key in processed_urls:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                return False
-            processed_urls.add(key)
-            return True
-
-        def _schedule_related_pages(
-            current: _QueuedUrl,
-            fetched: FetchResult,
-            pages_to_process: list[_QueuedUrl],
-        ) -> set[str]:
-            added_followups: list[str] = []
-            skipped_duplicates = 0
-            followups = self._extract_followup_faculty_links(fetched.links, fetched.url)
-            for link in followups[:_FOLLOWUP_PAGE_LIMIT]:
-                next_depth = current.depth + 1
-                if not self._within_depth(next_depth):
-                    continue
-                if not _mark_scheduled(link):
-                    skipped_duplicates += 1
-                    continue
-                pages_to_process.append(
-                    _QueuedUrl(
-                        url=link,
-                        depth=next_depth,
-                        label=current.label,
-                        org_unit_id=current.org_unit_id,
-                    )
-                )
-                added_followups.append(link)
-
-            added_pagination: list[str] = []
-            pagination_links = self._extract_pagination_links(fetched.links, fetched.url)
-            for plink in pagination_links:
-                if not self._within_depth(current.depth):
-                    continue
-                if not _mark_scheduled(plink):
-                    skipped_duplicates += 1
-                    continue
-                pages_to_process.append(
-                    _QueuedUrl(
-                        url=plink,
-                        depth=current.depth,
-                        label=current.label,
-                        org_unit_id=current.org_unit_id,
-                    )
-                )
-                added_pagination.append(plink)
-
-            if added_followups:
-                self._pipeline_stats["followups_scheduled"] = int(
-                    self._pipeline_stats.get("followups_scheduled", 0)
-                ) + len(added_followups)
-            if added_pagination:
-                self._pipeline_stats["pagination_scheduled"] = int(
-                    self._pipeline_stats.get("pagination_scheduled", 0)
-                ) + len(added_pagination)
-            if skipped_duplicates:
-                self._pipeline_stats["duplicate_followups_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_followups_skipped", 0)
-                ) + skipped_duplicates
-            if added_followups or added_pagination or skipped_duplicates:
-                sample = (added_followups + added_pagination)[:5]
-                self.logger.debug(
-                    "Queued faculty followups current=%s added_followups=%s added_pagination=%s skipped_duplicates=%s sample=%s",
-                    fetched.url,
-                    len(added_followups),
-                    len(added_pagination),
-                    skipped_duplicates,
-                    sample,
-                )
-            return {_queue_key(url) for url in added_followups + added_pagination if _queue_key(url)}
-
-        if not self.pipeline_enabled:
-            for item in faculty_links[:max_pages]:
-                if not _mark_scheduled(item.url):
-                    continue
-                pages_to_process = [item]
-                while pages_to_process:
-                    current = pages_to_process.pop(0)
-                    if not _mark_processing(current.url):
-                        continue
-                    if self._is_noise_or_login_candidate(current.url):
-                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
-                        continue
-                    fetched = await self._fetch_url(current.url, current.depth)
-                    if fetched is None:
-                        continue
-                    if self._is_noise_or_login_candidate(fetched.url):
-                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
-                        continue
-                    if self._is_retired_page(fetched):
-                        self.logger.info("Skip retired faculty page url=%s", fetched.url)
-                        continue
-                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
-                    if skip_llm:
-                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
-                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
-                        ) + 1
-                        self.logger.debug(
-                            "Skip professor LLM extraction by gate url=%s reason=%s",
-                            fetched.url,
-                            skip_reason,
-                        )
-                    else:
-                        await self._extract_professors_from_page(
-                            current,
-                            fetched,
-                            skills,
-                            detail_mode=False,
-                        )
-                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
-                    await self._enrich_profiles_with_detail_backend(
-                        current,
-                        fetched,
-                        skills,
-                        reserved_urls=reserved_urls,
-                    )
-            return
-
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
-        db_queue: asyncio.Queue[_SaveEvent | None] = asyncio.Queue(maxsize=self.pipeline_queue_cap)
-
-        if self.pipeline_enabled and self.task_recovery_enabled:
-            recovered = await self._recover_pipeline_tasks(limit=self.pipeline_queue_cap * 4)
-            for task in recovered:
-                await llm_queue.put(task)
-            if recovered:
-                self.logger.info("Recovered %s pending extraction tasks from DB", len(recovered))
-
-        llm_workers = [
-            asyncio.create_task(self._pipeline_llm_worker(llm_queue, db_queue, skills), name=f"llm_worker_{i}")
-            for i in range(self.pipeline_llm_workers)
-        ]
-        db_workers = [
-            asyncio.create_task(self._pipeline_db_worker(db_queue), name=f"db_worker_{i}")
-            for i in range(self.pipeline_db_workers)
-        ]
-
-        try:
-            for item in faculty_links[:max_pages]:
-                if not _mark_scheduled(item.url):
-                    continue
-                pages_to_process = [item]
-                while pages_to_process:
-                    current = pages_to_process.pop(0)
-                    if not _mark_processing(current.url):
-                        continue
-                    if self._is_noise_or_login_candidate(current.url):
-                        self.logger.debug("Skip noise/login candidate before fetch url=%s", current.url)
-                        continue
-                    fetched = await self._fetch_url(current.url, current.depth)
-                    if fetched is None:
-                        continue
-                    if self._is_noise_or_login_candidate(fetched.url):
-                        self.logger.info("Skip noise/login faculty page url=%s", fetched.url)
-                        continue
-                    if self._is_retired_page(fetched):
-                        self.logger.info("Skip retired faculty page url=%s", fetched.url)
-                        continue
-                    skip_llm, skip_reason = self._should_skip_professor_llm(url=fetched.url, text=fetched.text)
-                    if skip_llm:
-                        self._pipeline_stats["llm_calls_skipped_by_gate"] = int(
-                            self._pipeline_stats.get("llm_calls_skipped_by_gate", 0)
-                        ) + 1
-                        self.logger.debug(
-                            "Skip professor LLM enqueue by gate url=%s reason=%s",
-                            fetched.url,
-                            skip_reason,
-                        )
-                    else:
-                        await self._enqueue_extraction_task(
-                            current,
-                            fetched,
-                            llm_queue=llm_queue,
-                            detail_mode=False,
-                            priority=0,
-                        )
-                    reserved_urls = _schedule_related_pages(current, fetched, pages_to_process)
-                    previous_detail_queue = self._active_detail_llm_queue
-                    self._active_detail_llm_queue = llm_queue
-                    try:
-                        await self._enrich_profiles_with_detail_backend(
-                            current,
-                            fetched,
-                            skills,
-                            reserved_urls=reserved_urls,
-                        )
-                    finally:
-                        self._active_detail_llm_queue = previous_detail_queue
-        finally:
-            await llm_queue.join()
-            for _ in llm_workers:
-                await llm_queue.put(None)
-            await asyncio.gather(*llm_workers, return_exceptions=False)
-
-            await db_queue.join()
-            for _ in db_workers:
-                await db_queue.put(None)
-            await asyncio.gather(*db_workers, return_exceptions=False)
-
-            self.logger.info(
-                "Extraction pipeline stats queue_depth=%s processed=%s retries=%s failed=%s list_processed=%s list_failed=%s detail_enqueued=%s detail_processed=%s detail_failed=%s detail_skipped=%s records_accepted=%s records_created=%s records_updated=%s records_unchanged=%s deduped_by_name_key=%s list_roster_overlap_high=%s stale_in_progress_recovered=%s avg_task_ms=%.1f llm_calls=%s skipped_by_gate=%s followups=%s pagination=%s duplicate_skipped=%s detail_dirs_skipped=%s detail_reserved_for_list=%s detail_directory_skipped=%s avg_payload_bytes=%.1f",
-                self._pipeline_stats.get("queue_depth", 0),
-                self._pipeline_stats.get("processed_tasks", 0),
-                self._pipeline_stats.get("retries", 0),
-                self._pipeline_stats.get("failed", 0),
-                self._pipeline_stats.get("list_processed", 0),
-                self._pipeline_stats.get("list_failed", 0),
-                self._pipeline_stats.get("detail_enqueued", 0),
-                self._pipeline_stats.get("detail_processed", 0),
-                self._pipeline_stats.get("detail_failed", 0),
-                self._pipeline_stats.get("detail_skipped", 0),
-                self._pipeline_stats.get("records_accepted", 0),
-                self._pipeline_stats.get("records_created", 0),
-                self._pipeline_stats.get("records_updated", 0),
-                self._pipeline_stats.get("records_unchanged", 0),
-                self._pipeline_stats.get("deduped_by_name_key", 0),
-                self._pipeline_stats.get("list_roster_overlap_high", 0),
-                self._pipeline_stats.get("stale_in_progress_recovered", 0),
-                float(self._pipeline_stats.get("average_task_ms", 0.0)),
-                self._pipeline_stats.get("llm_calls_total", 0),
-                self._pipeline_stats.get("llm_calls_skipped_by_gate", 0),
-                self._pipeline_stats.get("followups_scheduled", 0),
-                self._pipeline_stats.get("pagination_scheduled", 0),
-                self._pipeline_stats.get("duplicate_tasks_skipped", 0),
-                self._pipeline_stats.get("detail_links_dropped_directory", 0),
-                self._pipeline_stats.get("detail_links_reserved_for_list", 0),
-                self._pipeline_stats.get("detail_directory_skipped", 0),
-                float(self._pipeline_stats.get("avg_payload_bytes", 0.0)),
-            )
-
-    async def _enqueue_extraction_task(
-        self,
-        current: _QueuedUrl,
-        fetched: FetchResult,
-        *,
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
-        detail_mode: bool,
-        priority: int,
-    ) -> None:
-        source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
-        if not source_url:
-            return
-        text_limit = self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode)
-        snapshot = self._compact_page_text(fetched.text or "", text_limit)
-        page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
-        allowed_tools = ["save_professors"]
-        task_kind = CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value
-        async with self.db.session() as session:
-            row = await crawler_db.upsert_crawl_task(
-                session,
-                university=self.university_name,
-                org_unit_name=current.label or "Unknown",
-                org_unit_url=current.url,
-                source_url=source_url,
-                page_url=source_url,
-                page_hash=page_hash,
-                task_kind=task_kind,
-                page_text_snapshot=snapshot,
-                allowed_tools=json.dumps(sorted(allowed_tools), ensure_ascii=False, separators=(",", ":")),
-                attempt=0,
-                priority=priority,
-                status=CrawlTaskStatus.PENDING,
-            )
-            if row.status != CrawlTaskStatus.PENDING.value:
-                self._pipeline_stats["duplicate_tasks_skipped"] = int(
-                    self._pipeline_stats.get("duplicate_tasks_skipped", 0)
-                ) + 1
-                if detail_mode:
-                    self._pipeline_stats["detail_skipped"] = int(self._pipeline_stats.get("detail_skipped", 0)) + 1
-                else:
-                    self._pipeline_stats["list_skipped"] = int(self._pipeline_stats.get("list_skipped", 0)) + 1
-                self.logger.debug(
-                    "Skip existing extraction task source=%s status=%s task_id=%s",
-                    source_url,
-                    row.status,
-                    row.id,
-                )
-                return
-            task = _ExtractionTaskItem(
-                task_id=int(row.id),
-                university=self.university_name,
-                org_unit_name=row.org_unit_name,
-                org_unit_url=row.org_unit_url,
-                source_url=row.source_url,
-                page_url=row.page_url,
-                page_hash=row.page_hash,
-                page_text_snapshot=row.page_text_snapshot,
-                allowed_tools=allowed_tools,
-                attempt=int(row.attempt or 0),
-                priority=int(row.priority or 0),
-                strict_retry=False,
-                detail_mode=detail_mode,
-                task_kind=str(getattr(row, "task_kind", None) or task_kind),
-            )
-        await llm_queue.put(task)
-        self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
-        if detail_mode:
-            self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
-        else:
-            self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
-        self._pipeline_stats["queue_depth"] = llm_queue.qsize()
-
-    async def _recover_pipeline_tasks(self, *, limit: int) -> list[_ExtractionTaskItem]:
-        async with self.db.session() as session:
-            stale_count = await crawler_db.recover_stale_in_progress_crawl_tasks(session)
-            rows = await crawler_db.list_recoverable_crawl_tasks(session, limit=limit)
-        if stale_count:
-            self._pipeline_stats["stale_in_progress_recovered"] = int(
-                self._pipeline_stats.get("stale_in_progress_recovered", 0)
-            ) + int(stale_count)
-            self.logger.info("Recovered %s stale in_progress extraction tasks", stale_count)
-        recovered: list[_ExtractionTaskItem] = []
-        for row in rows:
-            allowed_tools = ["save_professors"]
-            task_kind = str(getattr(row, "task_kind", None) or CrawlTaskKind.LIST_PAGE.value)
-            detail_mode = task_kind == CrawlTaskKind.DETAIL_PAGE.value
-            if row.allowed_tools:
-                try:
-                    parsed = json.loads(row.allowed_tools)
-                    if isinstance(parsed, list) and parsed:
-                        allowed_tools = [str(item) for item in parsed]
-                except Exception:
-                    pass
-            recovered.append(
-                _ExtractionTaskItem(
-                    task_id=int(row.id),
-                    university=row.university or self.university_name,
-                    org_unit_name=row.org_unit_name,
-                    org_unit_url=row.org_unit_url,
-                    source_url=row.source_url,
-                    page_url=row.page_url,
-                    page_hash=row.page_hash,
-                    page_text_snapshot=row.page_text_snapshot,
-                    allowed_tools=allowed_tools,
-                    attempt=int(row.attempt or 0),
-                    priority=int(row.priority or 0),
-                    strict_retry=(int(row.attempt or 0) > 0),
-                    detail_mode=detail_mode,
-                    task_kind=task_kind,
-                )
-            )
-            if row.status == CrawlTaskStatus.RETRY.value:
-                self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
-            else:
-                self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
-            if detail_mode:
-                self._pipeline_stats["detail_enqueued"] = int(self._pipeline_stats.get("detail_enqueued", 0)) + 1
-            else:
-                self._pipeline_stats["list_enqueued"] = int(self._pipeline_stats.get("list_enqueued", 0)) + 1
-        return recovered
-
-    async def _pipeline_llm_worker(
-        self,
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
-        db_queue: asyncio.Queue[_SaveEvent | None],
-        skills: str,
-    ) -> None:
-        while True:
-            task = await llm_queue.get()
-            if task is None:
-                llm_queue.task_done()
-                return
-
-            started = time.perf_counter()
-            self._pipeline_stats["in_progress"] = int(self._pipeline_stats.get("in_progress", 0)) + 1
-            self._pipeline_stats["pending"] = max(0, int(self._pipeline_stats.get("pending", 0)) - 1)
-            async with self.db.session() as session:
-                await crawler_db.set_crawl_task_status(
-                    session,
-                    task.task_id,
-                    status=CrawlTaskStatus.IN_PROGRESS,
-                    attempt=task.attempt,
-                )
-
-            outcome = await self._run_extraction_task(task, skills)
-            invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
-            if invalid_events:
-                await self._handle_invalid_json_retry(task, invalid_events, llm_queue)
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                self._update_pipeline_timing(elapsed_ms)
-                self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
-                llm_queue.task_done()
-                continue
-
-            if not outcome.payloads:
-                async with self.db.session() as session:
-                    await crawler_db.set_crawl_task_status(
-                        session,
-                        task.task_id,
-                        status=CrawlTaskStatus.FAILED,
-                        attempt=task.attempt,
-                        last_error="no_structured_data",
-                    )
-                    await crawler_db.log_extraction_failure(
-                        session,
-                        task_id=task.task_id,
-                        failure_type="no_structured_data",
-                        org_unit_name=task.org_unit_name,
-                        source_url=task.source_url,
-                        attempt=task.attempt,
-                        resolver="dropped",
-                    )
-                self._pipeline_stats["failed"] += 1
-                self._increment_task_kind_stat(task, "failed")
-                self._pipeline_stats["no_structured_data_failures"] += 1
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                self._update_pipeline_timing(elapsed_ms)
-                self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
-                llm_queue.task_done()
-                continue
-
-            await db_queue.put(_SaveEvent(task=task, payloads=outcome.payloads))
-            self._pipeline_stats["queue_depth"] = llm_queue.qsize()
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            self._update_pipeline_timing(elapsed_ms)
-            self._pipeline_stats["in_progress"] = max(0, int(self._pipeline_stats.get("in_progress", 0)) - 1)
-            llm_queue.task_done()
-
-    async def _pipeline_db_worker(self, db_queue: asyncio.Queue[_SaveEvent | None]) -> None:
-        while True:
-            event = await db_queue.get()
-            if event is None:
-                db_queue.task_done()
-                return
-            task = event.task
-            try:
-                save_summary = await self._save_payloads_to_db(event.payloads, task=task)
-            except Exception as error:
-                async with self.db.session() as session:
-                    await crawler_db.set_crawl_task_status(
-                        session,
-                        task.task_id,
-                        status=CrawlTaskStatus.FAILED,
-                        attempt=task.attempt,
-                        last_error=f"save_error:{error}",
-                    )
-                    await crawler_db.log_extraction_failure(
-                        session,
-                        task_id=task.task_id,
-                        failure_type="save_error",
-                        org_unit_name=task.org_unit_name,
-                        source_url=task.source_url,
-                        raw_arguments_preview=str(event.payloads)[:5000],
-                        attempt=task.attempt,
-                        resolver="dropped",
-                    )
-                self._pipeline_stats["failed"] += 1
-                self._increment_task_kind_stat(task, "failed")
-                self._pipeline_stats["save_errors"] += 1
-                db_queue.task_done()
-                continue
-
-            async with self.db.session() as session:
-                await crawler_db.set_crawl_task_status(
-                    session,
-                    task.task_id,
-                    status=CrawlTaskStatus.DONE,
-                    attempt=task.attempt,
-                )
-            self._pipeline_stats["done"] += 1
-            self._pipeline_stats["processed_tasks"] += 1
-            self._increment_task_kind_stat(task, "processed")
-            self.logger.debug(
-                "Extraction task done task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s deduped_by_name_key=%s",
-                task.task_id,
-                task.org_unit_name,
-                save_summary.get("accepted", 0),
-                save_summary.get("created", 0),
-                save_summary.get("updated", 0),
-                save_summary.get("unchanged", 0),
-                save_summary.get("deduped_by_name_key", 0),
-            )
-            db_queue.task_done()
-
-    async def _handle_invalid_json_retry(
-        self,
-        task: _ExtractionTaskItem,
-        invalid_events: list[dict[str, Any]],
-        llm_queue: asyncio.Queue[_ExtractionTaskItem | None],
-    ) -> None:
-        preview = (invalid_events[0].get("raw_args_preview") or "")[:5000] if invalid_events else None
-        if task.attempt < self.invalid_json_max_retry:
-            next_attempt = task.attempt + 1
-            retry_task = _ExtractionTaskItem(
-                task_id=task.task_id,
-                university=task.university,
-                org_unit_name=task.org_unit_name,
-                org_unit_url=task.org_unit_url,
-                source_url=task.source_url,
-                page_url=task.page_url,
-                page_hash=task.page_hash,
-                page_text_snapshot=task.page_text_snapshot,
-                allowed_tools=task.allowed_tools,
-                attempt=next_attempt,
-                priority=task.priority,
-                strict_retry=True,
-                detail_mode=task.detail_mode,
-                task_kind=task.task_kind,
-            )
-            async with self.db.session() as session:
-                await crawler_db.set_crawl_task_status(
-                    session,
-                    task.task_id,
-                    status=CrawlTaskStatus.RETRY,
-                    attempt=next_attempt,
-                    last_error="invalid_json_retry",
-                )
-                await crawler_db.log_extraction_failure(
-                    session,
-                    task_id=task.task_id,
-                    failure_type="invalid_json",
-                    org_unit_name=task.org_unit_name,
-                    source_url=task.source_url,
-                    raw_arguments_preview=preview,
-                    attempt=next_attempt,
-                    resolver="retry",
-                )
-            self._pipeline_stats["retries"] += 1
-            self._pipeline_stats["retry"] = int(self._pipeline_stats.get("retry", 0)) + 1
-            self._pipeline_stats["pending"] = int(self._pipeline_stats.get("pending", 0)) + 1
-            await llm_queue.put(retry_task)
-            return
-
-        async with self.db.session() as session:
-            await crawler_db.set_crawl_task_status(
-                session,
-                task.task_id,
-                status=CrawlTaskStatus.FAILED,
-                attempt=task.attempt,
-                last_error="invalid_json_dropped",
-            )
-            await crawler_db.log_extraction_failure(
-                session,
-                task_id=task.task_id,
-                failure_type="invalid_json",
-                org_unit_name=task.org_unit_name,
-                source_url=task.source_url,
-                raw_arguments_preview=preview,
-                attempt=task.attempt,
-                resolver="dropped",
-            )
-        self._pipeline_stats["failed"] += 1
-        self._increment_task_kind_stat(task, "failed")
-        self._pipeline_stats["invalid_json_failures"] += 1
-        self._pipeline_stats["retry"] = max(0, int(self._pipeline_stats.get("retry", 0)) - 1)
-
-    async def _run_extraction_task(self, task: _ExtractionTaskItem, skills: str) -> _ExtractionOutcome:
-        instruction = self._build_professor_instruction(task.org_unit_name, detail_mode=task.detail_mode, strict_retry=task.strict_retry)
-        allowed_tools = {"save_professors"}
-        tool_defs = [tool for tool in get_crawler_tool_definitions() if tool.get("name") in allowed_tools]
-        user_content, payload_meta = self._build_llm_payload(
-            state=CrawlerState.EXTRACT_PROFESSORS,
-            instruction=instruction,
-            url=task.page_url or task.source_url,
-            page_text=task.page_text_snapshot,
-            links=[],
-            allowed_tools=allowed_tools,
-            detail_mode=task.detail_mode,
-        )
-        self._record_llm_payload(int(payload_meta.get("payload_bytes", 0)))
-        self.logger.debug(
-            "LLM extraction payload task_id=%s url=%s raw_chars=%s compacted_chars=%s links_raw=%s links_kept=%s payload_bytes=%s",
-            task.task_id,
-            task.page_url or task.source_url,
-            payload_meta.get("raw_chars", 0),
-            payload_meta.get("compacted_chars", 0),
-            payload_meta.get("links_raw", 0),
-            payload_meta.get("links_kept", 0),
-            payload_meta.get("payload_bytes", 0),
-        )
-        dynamic_system_content = (
-            "Tool call policy: "
-            + self._build_tool_call_policy(allowed_tools)
-            + " Keep output short and strict JSON."
-        )
-        prompt_max_tokens = min(int(self.model_max_tokens), 16000)
-        batches = self.context_manager.build_messages(
-            "You are a cautious university faculty crawler. Stay on the same university domain.",
-            tool_defs,
-            skills,
-            user_content,
-            prompt_max_tokens,
-            dynamic_system_content=dynamic_system_content,
-        )
-
-        captured_payloads: list[dict[str, Any]] = []
-
-        async def _capture_save_professors(
-            org_unit_name: str,
-            professors: list[dict[str, Any]],
-            org_unit_url: str | None = None,
-            source_url: str | None = None,
-        ) -> dict[str, Any]:
-            normalized_professors = [item for item in professors if isinstance(item, dict)]
-            if task.strict_retry and len(normalized_professors) > 25:
-                normalized_professors = normalized_professors[:25]
-            captured_payloads.append(
-                {
-                    "org_unit_name": org_unit_name,
-                    "org_unit_url": org_unit_url or task.org_unit_url,
-                    "source_url": source_url or task.source_url,
-                    "professors": normalized_professors,
-                }
-            )
-            return {"accepted": len(normalized_professors)}
-
-        final_result = None
-        for batch in batches:
-            final_result = await self.llm_client.chat(
-                batch,
-                tools=tool_defs or None,
-                tool_handlers={"save_professors": _capture_save_professors},
-            )
-        assert final_result is not None
-        invalid_events = [
-            {
-                "name": item.name,
-                "raw_args_preview": item.raw_args_preview,
-                "error_type": item.error_type,
-            }
-            for item in (getattr(final_result, "invalid_tool_calls", None) or [])
-        ]
-
-        used_fallback = False
-        if not captured_payloads:
-            payload = self._parse_json_from_text(final_result.content)
-            if isinstance(payload, dict):
-                professors = payload.get("professors")
-                if isinstance(professors, list) and professors:
-                    captured_payloads.append(
-                        {
-                            "org_unit_name": str(payload.get("org_unit_name") or task.org_unit_name),
-                            "org_unit_url": str(payload.get("org_unit_url") or task.org_unit_url or "").strip() or None,
-                            "source_url": str(payload.get("source_url") or task.source_url or "").strip() or task.source_url,
-                            "professors": [item for item in professors if isinstance(item, dict)],
-                        }
-                    )
-                    used_fallback = True
-
-        return _ExtractionOutcome(
-            payloads=captured_payloads,
-            invalid_json_events=invalid_events,
-            content_fallback_used=used_fallback,
-        )
-
-    async def _save_payloads_to_db(
-        self,
-        payloads: list[dict[str, Any]],
-        *,
-        task: _ExtractionTaskItem | None = None,
-    ) -> dict[str, int]:
-        tools = get_crawler_tools(self.db, self.skill_manager)
-        totals = {
-            "accepted": 0,
-            "created": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "deduped_by_name_key": 0,
-        }
-        for payload in payloads:
-            result = await tools["save_professors"](
-                org_unit_name=str(payload.get("org_unit_name") or "Unknown"),
-                org_unit_url=(str(payload.get("org_unit_url")) if payload.get("org_unit_url") else None),
-                source_url=(str(payload.get("source_url")) if payload.get("source_url") else None),
-                professors=[item for item in payload.get("professors", []) if isinstance(item, dict)],
-            )
-            if isinstance(result, dict):
-                accepted = int(result.get("accepted", 0) or 0)
-                created = int(result.get("created", result.get("saved", 0)) or 0)
-                updated = int(result.get("updated", 0) or 0)
-                unchanged = int(result.get("unchanged", 0) or 0)
-                deduped_by_name_key = int(result.get("deduped_by_name_key", 0) or 0)
-                totals["accepted"] += accepted
-                totals["created"] += created
-                totals["updated"] += updated
-                totals["unchanged"] += unchanged
-                totals["deduped_by_name_key"] += deduped_by_name_key
-                self.saved_professors += created
-        self._pipeline_stats["records_accepted"] = int(self._pipeline_stats.get("records_accepted", 0)) + totals["accepted"]
-        self._pipeline_stats["records_created"] = int(self._pipeline_stats.get("records_created", 0)) + totals["created"]
-        self._pipeline_stats["records_updated"] = int(self._pipeline_stats.get("records_updated", 0)) + totals["updated"]
-        self._pipeline_stats["records_unchanged"] = int(self._pipeline_stats.get("records_unchanged", 0)) + totals["unchanged"]
-        self._pipeline_stats["deduped_by_name_key"] = int(self._pipeline_stats.get("deduped_by_name_key", 0)) + totals["deduped_by_name_key"]
-        if task is not None:
-            self._record_roster_overlap_observation(task, totals)
-        return totals
-
-    def _record_roster_overlap_observation(self, task: _ExtractionTaskItem, summary: dict[str, int]) -> None:
-        if self._task_kind_prefix(task) != "list":
-            return
-        accepted = int(summary.get("accepted", 0) or 0)
-        if accepted < 10:
-            return
-        created = int(summary.get("created", 0) or 0)
-        non_new = max(0, accepted - created)
-        ratio = non_new / float(accepted)
-        if ratio < 0.8:
-            return
-        self._pipeline_stats["list_roster_overlap_high"] = int(
-            self._pipeline_stats.get("list_roster_overlap_high", 0)
-        ) + 1
-        self.logger.info(
-            "High roster overlap observed task_id=%s org_unit=%s accepted=%s created=%s updated=%s unchanged=%s overlap_ratio=%.2f",
-            task.task_id,
-            task.org_unit_name,
-            accepted,
-            created,
-            summary.get("updated", 0),
-            summary.get("unchanged", 0),
-            ratio,
-        )
-
-    def _build_professor_instruction(self, org_unit_name: str, *, detail_mode: bool, strict_retry: bool) -> str:
-        return self.prompt_builder.build_professor_instruction(
-            org_unit_name,
-            detail_mode=detail_mode,
-            strict_retry=strict_retry,
-        )
-
-    def _update_pipeline_timing(self, elapsed_ms: float) -> None:
-        self.extraction_pipeline.update_timing(elapsed_ms)
-
-    @staticmethod
-    def _task_kind_prefix(task: _ExtractionTaskItem) -> str:
-        return ExtractionPipeline.task_kind_prefix(task)
-
-    def _increment_task_kind_stat(self, task: _ExtractionTaskItem, suffix: str, amount: int = 1) -> None:
-        self.extraction_pipeline.increment_task_kind_stat(task, suffix, amount)
-
     @staticmethod
     def _state_link_limit(state: CrawlerState) -> int:
         return CrawlerPromptBuilder.state_link_limit(state)
@@ -1990,6 +1977,7 @@ class CrawlerAgent:
                 org_unit_hosts=org_unit_hosts,
             )
             and not _looks_like_retired_url(item.url)
+            and not _is_non_faculty_noise_url(item.url)
         ]
         selected = _select_balanced_faculty_candidates(gated_structured, limit=max_candidates)
         if selected:
@@ -2128,7 +2116,12 @@ class CrawlerAgent:
             },
         ]
         try:
-            result = await self.llm_client.chat(messages, tools=None, tool_handlers={}, max_tokens=256)
+            try:
+                result = await self.llm_client.chat(messages, tools=None, tool_handlers={}, max_tokens=256)
+            except TypeError as error:
+                if "max_tokens" not in str(error):
+                    raise
+                result = await self.llm_client.chat(messages, tools=None, tool_handlers={})
         except Exception as error:
             self.logger.warning(
                 "Uncertain faculty candidate adjudication failed org_unit=%s url=%s error=%s",
@@ -2169,103 +2162,7 @@ class CrawlerAgent:
         return False, ""
 
     def _should_skip_professor_llm(self, *, url: str, text: str) -> tuple[bool, str]:
-        lowered_url = (url or "").lower()
-        lowered_text = (text or "").lower()
-
-        strong_noise_url_tokens = (
-            "/news",
-            "/notice",
-            "/tzgg",
-            "/gonggao",
-            "/announcement",
-            "/policy",
-            "/zcwj",
-            "/renshi",
-            "/rszc",
-            "/hr",
-            "/rczp",
-            "/zhaopin",
-            "/jobs",
-            "/dangjian",
-            "/party",
-            "/xsgz",
-            "/zsjy",
-        )
-        faculty_signal_tokens = (
-            "faculty",
-            "teacher",
-            "staff",
-            "professor",
-            "research",
-            "email",
-            "phone",
-            "导师",
-            "教师",
-            "师资",
-            "教授",
-            "副教授",
-            "讲师",
-            "研究员",
-            "邮箱",
-            "电话",
-            "研究方向",
-            "博导",
-            "硕导",
-        )
-        strong_faculty_evidence_tokens = (
-            "email",
-            "mail",
-            "phone",
-            "tel",
-            "professor",
-            "associate professor",
-            "assistant professor",
-            "lecturer",
-            "researcher",
-            "\u5bfc\u5e08",
-            "\u6559\u5e08",
-            "\u6559\u6388",
-            "\u526f\u6559\u6388",
-            "\u8bb2\u5e08",
-            "\u7814\u7a76\u5458",
-            "\u90ae\u7bb1",
-            "\u7535\u8bdd",
-            "\u535a\u5bfc",
-            "\u7855\u5bfc",
-        )
-        noise_text_tokens = (
-            "通知",
-            "公告",
-            "新闻",
-            "政策",
-            "招聘",
-            "人事",
-            "党建",
-            "招生",
-            "就业",
-            "notice",
-            "announcement",
-            "news",
-            "policy",
-            "recruit",
-            "personnel",
-            "hr",
-        )
-
-        has_faculty_signal = ("@" in (text or "")) or any(token in lowered_text for token in faculty_signal_tokens)
-        evidence_hits = sum(1 for token in strong_faculty_evidence_tokens if token in lowered_text)
-        has_strong_faculty_evidence = ("@" in (text or "")) or evidence_hits >= 2
-        if any(token in lowered_url for token in strong_noise_url_tokens) and not has_strong_faculty_evidence:
-            return True, "url_noise_token"
-
-        lines = [line.strip() for line in re.split(r"[\r\n]+", text or "") if line.strip()]
-        if not lines:
-            return False, ""
-        noise_hits = sum(1 for line in lines if any(token in line.lower() for token in noise_text_tokens))
-        noise_ratio = noise_hits / float(len(lines))
-        if noise_ratio >= 0.35 and not has_faculty_signal:
-            return True, f"text_noise_ratio={noise_ratio:.2f}"
-        return False, ""
+        return should_skip_professor_llm(url=url, text=text)
 
     async def _extract_professors_from_page(
         self,
@@ -2274,16 +2171,66 @@ class CrawlerAgent:
         skills: str,
         *,
         detail_mode: bool,
+        requested_url: str | None = None,
     ) -> int:
+        if not detail_mode:
+            saved_before = self.saved_professors
+            await self._record_list_page_traversal_task(
+                current,
+                fetched,
+                requested_url=requested_url,
+            )
+            return self.saved_professors - saved_before
+
+        if is_retryable_fetch_failure(fetched.block_reason):
+            result = await self._mark_retryable_fetch_failure(
+                current,
+                fetched,
+                detail_mode=detail_mode,
+            )
+            return -1 if result == "skipped" else 0
         saved_before = self.saved_professors
-        source_url = _sanitize_url(fetched.url) or _sanitize_url(current.url) or ""
+        source_url = _sanitize_url(requested_url or current.identity_url or current.url) or _sanitize_url(fetched.url) or ""
         if not source_url:
             return 0
+        final_url = _sanitize_url(fetched.url) or source_url
+        skip_redirect, redirect_reason = self._should_skip_redirected_extraction(
+            source_url,
+            final_url,
+            detail_mode=detail_mode,
+        )
+        if skip_redirect:
+            self._record_redirected_extraction_skip(detail_mode=detail_mode)
+            self.logger.warning(
+                "Skip synchronous extraction after redirect source=%s final=%s detail_mode=%s reason=%s",
+                source_url,
+                final_url,
+                detail_mode,
+                redirect_reason,
+            )
+            await self.graph_frontier.mark_node_status(
+                current.graph_node_id,
+                status=CrawlGraphNodeStatus.SKIPPED,
+                last_error=f"redirect:{redirect_reason}",
+            )
+            return -1
+        if final_url != source_url:
+            self.logger.debug(
+                "Synchronous extraction keeps requested URL after redirect source=%s final=%s detail_mode=%s",
+                source_url,
+                final_url,
+                detail_mode,
+            )
         snapshot = self._compact_page_text(
             fetched.text or "",
             self._state_text_limit(CrawlerState.EXTRACT_PROFESSORS, detail_mode=detail_mode),
         )
         page_hash = hashlib.sha1(f"{source_url}|{snapshot}".encode("utf-8", errors="ignore")).hexdigest()
+        name_homepage_candidates = self._extract_name_homepage_candidates(
+            fetched,
+            source_url=source_url,
+            detail_mode=detail_mode,
+        )
         task = _ExtractionTaskItem(
             task_id=0,
             university=self.university_name,
@@ -2299,13 +2246,18 @@ class CrawlerAgent:
             strict_retry=False,
             detail_mode=detail_mode,
             task_kind=CrawlTaskKind.DETAIL_PAGE.value if detail_mode else CrawlTaskKind.LIST_PAGE.value,
+            name_homepage_candidates=name_homepage_candidates,
         )
         outcome = await self._run_extraction_task(task, skills)
+        if outcome.skipped_by_gate:
+            return self.saved_professors - saved_before
         invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
         if invalid_events and self.invalid_json_max_retry > 0:
             task.attempt = 1
             task.strict_retry = True
             outcome = await self._run_extraction_task(task, skills)
+            if outcome.skipped_by_gate:
+                return self.saved_professors - saved_before
             invalid_events = [event for event in outcome.invalid_json_events if event.get("name") == "save_professors"]
 
         if invalid_events:
@@ -2367,9 +2319,6 @@ class CrawlerAgent:
             skills,
             reserved_urls=reserved_urls,
         )
-
-    async def _process_detail_urls_with_human(self, urls: list[str], current: _QueuedUrl, skills: str) -> None:
-        await self.detail_enricher.process_detail_urls_with_human(urls, current, skills)
 
     def _extract_detail_profile_links(
         self,
@@ -2434,10 +2383,10 @@ class CrawlerAgent:
         self._record_llm_payload(int(payload_meta.get("payload_bytes", 0)))
         tool_defs = get_crawler_tool_definitions()
         tool_defs = [tool for tool in tool_defs if tool.get("name") in allowed_tools] if allowed_tools else []
-        dynamic_system_content = "Tool call policy: " + self._build_tool_call_policy(allowed_tools)
+        dynamic_system_content = CrawlerPromptBuilder.build_dynamic_system_content(allowed_tools)
 
         batches = self.context_manager.build_messages(
-            "You are a cautious university faculty crawler. Stay on the same university domain.",
+            CRAWLER_SYSTEM_PROMPT,
             tool_defs,
             skills_text,
             user_content,
@@ -2486,8 +2435,22 @@ class CrawlerAgent:
         else:
             allowed_tools = set()
         return self.skill_manager.select_for_state(state.value, allowed_tools).rendered_text
-    async def _fetch_url(self, url: str, depth: int) -> FetchResult | None:
-        return await self.fetch_scheduler.fetch_url(url, depth)
+    async def _fetch_url(
+        self,
+        url: str,
+        depth: int,
+        *,
+        action: dict[str, Any] | None = None,
+        identity_url: str | None = None,
+        allow_depth_excess: bool = False,
+    ) -> FetchResult | None:
+        return await self.fetch_scheduler.fetch_url(
+            url,
+            depth,
+            action=action,
+            identity_url=identity_url,
+            allow_depth_excess=allow_depth_excess,
+        )
 
     async def _save_professors_from_content(self, content: str, fallback_org_unit: str) -> None:
         payload = self._parse_json_from_text(content)
@@ -2507,12 +2470,39 @@ class CrawlerAgent:
         source_url = str(payload.get("source_url") or "").strip() or None
         org_unit_url = str(payload.get("org_unit_url") or "").strip() or None
 
+        task = _ExtractionTaskItem(
+            task_id=0,
+            university=self.university_name,
+            org_unit_name=fallback_org_unit or "Unknown",
+            org_unit_url=org_unit_url,
+            source_url=source_url or "",
+            page_url=source_url or "",
+            page_hash="content-fallback",
+            page_text_snapshot="",
+            allowed_tools=["save_professors"],
+        )
+        normalized_payload = self._normalize_extraction_payload_for_task(
+            {
+                "org_unit_name": org_unit_name,
+                "org_unit_url": org_unit_url,
+                "source_url": source_url,
+                "professors": [item for item in professors if isinstance(item, dict)],
+            },
+            task=task,
+        )
+        if normalized_payload is None:
+            return
+
         tools = get_crawler_tools(self.db, self.skill_manager)
         result = await tools["save_professors"](
-            org_unit_name=org_unit_name,
-            org_unit_url=org_unit_url,
-            source_url=source_url,
-            professors=[item for item in professors if isinstance(item, dict)],
+            org_unit_name=str(normalized_payload.get("org_unit_name") or "Unknown"),
+            org_unit_url=(
+                str(normalized_payload.get("org_unit_url")) if normalized_payload.get("org_unit_url") else None
+            ),
+            source_url=(
+                str(normalized_payload.get("source_url")) if normalized_payload.get("source_url") else None
+            ),
+            professors=[item for item in normalized_payload.get("professors", []) if isinstance(item, dict)],
         )
         if isinstance(result, dict):
             self.saved_professors += int(result.get("saved", 0) or 0)
@@ -2610,8 +2600,3 @@ def _dedupe_queue(items: list[_QueuedUrl]) -> list[_QueuedUrl]:
         seen.add(item.url)
         result.append(item)
     return result
-
-
-
-
-

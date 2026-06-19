@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from urllib.parse import urldefrag, urljoin, urlparse
+
+from agents.crawler.url_validation import normalize_crawlable_url
 
 
 _SPACE_RE = re.compile(r"\s+")
@@ -64,11 +65,7 @@ def _normalize_space(value: str) -> str:
 
 
 def _normalize_url(href: str, base_url: str) -> str:
-    absolute = urldefrag(urljoin(base_url, href))[0]
-    scheme = urlparse(absolute).scheme.lower()
-    if scheme not in {"http", "https"}:
-        return ""
-    return absolute
+    return normalize_crawlable_url(href, base_url=base_url)
 
 
 def _context_token(tag: str, attrs: dict[str, str]) -> str:

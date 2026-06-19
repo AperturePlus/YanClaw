@@ -15,8 +15,17 @@ class StewardRunSummary:
     missing_field_audits: int
     recrawl_tasks_upserted: int
     audits_written: int
+    excluded_org_units_detected: int = 0
+    excluded_org_units_deleted: int = 0
+    sub_department_sections_detected: int = 0
+    sub_department_sections_merged: int = 0
+    org_unit_cleanup: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     backup_audit: dict[str, Any] = field(default_factory=dict)
+    export_path: str | None = None
+    export_size_bytes: int = 0
+    export_row_counts: dict[str, int] = field(default_factory=dict)
+    export_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -31,6 +40,12 @@ class StewardBatchSummary:
     unmatched_universities: list[str]
     unmatched_db_roots: list[str]
     runs: list[StewardRunSummary]
+    total_excluded_org_units_detected: int = 0
+    total_excluded_org_units_deleted: int = 0
+    total_sub_department_sections_detected: int = 0
+    total_sub_department_sections_merged: int = 0
+    total_exports: int = 0
+    total_exported_bytes: int = 0
 
 
 @dataclass(frozen=True)

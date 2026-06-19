@@ -1,38 +1,61 @@
 ---
 name: save-professors
-description: Extract public professor records and save them with strict field normalization.
-version: 4
+description: 从详情页提取公开教师记录，并按严格字段规则保存。
+version: 10
 applies_to: EXTRACT_PROFESSORS
 allowed_tools: save_professors
 priority: 20
 token_budget: 1000
 created_at: 2026-04-26T00:00:00
-updated_at: 2026-04-28T20:10:00
+updated_at: 2026-06-09
 ---
 ## Goal
 
-Extract public teacher records from official university pages and save high-quality structured data.
+从高校官方网站的教师个人详情页或强证据单人页中提取公开教师记录，并保存为高质量结构化数据。
 
-## Required Tool Call
+## 必须调用的工具
 
-Use `save_professors` with:
+使用 `save_professors`，参数为：
 
-- `org_unit_name`: required, must match current page context.
-- `org_unit_url`: optional but preferred.
-- `source_url`: current page URL.
-- `professors`: list of records.
+- `org_unit_name`：必填，必须匹配当前任务的学院上下文。
+- `org_unit_url`：可选，但优先提供。
+- `source_url`：当前页面 URL。
+- `professors`：教师记录列表。
 
-## Field Rules (Strict)
+## 页面类型规则
 
-- `name`: required; no extra punctuation or numbering.
-- `title`: use only academic rank / role. Do not include honors.
-- `enrollment_pref`: put advisor information here (博导/硕导), not in `title`.
-- `email` / `phone` / `homepage` / `bio` / `research_areas` / `publications`: only if visible on the page.
-- Missing optional values should be `null` (not empty string `""`).
+- 只有在当前页是教师个人详情页、强证据单人页、明确团队页或院士聚合页时，才调用 `save_professors`。
+- 名单页、列表页、分页名单、学院师资目录页只用于发现个人详情页，不要调用 `save_professors`。
+- 如果页面只是导航页，没有教师详情证据，继续进入名单页或详情页后再保存。
 
-## Allowed Title Set
+## 学院上下文规则
 
-Prefer these normalized titles:
+- `org_unit_name` 使用当前任务的父级学院/学校名称。不要用页面标题中的系、教学中心、实验中心、实验室分区或名单分类替代它。
+- 如果当前页是学院下属系名单，例如 `自动化科学与电气工程学院` 下的 `工业互联网与建模仿真系`，可以提取可见教师，但调用 `save_professors` 时仍使用父级学院名称。
+- 如果当前页是教学、实验或实训中心名单，例如 `教学中心`、`实验中心`、`教学实验中心`、`实验教学中心`、`实训中心`、`实践教学中心`，不要调用 `save_professors`；这些不是研究生招生学院。
+
+## 字段规则
+
+- `name`：必填，只填写教师真实姓名。去掉多余标点、编号，以及 `（兼）`、`(兼)`、`兼职` 等低价值角色标记。
+- 外籍教师如果显示为 `Latin Name (中文名)` 或 `Latin Name（中文名）`，`name` 只保存拉丁姓名，不包含括号里的中文别名。
+- `title`：只保存学术职称或岗位，不要放荣誉称号。
+- `enrollment_pref`：博导、硕导等导师资格放在这里，不要放入 `title`。
+- `email` / `phone` / `homepage` / `external_link` / `bio` / `research_areas` / `publications`：只有页面可见时才填写。
+- `is_academician`：当页面明确说明该教师本人是 `院士`、`中国科学院院士`、`中国工程院院士` 或 `Academician` 时设为 `true`，即使其职称同时也是 `教授`。
+- 不要因为导师、合作者、团队负责人、实验室、项目、`院士工作站`、`院士团队`、`院士课题组` 提到院士，就设置 `is_academician=true`。院士身份必须指向当前教师本人。
+- `homepage`：优先使用教师官方个人简介/详情页。如果当前 `source_url` 是单个教师详情页，可以作为该教师的 `homepage`。
+- 不要把名单页、列表页、学院主页或师资目录页作为教师 `homepage`。
+- Google Scholar、ORCID、ResearchGate、个人域名等外部个人站点放入 `external_link`，不要放入 `homepage`。
+- 缺失的可选字段用 `null`，不要用空字符串 `""`。
+- 如果 `bio` 中包含明确研究短语，例如 `研究方向`、`研究领域`、`主要从事...研究`、`在...方面取得...研究成果`，也要提取到 `research_areas`，不要只留在 `bio`。
+- 在详情页中，研究方向可能是 `研究方向` / `研究领域` 标题下的链接；应把可见链接文本保存到 `research_areas`。
+- 如果 `个人简介`、`简介`、`个人概况` 等标题后有可见正文段落，把该段落保存到 `bio`。不要编造，也不要复制输入页面中不可见的内容。
+- 详情页必须至少有一个有效证据字段：`title`、`email`、`phone`、`research_areas`、`bio`、`homepage`、`external_link`、`publications` 或 `enrollment_pref`。
+- 只包含 `{name}` 的页面不要保存；不要为了通过校验而编造职称、邮箱、研究方向或简介。
+
+## 推荐职称集合
+
+优先使用以下规范化职称：
 
 - `教授`
 - `副教授`
@@ -42,23 +65,25 @@ Prefer these normalized titles:
 - `讲师`
 - `助理教授`
 - `工程师`
-- `院士` (for academicians)
+- `院士`（仅用于院士）
 
-## What Must Not Go Into `title`
+## 不应写入 `title` 的内容
 
-- Awards and talent labels: such as 国家级教学名师, 杰青, 优青, 长江学者, 千人计划.
-- Organization roles: 院长, 系主任, 党委书记 (unless no academic rank is available).
-- Mixed bilingual text like `教授 (Professor)` or `Professor / National-level Teaching Master`.
+- 荣誉和人才标签：如国家级教学名师、杰青、优青、长江学者、千人计划。
+- 行政或组织职务：如院长、系主任、党委书记；除非没有任何学术职称可用。
+- 中英混排或混合荣誉文本：如 `教授 (Professor)`、`Professor / National-level Teaching Master`。
 
-## Precision and Coverage
+## 精度与覆盖
 
-- On official roster/list pages, save visible teacher names and academic titles even when contact or research fields are not shown; profile/detail pages can enrich those records later.
-- If a page is only a navigation page with no teacher names, continue to list/profile pages before saving.
-- Prefer complete list extraction for each org unit page before moving on.
-- Do not fabricate any value not present in page text.
+- 在官方名单页/列表页上，即使看到教师姓名和学术职称，也不要保存；应等待个人详情页或强证据单人页。
+- 研究所、实验室、中心等分组下列出的姓名都是详情页发现线索，但不是默认入库事实。
+- `所长`、`副所长`、`主任`、`副主任`、`负责人` 等行政或组织角色后面的人名也只是详情页发现线索；除非当前页是该人的详情页并有有效证据字段，否则不要保存。
+- 同一教师如果在多个详情页中重复出现，可保存一次，由数据库去重和详情页更新处理。
+- 非明确团队页或院士聚合页时，一个详情页最多保存一名主教授。
+- 不要编造页面文本中不存在的值。
 
-## Exclusion Strategy (Important)
+## 排除策略
 
-- If the page is mainly news/notice/policy/recruitment/personnel content, do not call `save_professors`.
-- Typical noise examples: `通知`, `公告`, `新闻`, `政策`, `规章`, `人事`, `招聘`, `党建`, `学工`, `招生`.
-- Even under `szdw/jsdw/faculty` path, skip such non-roster pages and continue to actual teacher list/profile pages.
+- 如果页面主要是新闻、通知、政策、招聘或人事内容，不要调用 `save_professors`。
+- 典型噪声包括：`通知`、`公告`、`新闻`、`政策`、`规章`、`人事`、`招聘`、`党建`、`学工`、`招生`。
+- 即使 URL 位于 `szdw/jsdw/faculty` 路径下，只要内容不是教师名单或详情，也要跳过并继续查找真实名单页/详情页。
